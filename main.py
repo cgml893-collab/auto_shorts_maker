@@ -9,7 +9,10 @@ import math
 import os
 import random
 import re
+import shutil
+import subprocess
 import sys
+import uuid
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -192,13 +195,23 @@ def media_to_preview_b64(path):
             with Image.open(path) as im:
                 return _pil_to_jpeg_b64(im)
         if suffix in VIDEO_EXTS:
-            clip = VideoFileClip(str(path))
+            preview = OUTPUT_DIR / ("_preview_{}.jpg".format(path.stem))
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
             try:
-                t = min(0.5, max(0.0, float(clip.duration or 1) * 0.1))
-                frame = clip.get_frame(t)
-            finally:
-                clip.close()
-            return _pil_to_jpeg_b64(Image.fromarray(frame.astype("uint8")))
+                run_ffmpeg(
+                    ["-ss", "0.3", "-i", str(path), "-frames:v", "1", "-q:v", "6", str(preview)],
+                    timeout=20,
+                )
+                with Image.open(preview) as im:
+                    return _pil_to_jpeg_b64(im)
+            except Exception:
+                clip = VideoFileClip(str(path))
+                try:
+                    t = min(0.5, max(0.0, float(clip.duration or 1) * 0.1))
+                    frame = clip.get_frame(t)
+                finally:
+                    clip.close()
+                return _pil_to_jpeg_b64(Image.fromarray(frame.astype("uint8")))
     except Exception as exc:
         print("[경고] 미리보기 추출 실패 ({}): {}".format(path.name, exc))
     return None
@@ -289,6 +302,236 @@ def generate_voice(settings, script):
     VOICE_PATH.write_bytes(response.content)
     print("   저장: {}".format(VOICE_PATH))
     return VOICE_PATH
+
+
+FFMPEG_PRESET = [
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-crf",
+    "23",
+    "-threads",
+    "2",
+    "-pix_fmt",
+    "yuv420p",
+]
+
+
+def ffmpeg_bin():
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    try:
+        import imageio_ffmpeg
+
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and Path(exe).is_file():
+            return exe
+    except Exception:
+        pass
+    raise RuntimeError("FFmpeg를 찾을 수 없습니다. 시스템에 ffmpeg를 설치해 주세요.")
+
+
+def run_ffmpeg(args, timeout=90):
+    cmd = [ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y"] + list(args)
+    flags = 0
+    if os.name == "nt":
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        creationflags=flags,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError("FFmpeg 실패: {}".format(err[-1800:]))
+    return proc
+
+
+def probe_duration(path):
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    proc = subprocess.run(
+        [ffmpeg_bin(), "-i", str(path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        creationflags=flags,
+    )
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", proc.stderr or "")
+    if not match:
+        raise RuntimeError("미디어 길이를 읽지 못했습니다: {}".format(path))
+    hours, minutes, seconds = match.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def _ff_file(path):
+    return str(Path(path).resolve()).replace("\\", "/")
+
+
+def make_scene_clip(src, dest, duration):
+    duration = max(0.2, float(duration))
+    vf = (
+        "scale={w}:{h}:force_original_aspect_ratio=increase,"
+        "crop={w}:{h},fps={fps}"
+    ).format(w=TARGET_W, h=TARGET_H, fps=FPS)
+    suffix = Path(src).suffix.lower()
+    args = []
+    if suffix in IMAGE_EXTS:
+        args += ["-loop", "1", "-i", str(src), "-t", "{:.3f}".format(duration)]
+    else:
+        args += ["-stream_loop", "-1", "-i", str(src), "-t", "{:.3f}".format(duration)]
+    args += ["-vf", vf, "-an"] + FFMPEG_PRESET + [str(dest)]
+    run_ffmpeg(args, timeout=60)
+
+
+def concat_scene_clips(clips, dest):
+    list_file = dest.with_suffix(".txt")
+    lines = []
+    for clip in clips:
+        lines.append("file '{}'".format(_ff_file(clip)))
+    list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        run_ffmpeg(
+            ["-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(dest)],
+            timeout=30,
+        )
+    except RuntimeError:
+        run_ffmpeg(
+            ["-f", "concat", "-safe", "0", "-i", str(list_file), "-an"]
+            + FFMPEG_PRESET
+            + [str(dest)],
+            timeout=60,
+        )
+
+
+def build_subtitle_assets(script, duration, font_path, work_dir):
+    cues = split_script_cues(script, duration)
+    assets = []
+    for i, (text, start, end) in enumerate(cues):
+        png_path = work_dir / ("sub_{:03d}.png".format(i))
+        render_subtitle_png(text, font_path, png_path)
+        with Image.open(png_path) as im:
+            w, h = im.size
+        assets.append((png_path, float(start), float(end), w, h))
+    return assets
+
+
+def ffmpeg_compose(concat_video, voice_path, duration, sub_assets, scene_starts, out_file):
+    cmd = ["-i", str(concat_video)]
+    for png, _s, _e, _w, _h in sub_assets:
+        cmd += ["-i", str(png)]
+    cmd += ["-i", str(voice_path)]
+    voice_idx = 1 + len(sub_assets)
+
+    bgm_path = pick_bgm_file()
+    bgm_idx = None
+    if bgm_path:
+        cmd += ["-stream_loop", "-1", "-i", str(bgm_path)]
+        bgm_idx = voice_idx + 1
+
+    pop_path = ensure_pop_sfx()
+    whoosh_path = ensure_whoosh_sfx()
+    pop_idx = (bgm_idx if bgm_idx is not None else voice_idx) + 1
+    cmd += ["-i", str(pop_path)]
+    whoosh_idx = pop_idx + 1
+    cmd += ["-i", str(whoosh_path)]
+
+    filters = []
+    last_v = "0:v"
+    for i, (png, start, end, _w, h) in enumerate(sub_assets):
+        out_v = "v{}".format(i)
+        y = max(0, TARGET_H - h - SUB_BOTTOM_MARGIN)
+        filters.append(
+            "[{inv}][{si}:v]overlay=x=(W-w)/2:y={y}:enable='between(t,{start:.3f},{end:.3f})'[{out}]".format(
+                inv=last_v if i == 0 else last_v,
+                si=i + 1,
+                y=y,
+                start=start,
+                end=end,
+                out=out_v,
+            )
+        )
+        last_v = out_v
+    if not sub_assets:
+        filters.append("[0:v]format=yuv420p[vout]")
+        last_v = "vout"
+    else:
+        filters[-1] = filters[-1].rsplit("[", 1)[0] + "[vout]"
+        last_v = "vout"
+    filters.append("[vout]format=yuv420p[vfinal]")
+
+    audio_labels = []
+    filters.append(
+        "[{}:a]volume={:.2f},atrim=0:{:.3f},asetpts=PTS-STARTPTS[a_voice]".format(
+            voice_idx, VOICE_GAIN, duration
+        )
+    )
+    audio_labels.append("a_voice")
+    if bgm_idx is not None:
+        fade_out_start = max(0.0, duration - 0.55)
+        filters.append(
+            "[{}:a]volume=0.18,atrim=0:{:.3f},asetpts=PTS-STARTPTS,"
+            "afade=t=in:st=0:d=0.25,afade=t=out:st={:.3f}:d=0.55[a_bgm]".format(
+                bgm_idx, duration, fade_out_start
+            )
+        )
+        audio_labels.append("a_bgm")
+
+    for i, (_png, start, _end, _w, _h) in enumerate(sub_assets):
+        label = "a_pop{}".format(i)
+        ms = max(0, int(round(start * 1000)))
+        filters.append(
+            "[{}:a]volume={:.2f},atrim=0:0.28,adelay={ms}:all=1,asetpts=PTS-STARTPTS[{lab}]".format(
+                pop_idx, POP_GAIN, ms=ms, lab=label
+            )
+        )
+        audio_labels.append(label)
+
+    for i, start in enumerate(scene_starts):
+        if i == 0:
+            continue
+        label = "a_whoosh{}".format(i)
+        ms = max(0, int(round(max(0.0, start - 0.04) * 1000)))
+        filters.append(
+            "[{}:a]volume={:.2f},atrim=0:0.42,adelay={ms}:all=1,asetpts=PTS-STARTPTS[{lab}]".format(
+                whoosh_idx, WHOOSH_GAIN, ms=ms, lab=label
+            )
+        )
+        audio_labels.append(label)
+
+    mix_in = "".join("[{}]".format(name) for name in audio_labels)
+    filters.append(
+        "{}amix=inputs={}:duration=first:dropout_transition=0[aout]".format(
+            mix_in, len(audio_labels)
+        )
+    )
+
+    cmd += [
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        "[vfinal]",
+        "-map",
+        "[aout]",
+        "-t",
+        "{:.3f}".format(duration),
+        "-r",
+        str(FPS),
+    ]
+    cmd += FFMPEG_PRESET
+    cmd += [
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        str(out_file),
+    ]
+    run_ffmpeg(cmd, timeout=90)
 
 
 def _call(clip, names, *args, **kwargs):
@@ -797,43 +1040,39 @@ def run_pipeline(media_files, style_prompt="", progress_cb=None, output_path=Non
     _notify(progress_cb, 32, "2/5 한국어 음성 생성 중...")
     generate_voice(settings, script)
 
-    audio = AudioFileClip(str(VOICE_PATH))
-    audio_duration = float(audio.duration)
+    audio_duration = probe_duration(VOICE_PATH)
     if audio_duration < 1:
-        audio.close()
         raise RuntimeError("생성된 음성이 너무 짧습니다. 대본/TTS를 확인하세요.")
     print("   음성 길이: {:.2f}초".format(audio_duration))
 
-    _notify(progress_cb, 48, "3/6 9:16 영상 편집 중...")
-    visuals, scene_starts = build_visuals(media_files, audio_duration)
-
-    _notify(progress_cb, 64, "4/6 자막 팝 애니메이션...")
-    subtitles, cue_starts = make_subtitle_clips(script, audio_duration, font_path)
-    final = CompositeVideoClip([visuals] + subtitles, size=(TARGET_W, TARGET_H))
-
-    _notify(progress_cb, 74, "5/6 BGM·팝·후시 효과음 믹싱...")
-    mixed_audio = mix_soundtrack(audio, audio_duration, cue_starts, scene_starts)
-    final = _call(final, ("with_audio", "set_audio"), mixed_audio)
-    final = _call(final, ("with_duration", "set_duration"), audio_duration)
-    final = _call(final, ("with_fps", "set_fps"), FPS)
-
-    _notify(progress_cb, 82, "6/6 최종 렌더 중... (조금 기다려 주세요)")
-    write_kwargs = {
-        "fps": FPS,
-        "codec": "libx264",
-        "audio_codec": "aac",
-        "preset": "medium",
-        "threads": os.cpu_count() or 4,
-        "ffmpeg_params": ["-pix_fmt", "yuv420p", "-movflags", "+faststart"],
-    }
+    work_dir = out_file.parent / ("_ffwork_{}".format(uuid.uuid4().hex[:8]))
+    work_dir.mkdir(parents=True, exist_ok=True)
     try:
-        final.write_videofile(str(out_file), logger="bar", **write_kwargs)
-    except TypeError:
-        final.write_videofile(str(out_file), **write_kwargs)
+        _notify(progress_cb, 48, "3/6 FFmpeg 고속 9:16 클립 생성...")
+        per = audio_duration / float(len(media_files))
+        scene_starts = []
+        clips = []
+        t = 0.0
+        for i, path in enumerate(media_files):
+            scene_starts.append(t)
+            clip_path = work_dir / ("clip_{:03d}.mp4".format(i))
+            make_scene_clip(path, clip_path, per)
+            clips.append(clip_path)
+            t += per
+        concat_path = work_dir / "concat.mp4"
+        concat_scene_clips(clips, concat_path)
 
-    final.close()
-    visuals.close()
-    audio.close()
+        _notify(progress_cb, 64, "4/6 자막 PNG 생성...")
+        sub_assets = build_subtitle_assets(script, audio_duration, font_path, work_dir)
+
+        _notify(progress_cb, 74, "5/6 BGM·효과음 믹싱 + FFmpeg 렌더...")
+        _notify(progress_cb, 82, "6/6 ultrafast 인코딩 중...")
+        ffmpeg_compose(
+            concat_path, VOICE_PATH, audio_duration, sub_assets, scene_starts, out_file
+        )
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
     cleanup_temp_files()
     _notify(progress_cb, 100, "완료: {}".format(out_file))
     return out_file, script

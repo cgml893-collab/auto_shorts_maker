@@ -12,6 +12,8 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 
+const kApiBaseUrl = 'https://auto-shorts-maker.onrender.com';
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setSystemUIOverlayStyle(
@@ -117,7 +119,7 @@ class LicenseScreen extends StatefulWidget {
 
 class _LicenseScreenState extends State<LicenseScreen> {
   final _keyCtrl = TextEditingController();
-  final _urlCtrl = TextEditingController(text: 'http://192.168.0.10:8000');
+  final _urlCtrl = TextEditingController(text: kApiBaseUrl);
   String _deviceId = '';
   String _platform = '';
   bool _busy = false;
@@ -157,8 +159,13 @@ class _LicenseScreenState extends State<LicenseScreen> {
     setState(() {
       _deviceId = id;
       _platform = plat;
-      if (savedUrl != null && savedUrl.isNotEmpty) {
+      if (savedUrl != null &&
+          savedUrl.isNotEmpty &&
+          !savedUrl.contains('192.168.') &&
+          !savedUrl.contains('localhost')) {
         _urlCtrl.text = savedUrl;
+      } else {
+        _urlCtrl.text = kApiBaseUrl;
       }
     });
   }
@@ -235,7 +242,7 @@ class _LicenseScreenState extends State<LicenseScreen> {
                 controller: _urlCtrl,
                 keyboardType: TextInputType.url,
                 decoration: const InputDecoration(
-                  hintText: 'http://192.168.0.10:8000',
+                  hintText: 'https://auto-shorts-maker.onrender.com',
                 ),
               ),
               const SizedBox(height: 16),
@@ -316,7 +323,10 @@ class _StudioScreenState extends State<StudioScreen> {
       return;
     }
     final prefs = await SharedPreferences.getInstance();
-    final url = (prefs.getString('server_url') ?? '').replaceAll(RegExp(r'/$'), '');
+    var url = (prefs.getString('server_url') ?? kApiBaseUrl).replaceAll(RegExp(r'/$'), '');
+    if (url.isEmpty || url.contains('192.168.') || url.contains('localhost')) {
+      url = kApiBaseUrl;
+    }
     final key = prefs.getString('license_key') ?? '';
     final deviceId = prefs.getString('device_id') ?? '';
     final platform = prefs.getString('platform') ?? '';
@@ -345,8 +355,10 @@ class _StudioScreenState extends State<StudioScreen> {
           ),
         );
       }
-      final streamed = await req.send().timeout(const Duration(minutes: 12));
-      final res = await http.Response.fromStream(streamed);
+      final res = await Future(() async {
+        final streamed = await req.send();
+        return http.Response.fromStream(streamed);
+      }).timeout(const Duration(seconds: 180));
       if (res.statusCode != 200) {
         throw _apiError(res);
       }
