@@ -317,6 +317,12 @@ FFMPEG_PRESET = [
     "yuv420p",
 ]
 
+SCALE_PAD_VF = (
+    "scale=1080:1920:force_original_aspect_ratio=decrease,"
+    "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,"
+    "setsar=1,fps=30,format=yuv420p"
+)
+
 
 def ffmpeg_bin():
     found = shutil.which("ffmpeg")
@@ -333,78 +339,177 @@ def ffmpeg_bin():
     raise RuntimeError("FFmpeg를 찾을 수 없습니다. 시스템에 ffmpeg를 설치해 주세요.")
 
 
-def run_ffmpeg(args, timeout=90):
-    cmd = [ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y"] + list(args)
-    flags = 0
-    if os.name == "nt":
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        creationflags=flags,
-    )
+def run_ffmpeg(args, timeout=120):
+    cmd = [ffmpeg_bin(), "-hide_banner", "-y"] + [str(a) for a in args]
+    print("[ffmpeg cmd] {}".format(" ".join(cmd)), flush=True)
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=timeout,
+            creationflags=flags,
+        )
+    except subprocess.TimeoutExpired as exc:
+        err = (exc.stderr or b"").decode("utf-8", errors="replace")
+        print("[ffmpeg timeout stderr]\n{}".format(err), flush=True)
+        raise RuntimeError("FFmpeg 시간 초과 ({}s): {}".format(timeout, err[-1500:]))
+    stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
+    stdout = (proc.stdout or b"").decode("utf-8", errors="replace")
     if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()
-        raise RuntimeError("FFmpeg 실패: {}".format(err[-1800:]))
+        print("[ffmpeg exit {}]".format(proc.returncode), flush=True)
+        print("[ffmpeg stderr]\n{}".format(stderr), flush=True)
+        if stdout.strip():
+            print("[ffmpeg stdout]\n{}".format(stdout), flush=True)
+        raise RuntimeError(
+            "FFmpeg 실패 (code={}): {}".format(
+                proc.returncode, (stderr or stdout or "stderr 비어 있음")[-2500:]
+            )
+        )
+    if stderr.strip():
+        print("[ffmpeg log]\n{}".format(stderr[-800:]), flush=True)
     return proc
 
 
 def probe_duration(path):
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     proc = subprocess.run(
-        [ffmpeg_bin(), "-i", str(path)],
+        [ffmpeg_bin(), "-hide_banner", "-i", str(path)],
         capture_output=True,
-        text=True,
         timeout=30,
         creationflags=flags,
     )
-    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", proc.stderr or "")
+    stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stderr)
     if not match:
-        raise RuntimeError("미디어 길이를 읽지 못했습니다: {}".format(path))
+        print("[ffmpeg probe stderr]\n{}".format(stderr), flush=True)
+        raise RuntimeError("미디어 길이를 읽지 못했습니다: {}\n{}".format(path, stderr[-800:]))
     hours, minutes, seconds = match.groups()
     return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
-def _ff_file(path):
-    return str(Path(path).resolve()).replace("\\", "/")
+def _safe_src_copy(src, work_dir, index):
+    suffix = Path(src).suffix.lower() or ".jpg"
+    dest = work_dir / ("src_{:03d}{}".format(index, suffix))
+    shutil.copy2(str(src), str(dest))
+    return dest
 
 
 def make_scene_clip(src, dest, duration):
     duration = max(0.2, float(duration))
-    vf = (
-        "scale={w}:{h}:force_original_aspect_ratio=increase,"
-        "crop={w}:{h},fps={fps}"
-    ).format(w=TARGET_W, h=TARGET_H, fps=FPS)
     suffix = Path(src).suffix.lower()
     args = []
     if suffix in IMAGE_EXTS:
-        args += ["-loop", "1", "-i", str(src), "-t", "{:.3f}".format(duration)]
+        args += [
+            "-loop",
+            "1",
+            "-framerate",
+            str(FPS),
+            "-t",
+            "{:.3f}".format(duration),
+            "-i",
+            str(src),
+        ]
     else:
-        args += ["-stream_loop", "-1", "-i", str(src), "-t", "{:.3f}".format(duration)]
-    args += ["-vf", vf, "-an"] + FFMPEG_PRESET + [str(dest)]
-    run_ffmpeg(args, timeout=60)
+        args += [
+            "-stream_loop",
+            "-1",
+            "-t",
+            "{:.3f}".format(duration),
+            "-i",
+            str(src),
+        ]
+    args += ["-vf", SCALE_PAD_VF, "-an"] + FFMPEG_PRESET + [str(dest)]
+    run_ffmpeg(args, timeout=90)
 
 
 def concat_scene_clips(clips, dest):
-    list_file = dest.with_suffix(".txt")
-    lines = []
+    if len(clips) == 1:
+        shutil.copy2(str(clips[0]), str(dest))
+        return
+    args = []
     for clip in clips:
-        lines.append("file '{}'".format(_ff_file(clip)))
-    list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    try:
-        run_ffmpeg(
-            ["-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(dest)],
-            timeout=30,
+        args += ["-i", str(clip)]
+    parts = []
+    for i in range(len(clips)):
+        parts.append("[{}:v]setsar=1,format=yuv420p[v{}]".format(i, i))
+    concat_in = "".join("[v{}]".format(i) for i in range(len(clips)))
+    parts.append("{}concat=n={}:v=1:a=0[vout]".format(concat_in, len(clips)))
+    args += [
+        "-filter_complex",
+        ";".join(parts),
+        "-map",
+        "[vout]",
+        "-an",
+    ] + FFMPEG_PRESET + [str(dest)]
+    run_ffmpeg(args, timeout=90)
+
+
+def mux_voice(video_path, voice_path, duration, out_file):
+    run_ffmpeg(
+        [
+            "-i",
+            str(video_path),
+            "-i",
+            str(voice_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-t",
+            "{:.3f}".format(duration),
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            str(out_file),
+        ],
+        timeout=60,
+    )
+
+
+def overlay_subtitles(video_path, sub_assets, out_file):
+    if not sub_assets:
+        shutil.copy2(str(video_path), str(out_file))
+        return
+    args = ["-i", str(video_path)]
+    for png, _s, _e, _w, _h in sub_assets:
+        args += ["-i", str(png)]
+    filters = []
+    last = "0:v"
+    for i, (_png, start, end, _w, h) in enumerate(sub_assets):
+        out_v = "v{}".format(i)
+        y = max(0, TARGET_H - int(h) - SUB_BOTTOM_MARGIN)
+        filters.append(
+            "[{last}][{si}:v]overlay=x=(W-w)/2:y={y}:enable='between(t,{start:.3f},{end:.3f})'[{out}]".format(
+                last=last,
+                si=i + 1,
+                y=y,
+                start=start,
+                end=end,
+                out=out_v,
+            )
         )
-    except RuntimeError:
-        run_ffmpeg(
-            ["-f", "concat", "-safe", "0", "-i", str(list_file), "-an"]
-            + FFMPEG_PRESET
-            + [str(dest)],
-            timeout=60,
-        )
+        last = out_v
+    filters[-1] = filters[-1].rsplit("[", 1)[0] + "[vout]"
+    args += [
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        "[vout]",
+        "-map",
+        "0:a:0",
+        "-t",
+        str(probe_duration(video_path)),
+    ]
+    args += FFMPEG_PRESET
+    args += ["-c:a", "copy", "-movflags", "+faststart", str(out_file)]
+    run_ffmpeg(args, timeout=90)
 
 
 def build_subtitle_assets(script, duration, font_path, work_dir):
@@ -417,121 +522,6 @@ def build_subtitle_assets(script, duration, font_path, work_dir):
             w, h = im.size
         assets.append((png_path, float(start), float(end), w, h))
     return assets
-
-
-def ffmpeg_compose(concat_video, voice_path, duration, sub_assets, scene_starts, out_file):
-    cmd = ["-i", str(concat_video)]
-    for png, _s, _e, _w, _h in sub_assets:
-        cmd += ["-i", str(png)]
-    cmd += ["-i", str(voice_path)]
-    voice_idx = 1 + len(sub_assets)
-
-    bgm_path = pick_bgm_file()
-    bgm_idx = None
-    if bgm_path:
-        cmd += ["-stream_loop", "-1", "-i", str(bgm_path)]
-        bgm_idx = voice_idx + 1
-
-    pop_path = ensure_pop_sfx()
-    whoosh_path = ensure_whoosh_sfx()
-    pop_idx = (bgm_idx if bgm_idx is not None else voice_idx) + 1
-    cmd += ["-i", str(pop_path)]
-    whoosh_idx = pop_idx + 1
-    cmd += ["-i", str(whoosh_path)]
-
-    filters = []
-    last_v = "0:v"
-    for i, (png, start, end, _w, h) in enumerate(sub_assets):
-        out_v = "v{}".format(i)
-        y = max(0, TARGET_H - h - SUB_BOTTOM_MARGIN)
-        filters.append(
-            "[{inv}][{si}:v]overlay=x=(W-w)/2:y={y}:enable='between(t,{start:.3f},{end:.3f})'[{out}]".format(
-                inv=last_v if i == 0 else last_v,
-                si=i + 1,
-                y=y,
-                start=start,
-                end=end,
-                out=out_v,
-            )
-        )
-        last_v = out_v
-    if not sub_assets:
-        filters.append("[0:v]format=yuv420p[vout]")
-        last_v = "vout"
-    else:
-        filters[-1] = filters[-1].rsplit("[", 1)[0] + "[vout]"
-        last_v = "vout"
-    filters.append("[vout]format=yuv420p[vfinal]")
-
-    audio_labels = []
-    filters.append(
-        "[{}:a]volume={:.2f},atrim=0:{:.3f},asetpts=PTS-STARTPTS[a_voice]".format(
-            voice_idx, VOICE_GAIN, duration
-        )
-    )
-    audio_labels.append("a_voice")
-    if bgm_idx is not None:
-        fade_out_start = max(0.0, duration - 0.55)
-        filters.append(
-            "[{}:a]volume=0.18,atrim=0:{:.3f},asetpts=PTS-STARTPTS,"
-            "afade=t=in:st=0:d=0.25,afade=t=out:st={:.3f}:d=0.55[a_bgm]".format(
-                bgm_idx, duration, fade_out_start
-            )
-        )
-        audio_labels.append("a_bgm")
-
-    for i, (_png, start, _end, _w, _h) in enumerate(sub_assets):
-        label = "a_pop{}".format(i)
-        ms = max(0, int(round(start * 1000)))
-        filters.append(
-            "[{}:a]volume={:.2f},atrim=0:0.28,adelay={ms}:all=1,asetpts=PTS-STARTPTS[{lab}]".format(
-                pop_idx, POP_GAIN, ms=ms, lab=label
-            )
-        )
-        audio_labels.append(label)
-
-    for i, start in enumerate(scene_starts):
-        if i == 0:
-            continue
-        label = "a_whoosh{}".format(i)
-        ms = max(0, int(round(max(0.0, start - 0.04) * 1000)))
-        filters.append(
-            "[{}:a]volume={:.2f},atrim=0:0.42,adelay={ms}:all=1,asetpts=PTS-STARTPTS[{lab}]".format(
-                whoosh_idx, WHOOSH_GAIN, ms=ms, lab=label
-            )
-        )
-        audio_labels.append(label)
-
-    mix_in = "".join("[{}]".format(name) for name in audio_labels)
-    filters.append(
-        "{}amix=inputs={}:duration=first:dropout_transition=0[aout]".format(
-            mix_in, len(audio_labels)
-        )
-    )
-
-    cmd += [
-        "-filter_complex",
-        ";".join(filters),
-        "-map",
-        "[vfinal]",
-        "-map",
-        "[aout]",
-        "-t",
-        "{:.3f}".format(duration),
-        "-r",
-        str(FPS),
-    ]
-    cmd += FFMPEG_PRESET
-    cmd += [
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-        str(out_file),
-    ]
-    run_ffmpeg(cmd, timeout=90)
 
 
 def _call(clip, names, *args, **kwargs):
@@ -1048,28 +1038,29 @@ def run_pipeline(media_files, style_prompt="", progress_cb=None, output_path=Non
     work_dir = out_file.parent / ("_ffwork_{}".format(uuid.uuid4().hex[:8]))
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
-        _notify(progress_cb, 48, "3/6 FFmpeg 고속 9:16 클립 생성...")
+        _notify(progress_cb, 48, "3/5 FFmpeg 고속 9:16 편집 중...")
         per = audio_duration / float(len(media_files))
-        scene_starts = []
         clips = []
-        t = 0.0
         for i, path in enumerate(media_files):
-            scene_starts.append(t)
+            src = _safe_src_copy(path, work_dir, i)
             clip_path = work_dir / ("clip_{:03d}.mp4".format(i))
-            make_scene_clip(path, clip_path, per)
+            make_scene_clip(src, clip_path, per)
             clips.append(clip_path)
-            t += per
-        concat_path = work_dir / "concat.mp4"
-        concat_scene_clips(clips, concat_path)
+        silent_path = work_dir / "silent.mp4"
+        concat_scene_clips(clips, silent_path)
 
-        _notify(progress_cb, 64, "4/6 자막 PNG 생성...")
-        sub_assets = build_subtitle_assets(script, audio_duration, font_path, work_dir)
+        voiced_path = work_dir / "voiced.mp4"
+        mux_voice(silent_path, VOICE_PATH, audio_duration, voiced_path)
 
-        _notify(progress_cb, 74, "5/6 BGM·효과음 믹싱 + FFmpeg 렌더...")
-        _notify(progress_cb, 82, "6/6 ultrafast 인코딩 중...")
-        ffmpeg_compose(
-            concat_path, VOICE_PATH, audio_duration, sub_assets, scene_starts, out_file
-        )
+        _notify(progress_cb, 72, "4/5 자막 입히기...")
+        try:
+            sub_assets = build_subtitle_assets(script, audio_duration, font_path, work_dir)
+            overlay_subtitles(voiced_path, sub_assets, out_file)
+        except Exception as sub_exc:
+            print("[경고] 자막 합성 실패, 음성만 입힌 영상으로 저장: {}".format(sub_exc), flush=True)
+            shutil.copy2(str(voiced_path), str(out_file))
+
+        _notify(progress_cb, 90, "5/5 완료 처리...")
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 

@@ -155,6 +155,9 @@ async def create_video(
             check_license=False,
         )
     except Exception as exc:
+        import traceback
+
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail="영상 제작 실패: {}".format(exc))
     finally:
         RENDER_LOCK.release()
