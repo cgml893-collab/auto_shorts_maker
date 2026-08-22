@@ -1,0 +1,11 @@
+openai>=1.40.0
+python-dotenv>=1.0.0
+requests>=2.32.0
+moviepy>=2.1.0
+pillow>=10.0.0
+imageio-ffmpeg>=0.5.1
+numpy>=1.26.0
+streamlit>=1.36.0
+fastapi>=0.111.0
+uvicorn>=0.30.0
+python-multipart>=0.0.9

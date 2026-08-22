@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+.env.*
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.cursor
+mobile
+output
+input_media
+*.md
+Start_App.bat
+Create_Desktop_Shortcut.bat

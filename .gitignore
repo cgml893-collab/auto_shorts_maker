@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.venv/
+venv/
+input_media/*
+!input_media/.gitkeep
+
+_frame_*.jpg
+mobile/.dart_tool/
+mobile/.idea/
+mobile/build/
+mobile/**/GeneratedPluginRegistrant.*
+.DS_Store
