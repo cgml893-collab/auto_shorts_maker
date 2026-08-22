@@ -56,17 +56,18 @@ SFX_DIR = ROOT / "sfx"
 VOICE_PATH = OUTPUT_DIR / "voice.mp3"
 FINAL_PATH = OUTPUT_DIR / "final_shorts.mp4"
 
-TARGET_W = 1080
-TARGET_H = 1920
-FPS = 30
+TARGET_W = 720
+TARGET_H = 1280
+FPS = 24
+FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "300"))
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
 DEFAULT_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"
 ELEVENLABS_MODEL = "eleven_multilingual_v2"
 
-SUB_MAX_WIDTH = 960
-SUB_FONT_SIZE = 68
+SUB_MAX_WIDTH = 640
+SUB_FONT_SIZE = 48
 SUB_STROKE = 6
 SUB_LINE_GAP = 10
 SUB_PAD_X = 28
@@ -307,10 +308,12 @@ def generate_voice(settings, script):
 FFMPEG_PRESET = [
     "-c:v",
     "libx264",
+    "-tune",
+    "stillimage",
     "-preset",
     "ultrafast",
     "-crf",
-    "23",
+    "26",
     "-threads",
     "2",
     "-pix_fmt",
@@ -318,10 +321,10 @@ FFMPEG_PRESET = [
 ]
 
 SCALE_PAD_VF = (
-    "scale=1080:1920:force_original_aspect_ratio=decrease,"
-    "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,"
-    "setsar=1,fps=30,format=yuv420p"
-)
+    "scale={w}:{h}:force_original_aspect_ratio=decrease,"
+    "pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,"
+    "setsar=1,fps={fps},format=yuv420p"
+).format(w=TARGET_W, h=TARGET_H, fps=FPS)
 
 
 def ffmpeg_bin():
@@ -339,7 +342,9 @@ def ffmpeg_bin():
     raise RuntimeError("FFmpeg를 찾을 수 없습니다. 시스템에 ffmpeg를 설치해 주세요.")
 
 
-def run_ffmpeg(args, timeout=120):
+def run_ffmpeg(args, timeout=None):
+    if timeout is None:
+        timeout = FFMPEG_TIMEOUT
     cmd = [ffmpeg_bin(), "-hide_banner", "-y"] + [str(a) for a in args]
     print("[ffmpeg cmd] {}".format(" ".join(cmd)), flush=True)
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
@@ -420,7 +425,7 @@ def make_scene_clip(src, dest, duration):
             str(src),
         ]
     args += ["-vf", SCALE_PAD_VF, "-an"] + FFMPEG_PRESET + [str(dest)]
-    run_ffmpeg(args, timeout=90)
+    run_ffmpeg(args)
 
 
 def concat_scene_clips(clips, dest):
@@ -442,7 +447,7 @@ def concat_scene_clips(clips, dest):
         "[vout]",
         "-an",
     ] + FFMPEG_PRESET + [str(dest)]
-    run_ffmpeg(args, timeout=90)
+    run_ffmpeg(args)
 
 
 def mux_voice(video_path, voice_path, duration, out_file):
@@ -469,7 +474,7 @@ def mux_voice(video_path, voice_path, duration, out_file):
             "+faststart",
             str(out_file),
         ],
-        timeout=60,
+        timeout=FFMPEG_TIMEOUT,
     )
 
 
@@ -509,7 +514,7 @@ def overlay_subtitles(video_path, sub_assets, out_file):
     ]
     args += FFMPEG_PRESET
     args += ["-c:a", "copy", "-movflags", "+faststart", str(out_file)]
-    run_ffmpeg(args, timeout=90)
+    run_ffmpeg(args)
 
 
 def build_subtitle_assets(script, duration, font_path, work_dir):
@@ -599,7 +604,7 @@ def fit_duration(clip, duration):
 
 def build_visuals(media_files, audio_duration):
     # type: (List[Path], float) -> Tuple[object, List[float]]
-    print("3) 미디어를 9:16 (1080x1920)으로 맞추고 이어붙이는 중...")
+    print("3) 미디어를 9:16 (720x1280)으로 맞추고 이어붙이는 중...")
     per = audio_duration / float(len(media_files))
     clips = []
     scene_starts = []
@@ -1038,7 +1043,7 @@ def run_pipeline(media_files, style_prompt="", progress_cb=None, output_path=Non
     work_dir = out_file.parent / ("_ffwork_{}".format(uuid.uuid4().hex[:8]))
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
-        _notify(progress_cb, 48, "3/5 FFmpeg 고속 9:16 편집 중...")
+        _notify(progress_cb, 48, "3/5 FFmpeg 720x1280 24fps 편집 중...")
         per = audio_duration / float(len(media_files))
         clips = []
         for i, path in enumerate(media_files):

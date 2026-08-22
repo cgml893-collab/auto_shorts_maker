@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import threading
+import traceback
 import uuid
 from pathlib import Path
 from typing import List
+
+os.environ.setdefault("FFMPEG_TIMEOUT", "300")
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -155,8 +159,6 @@ async def create_video(
             check_license=False,
         )
     except Exception as exc:
-        import traceback
-
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="영상 제작 실패: {}".format(exc))
     finally:
