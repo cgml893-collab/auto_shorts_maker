@@ -19,6 +19,7 @@ import numpy as np
 import requests
 from dotenv import load_dotenv
 from openai import OpenAI
+from PIL import Image, ImageDraw, ImageFont
 from license_lock import require_license, verify_saved_license
 
 try:
