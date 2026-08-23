@@ -308,14 +308,15 @@ class StudioScreen extends StatefulWidget {
 class _StudioScreenState extends State<StudioScreen> {
   final _styleCtrl = TextEditingController(text: '신나는 브이로그');
   final _picker = ImagePicker();
-  final _presets = const ['신나는 브이로그', '감동적인 일상', '빠른 템포의 유머 숏폼', '감성 힐링 여행'];
   List<XFile> _media = [];
   bool _busy = false;
   String _busyText = '릴스를 만들고 있어요...';
   double _progress = 0;
-  String _voiceType = 'bright_female';
+  String _voiceType = 'vlog_female';
   String _speed = '1.2';
-  String _bgmMood = 'upbeat';
+  String _bgmMood = 'pop';
+  List<Map<String, String>> _aiStyles = [];
+  bool _analyzing = false;
   File? _resultVideo;
   VideoPlayerController? _player;
 
@@ -326,12 +327,100 @@ class _StudioScreenState extends State<StudioScreen> {
     super.dispose();
   }
 
+  Future<Map<String, String>> _apiAuth() async {
+    final prefs = await SharedPreferences.getInstance();
+    var url = (prefs.getString('server_url') ?? kApiBaseUrl).replaceAll(RegExp(r'/$'), '');
+    if (url.isEmpty || url.contains('192.168.') || url.contains('localhost')) {
+      url = kApiBaseUrl;
+    }
+    return {
+      'url': url,
+      'license_key': prefs.getString('license_key') ?? '',
+      'device_id': prefs.getString('device_id') ?? '',
+      'platform': prefs.getString('platform') ?? '',
+    };
+  }
+
   Future<void> _pick() async {
     final picked = await _picker.pickMultipleMedia();
     if (picked.isEmpty) {
       return;
     }
-    setState(() => _media = picked);
+    setState(() {
+      _media = picked;
+      _aiStyles = [];
+    });
+    _analyzeStyles();
+  }
+
+  Future<void> _analyzeStyles() async {
+    if (_media.isEmpty) {
+      return;
+    }
+    setState(() => _analyzing = true);
+    try {
+      final auth = await _apiAuth();
+      if (auth['url']!.isEmpty || auth['license_key']!.isEmpty) {
+        return;
+      }
+      http.Response? res;
+      Object? last;
+      for (var i = 0; i < 5; i++) {
+        try {
+          final req = http.MultipartRequest('POST', Uri.parse('${auth['url']}/analyze-media'));
+          req.fields['license_key'] = auth['license_key']!;
+          req.fields['device_id'] = auth['device_id']!;
+          req.fields['platform'] = auth['platform']!;
+          for (final file in _media.take(2)) {
+            req.files.add(
+              await http.MultipartFile.fromPath('files', file.path, filename: p.basename(file.path)),
+            );
+          }
+          final streamed = await req.send().timeout(const Duration(seconds: 45));
+          res = await http.Response.fromStream(streamed).timeout(const Duration(seconds: 45));
+          if (res.statusCode == 200) {
+            last = null;
+            break;
+          }
+          if (res.statusCode >= 400 && res.statusCode < 500 && res.statusCode != 429) {
+            throw Exception(_apiError(res));
+          }
+          last = Exception(_apiError(res));
+        } catch (e) {
+          last = e;
+        }
+        await Future.delayed(Duration(milliseconds: 400 * (i + 1)));
+      }
+      if (res == null || res.statusCode != 200) {
+        throw last ?? Exception('스타일 추천에 실패했습니다.');
+      }
+      final body = jsonDecode(res.body) as Map<String, dynamic>;
+      final raw = body['styles'];
+      final styles = <Map<String, String>>[];
+      if (raw is List) {
+        for (final item in raw) {
+          if (item is Map) {
+            final label = '${item['label'] ?? ''}'.trim();
+            final prompt = '${item['prompt'] ?? label}'.trim();
+            if (prompt.isNotEmpty) {
+              styles.add({'label': label.isEmpty ? prompt : label, 'prompt': prompt});
+            }
+          }
+        }
+      }
+      if (!mounted) {
+        return;
+      }
+      setState(() => _aiStyles = styles);
+    } catch (_) {
+      if (mounted) {
+        setState(() => _aiStyles = []);
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _analyzing = false);
+      }
+    }
   }
 
   Future<http.Response> _retryGet(Uri uri, {Duration timeout = const Duration(seconds: 25)}) async {
@@ -379,14 +468,11 @@ class _StudioScreenState extends State<StudioScreen> {
       _toast('스타일 프롬프트를 입력해 주세요.');
       return;
     }
-    final prefs = await SharedPreferences.getInstance();
-    var url = (prefs.getString('server_url') ?? kApiBaseUrl).replaceAll(RegExp(r'/$'), '');
-    if (url.isEmpty || url.contains('192.168.') || url.contains('localhost')) {
-      url = kApiBaseUrl;
-    }
-    final key = prefs.getString('license_key') ?? '';
-    final deviceId = prefs.getString('device_id') ?? '';
-    final platform = prefs.getString('platform') ?? '';
+    final auth = await _apiAuth();
+    final url = auth['url']!;
+    final key = auth['license_key']!;
+    final deviceId = auth['device_id']!;
+    final platform = auth['platform']!;
     if (url.isEmpty || key.isEmpty || deviceId.isEmpty) {
       _toast('라이선스 정보가 없습니다. 앱을 다시 시작해 주세요.');
       return;
@@ -410,6 +496,7 @@ class _StudioScreenState extends State<StudioScreen> {
           req.fields['platform'] = platform;
           req.fields['voice_type'] = _voiceType;
           req.fields['speed_multiplier'] = _speed;
+          req.fields['bgm_type'] = _bgmMood;
           req.fields['bgm_mood'] = _bgmMood;
           for (final file in _media) {
             req.files.add(
@@ -606,45 +693,77 @@ class _StudioScreenState extends State<StudioScreen> {
                       ),
                     ),
                   ],
+                  if (_media.isNotEmpty) ...[
+                    const SizedBox(height: 20),
+                    const _Label('AI 추천 스타일'),
+                    if (_analyzing)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: Text(
+                          '사진을 읽고 스타일을 추천하는 중...',
+                          style: TextStyle(color: Colors.white.withValues(alpha: 0.55), fontSize: 13),
+                        ),
+                      ),
+                    if (_aiStyles.isNotEmpty)
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: _aiStyles
+                            .map(
+                              (item) => ActionChip(
+                                label: Text(item['label'] ?? ''),
+                                onPressed: () => setState(() => _styleCtrl.text = item['prompt'] ?? ''),
+                                backgroundColor: const Color(0x55FF4D8D),
+                                side: const BorderSide(color: Color(0xFFFF4D8D)),
+                              ),
+                            )
+                            .toList(),
+                      ),
+                  ],
                   const SizedBox(height: 20),
-                  const _Label('2. 스타일 프롬프트'),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: _presets
-                        .map(
-                          (preset) => ActionChip(
-                            label: Text(preset),
-                            onPressed: () => setState(() => _styleCtrl.text = preset),
-                            backgroundColor: const Color(0x331A1028),
-                            side: BorderSide(color: Colors.white.withValues(alpha: 0.12)),
-                          ),
-                        )
-                        .toList(),
-                  ),
-                  const SizedBox(height: 10),
+                  const _Label('2. 스타일 직접 입력'),
                   TextField(
                     controller: _styleCtrl,
                     minLines: 2,
                     maxLines: 3,
                     decoration: const InputDecoration(
-                      hintText: "예: 신나는 브이로그, 감동적인 일상",
+                      hintText: "예: 무한도전 스타일, 감성 브이로그, 뉴스 브리핑",
                     ),
                   ),
-                  const SizedBox(height: 20),
-                  const _Label('3. 목소리 선택'),
-                  _OptionWrap(
-                    options: const [
-                      _Option('bright_female', '밝은 여성'),
-                      _Option('energetic_male', '활기찬 남성'),
-                      _Option('calm_male', '차분한 남성'),
-                      _Option('story_female', '감성 여성'),
-                    ],
+                  const SizedBox(height: 18),
+                  _DropdownField(
+                    label: '3. 목소리',
                     value: _voiceType,
+                    options: const [
+                      _Option('variety_male', '예능 남성'),
+                      _Option('variety_female', '예능 여성'),
+                      _Option('vlog_female', '브이로그 여성'),
+                      _Option('fast_story_male', '빠른 스토리 남성'),
+                      _Option('docu_male', '다큐 남성'),
+                      _Option('radio_female', '라디오 여성'),
+                      _Option('news_male', '뉴스 남성'),
+                      _Option('news_female', '뉴스 여성'),
+                    ],
                     onChanged: (v) => setState(() => _voiceType = v),
                   ),
-                  const SizedBox(height: 18),
-                  const _Label('4. 영상 속도'),
+                  const SizedBox(height: 14),
+                  _DropdownField(
+                    label: '4. BGM',
+                    value: _bgmMood,
+                    options: const [
+                      _Option('variety', '예능'),
+                      _Option('lofi', '로파이'),
+                      _Option('phonk', '폰크'),
+                      _Option('pop', '팝'),
+                      _Option('acoustic', '어쿠스틱'),
+                      _Option('suspense', '서스펜스'),
+                      _Option('cinematic', '시네마틱'),
+                      _Option('none', '음악 없음'),
+                    ],
+                    onChanged: (v) => setState(() => _bgmMood = v),
+                  ),
+                  const SizedBox(height: 14),
+                  const _Label('5. 영상 속도'),
                   _OptionWrap(
                     options: const [
                       _Option('1.0', '1.0x 보통'),
@@ -653,18 +772,6 @@ class _StudioScreenState extends State<StudioScreen> {
                     ],
                     value: _speed,
                     onChanged: (v) => setState(() => _speed = v),
-                  ),
-                  const SizedBox(height: 18),
-                  const _Label('5. BGM 분위기'),
-                  _OptionWrap(
-                    options: const [
-                      _Option('upbeat', '신나는 비트'),
-                      _Option('emotional', '감성 브이로그'),
-                      _Option('tense', '긴박한 펑크'),
-                      _Option('none', '음악 없음'),
-                    ],
-                    value: _bgmMood,
-                    onChanged: (v) => setState(() => _bgmMood = v),
                   ),
                   const SizedBox(height: 22),
                   _PrimaryButton(
@@ -761,6 +868,60 @@ class _Hero extends StatelessWidget {
           subtitle,
           textAlign: TextAlign.center,
           style: TextStyle(color: Colors.white.withValues(alpha: 0.7), height: 1.4),
+        ),
+      ],
+    );
+  }
+}
+
+class _DropdownField extends StatelessWidget {
+  const _DropdownField({
+    required this.label,
+    required this.value,
+    required this.options,
+    required this.onChanged,
+  });
+
+  final String label;
+  final String value;
+  final List<_Option> options;
+  final ValueChanged<String> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final current = options.any((o) => o.id == value) ? value : options.first.id;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _Label(label),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14),
+          decoration: BoxDecoration(
+            color: const Color(0x331A1028),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
+          ),
+          child: DropdownButtonHideUnderline(
+            child: DropdownButton<String>(
+              value: current,
+              isExpanded: true,
+              dropdownColor: const Color(0xFF1A1028),
+              icon: const Icon(Icons.keyboard_arrow_down_rounded, color: Color(0xFFFFD3EA)),
+              items: options
+                  .map(
+                    (option) => DropdownMenuItem(
+                      value: option.id,
+                      child: Text(option.label),
+                    ),
+                  )
+                  .toList(),
+              onChanged: (next) {
+                if (next != null) {
+                  onChanged(next);
+                }
+              },
+            ),
+          ),
         ),
       ],
     );

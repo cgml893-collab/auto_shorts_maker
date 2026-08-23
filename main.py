@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import math
 import os
 import random
@@ -71,38 +72,61 @@ VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 DEFAULT_VOICE_ID = "cgSgspJ2msm6clMCkdW9"
 ELEVENLABS_MODEL = "eleven_multilingual_v2"
 ALLOWED_SPEEDS = (1.0, 1.2, 1.5)
-DEFAULT_VOICE_TYPE = "bright_female"
-DEFAULT_BGM_MOOD = "upbeat"
+DEFAULT_VOICE_TYPE = "vlog_female"
+DEFAULT_BGM_MOOD = "pop"
 
 # Premade multilingual voices that speak Korean well on eleven_multilingual_v2.
-# Override with ELEVENLABS_VOICE_<TYPE> in .env if needed.
 VOICE_PRESETS = {
-    "energetic_male": {
+    "variety_male": {
         "id": "iP95p4xoKVk53GoZ742B",  # Chris
-        "stability": 0.28,
-        "similarity_boost": 0.70,
-        "style": 0.74,
+        "stability": 0.26,
+        "similarity_boost": 0.68,
+        "style": 0.78,
     },
-    "bright_female": {
+    "variety_female": {
         "id": "cgSgspJ2msm6clMCkdW9",  # Jessica
-        "stability": 0.36,
-        "similarity_boost": 0.78,
-        "style": 0.58,
+        "stability": 0.32,
+        "similarity_boost": 0.76,
+        "style": 0.70,
     },
-    "calm_male": {
+    "vlog_female": {
+        "id": "pFZP5JQG7iQjIQuC4Bku",  # Lily
+        "stability": 0.46,
+        "similarity_boost": 0.84,
+        "style": 0.48,
+    },
+    "fast_story_male": {
+        "id": "bIHbv24MWmeRgasZH58o",  # Will
+        "stability": 0.30,
+        "similarity_boost": 0.72,
+        "style": 0.66,
+    },
+    "docu_male": {
         "id": "onwK4e9ZLuTAKqWW03F9",  # Daniel
-        "stability": 0.64,
+        "stability": 0.66,
+        "similarity_boost": 0.84,
+        "style": 0.16,
+    },
+    "radio_female": {
+        "id": "EXAVITQu4vr4xnSDxMaL",  # Sarah
+        "stability": 0.50,
+        "similarity_boost": 0.80,
+        "style": 0.40,
+    },
+    "news_male": {
+        "id": "nPczCjzI2devNBz1zQrb",  # Brian
+        "stability": 0.62,
         "similarity_boost": 0.82,
+        "style": 0.12,
+    },
+    "news_female": {
+        "id": "FGY2WhTYpPnrIDTdsKH5",  # Laura
+        "stability": 0.58,
+        "similarity_boost": 0.80,
         "style": 0.18,
     },
-    "story_female": {
-        "id": "pFZP5JQG7iQjIQuC4Bku",  # Lily
-        "stability": 0.48,
-        "similarity_boost": 0.84,
-        "style": 0.46,
-    },
 }
-BGM_MOODS = ("upbeat", "emotional", "tense", "none")
+BGM_MOODS = ("variety", "lofi", "phonk", "pop", "acoustic", "suspense", "cinematic", "none")
 
 SUB_MAX_WIDTH = 640
 SUB_FONT_SIZE = 48
@@ -118,6 +142,46 @@ BGM_GAIN_MAX = 0.26
 POP_GAIN = 0.72
 WHOOSH_GAIN = 0.58
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg"}
+
+
+@dataclass(frozen=True)
+class StyleDirection:
+    tone: str
+    script_guide: str
+    fill: Tuple[int, int, int]
+    stroke: Tuple[int, int, int]
+    font_scale: float
+    xfade: float
+    speed: float
+    sfx: str
+
+
+def default_style_direction(style_prompt=""):
+    text = (style_prompt or "").lower()
+    fill, stroke = (255, 255, 255), (0, 0, 0)
+    xfade, speed, sfx, tone = 0.4, 1.0, "soft", "자연스러운 구어체"
+    if any(k in text for k in ("무한도전", "예능", "variety", "개그", "코미디")):
+        fill, stroke = (255, 224, 64), (20, 20, 20)
+        xfade, speed, sfx, tone = 0.18, 1.2, "poppy", "빠르고 장난기 있는 예능 톤"
+    elif any(k in text for k in ("뉴스", "브리핑", "news")):
+        fill, stroke = (245, 248, 255), (12, 28, 72)
+        xfade, speed, sfx, tone = 0.22, 1.0, "none", "단정한 뉴스 앵커 톤"
+    elif any(k in text for k in ("다큐", "시네마", "cinematic")):
+        fill, stroke = (255, 236, 210), (40, 24, 8)
+        xfade, speed, sfx, tone = 0.5, 1.0, "soft", "낮고 차분한 내레이션"
+    elif any(k in text for k in ("브이로그", "vlog", "감성")):
+        fill, stroke = (255, 255, 255), (30, 18, 40)
+        xfade, speed, sfx, tone = 0.45, 1.0, "soft", "친근한 브이로그 말투"
+    return StyleDirection(
+        tone=tone,
+        script_guide=tone + ". 지정 스타일의 컷 템포와 말맛에 맞출 것.",
+        fill=fill,
+        stroke=stroke,
+        font_scale=1.08 if "예능" in text or "무한도전" in text else 1.0,
+        xfade=xfade,
+        speed=speed,
+        sfx=sfx,
+    )
 
 
 @dataclass(frozen=True)
@@ -271,12 +335,20 @@ def sanitize_narration(text):
 def resolve_voice(voice_type):
     key = (voice_type or DEFAULT_VOICE_TYPE).strip().lower()
     aliases = {
-        "bright_female": "bright_female",
-        "female": "bright_female",
-        "energetic_male": "energetic_male",
-        "male": "energetic_male",
-        "calm_male": "calm_male",
-        "story_female": "story_female",
+        "variety_male": "variety_male",
+        "variety_female": "variety_female",
+        "vlog_female": "vlog_female",
+        "fast_story_male": "fast_story_male",
+        "docu_male": "docu_male",
+        "radio_female": "radio_female",
+        "news_male": "news_male",
+        "news_female": "news_female",
+        "bright_female": "variety_female",
+        "energetic_male": "variety_male",
+        "calm_male": "docu_male",
+        "story_female": "vlog_female",
+        "female": "vlog_female",
+        "male": "variety_male",
     }
     key = aliases.get(key, DEFAULT_VOICE_TYPE)
     preset = VOICE_PRESETS[key]
@@ -297,18 +369,23 @@ def normalize_speed(value):
 def normalize_bgm_mood(value):
     mood = (value or DEFAULT_BGM_MOOD).strip().lower()
     aliases = {
-        "upbeat": "upbeat",
-        "beat": "upbeat",
-        "energetic": "upbeat",
-        "emotional": "emotional",
-        "vlog": "emotional",
-        "soft": "emotional",
-        "tense": "tense",
-        "funk": "tense",
-        "punk": "tense",
+        "variety": "variety",
+        "lofi": "lofi",
+        "phonk": "phonk",
+        "pop": "pop",
+        "acoustic": "acoustic",
+        "suspense": "suspense",
+        "cinematic": "cinematic",
         "none": "none",
         "off": "none",
         "mute": "none",
+        "upbeat": "pop",
+        "beat": "pop",
+        "emotional": "lofi",
+        "vlog": "lofi",
+        "tense": "suspense",
+        "funk": "phonk",
+        "punk": "phonk",
     }
     return aliases.get(mood, DEFAULT_BGM_MOOD)
 
@@ -338,17 +415,219 @@ def parse_photo_order(raw, media_count):
     return text, order
 
 
-def generate_script(settings, media_files, style_prompt=""):
+def _extract_json(text):
+    raw = (text or "").strip()
+    fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw, re.S)
+    if fence:
+        raw = fence.group(1)
+    start, end = raw.find("{"), raw.rfind("}")
+    if start < 0 or end <= start:
+        return {}
+    try:
+        data = json.loads(raw[start : end + 1])
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def interpret_style_direction(settings, style_prompt=""):
+    base = default_style_direction(style_prompt)
+    style = (style_prompt or "").strip() or "감성 브이로그"
+    try:
+        client = OpenAI(api_key=settings.openai_api_key)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "한국어 숏폼 연출 디렉션을 JSON만 반환하세요. 스타일: {}\n"
+                        '{{"tone":"대본 어조","script_guide":"대본 작성 지시 한 줄",'
+                        '"fill":[R,G,B],"stroke":[R,G,B],"font_scale":1.0,'
+                        '"xfade":0.4,"speed":1.0,"sfx":"poppy|soft|none",'
+                        '"cut_tempo":"fast|normal|slow"}}'
+                    ).format(style),
+                }
+            ],
+            temperature=0.4,
+            max_tokens=280,
+        )
+        data = _extract_json(response.choices[0].message.content or "")
+        fill = tuple(int(x) for x in (data.get("fill") or base.fill)[:3])
+        stroke = tuple(int(x) for x in (data.get("stroke") or base.stroke)[:3])
+        xfade = float(data.get("xfade") or base.xfade)
+        tempo = (data.get("cut_tempo") or "").lower()
+        if tempo == "fast":
+            xfade = min(xfade, 0.2)
+        elif tempo == "slow":
+            xfade = max(xfade, 0.45)
+        return StyleDirection(
+            tone=(data.get("tone") or base.tone).strip(),
+            script_guide=(data.get("script_guide") or base.script_guide).strip(),
+            fill=(max(0, min(255, fill[0])), max(0, min(255, fill[1])), max(0, min(255, fill[2]))),
+            stroke=(max(0, min(255, stroke[0])), max(0, min(255, stroke[1])), max(0, min(255, stroke[2]))),
+            font_scale=max(0.85, min(1.25, float(data.get("font_scale") or base.font_scale))),
+            xfade=max(0.12, min(0.6, xfade)),
+            speed=normalize_speed(data.get("speed") or base.speed),
+            sfx=(data.get("sfx") or base.sfx).strip() or "soft",
+        )
+    except Exception as exc:
+        print("[안내] 스타일 해석 폴백: {}".format(exc))
+        return base
+
+
+def analyze_media_styles(settings, media_files):
+    if not media_files:
+        raise RuntimeError("분석할 미디어가 없습니다.")
+    b64 = media_to_preview_b64(media_files[0])
+    prompt = (
+        "사진/영상 첫 프레임을 보고 장소, 분위기, 행동을 파악한 뒤 "
+        "한국어 JSON만 반환하세요.\n"
+        '{"place":"","mood":"","action":"","theme":"",'
+        '"styles":[{"label":"짧은 칩 제목","prompt":"실제 입력용 스타일 프롬프트"}]}'
+        "\nstyles는 3~4개. prompt는 예능/브이로그/뉴스 등 연출이 드러나게."
+    )
+    content = [{"type": "text", "text": prompt}]
+    if b64:
+        content.append(
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}}
+        )
+    client = OpenAI(api_key=settings.openai_api_key)
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": content}],
+        temperature=0.7,
+        max_tokens=420,
+    )
+    data = _extract_json(response.choices[0].message.content or "")
+    styles = []
+    for item in data.get("styles") or []:
+        if isinstance(item, dict):
+            label = (item.get("label") or "").strip()
+            prompt_text = (item.get("prompt") or label).strip()
+            if prompt_text:
+                styles.append({"label": label or prompt_text, "prompt": prompt_text})
+        elif isinstance(item, str) and item.strip():
+            styles.append({"label": item.strip(), "prompt": item.strip()})
+    if len(styles) < 3:
+        styles = [
+            {"label": "감성 브이로그", "prompt": "감성 브이로그"},
+            {"label": "무한도전 스타일", "prompt": "무한도전 스타일"},
+            {"label": "뉴스 브리핑", "prompt": "뉴스 브리핑"},
+            {"label": "시네마틱 하이라이트", "prompt": "시네마틱 하이라이트"},
+        ]
+    return {
+        "place": (data.get("place") or "").strip(),
+        "mood": (data.get("mood") or "").strip(),
+        "action": (data.get("action") or "").strip(),
+        "theme": (data.get("theme") or "").strip(),
+        "styles": styles[:4],
+    }
+
+
+def smart_prepare_media(path, work_dir):
+    path = Path(path)
+    if path.suffix.lower() not in VIDEO_EXTS:
+        return path
+    duration = probe_duration(path)
+    if duration <= 60:
+        return path
+    start = _peak_window_start(path, duration, window=25.0)
+    dest = work_dir / ("highlight_{}.mp4".format(path.stem[:24]))
+    print("   긴 영상 {:.1f}초 → 하이라이트 {:.1f}초부터 25초 추출".format(duration, start))
+    run_ffmpeg(
+        [
+            "-ss",
+            "{:.3f}".format(start),
+            "-t",
+            "25",
+            "-i",
+            str(path),
+            "-vf",
+            "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            str(dest),
+        ],
+        timeout=45,
+    )
+    return dest if dest.is_file() else path
+
+
+def _peak_window_start(path, duration, window=25.0):
+    window = min(30.0, max(20.0, float(window)))
+    if duration <= window + 0.5:
+        return 0.0
+    tmp = Path(path).parent / ("_rms_{}.wav".format(uuid.uuid4().hex[:8]))
+    try:
+        run_ffmpeg(
+            [
+                "-i",
+                str(path),
+                "-t",
+                "180",
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "8000",
+                str(tmp),
+            ],
+            timeout=35,
+        )
+        with wave.open(str(tmp), "rb") as wav_file:
+            sr = wav_file.getframerate() or 8000
+            frames = wav_file.readframes(wav_file.getnframes())
+        samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
+        if samples.size < sr:
+            return min(duration * 0.12, max(0.0, duration - window))
+        hop = max(1, sr // 2)
+        win = max(hop, int(sr * 0.5))
+        scores = []
+        for i in range(0, samples.size - win, hop):
+            chunk = samples[i : i + win]
+            scores.append(float(np.sqrt(np.mean(np.square(chunk)))))
+        if not scores:
+            return 0.0
+        span = max(1, int(round(window / 0.5)))
+        best_i, best = 0, -1.0
+        for i in range(0, len(scores)):
+            val = float(np.mean(scores[i : i + span]))
+            if val > best:
+                best, best_i = val, i
+        start = best_i * 0.5
+        return max(0.0, min(start, max(0.0, duration - window)))
+    except Exception as exc:
+        print("[안내] 하이라이트 탐색 폴백: {}".format(exc))
+        return min(duration * 0.15, max(0.0, duration - window))
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def generate_script(settings, media_files, style_prompt="", direction=None):
     # type: (Settings, List[Path], str) -> Tuple[str, List[int]]
     print("1) OpenAI(gpt-4o-mini)로 숏폼 나레이션 대본 작성 중...")
     style = (style_prompt or "").strip() or "시선을 사로잡는 빠른 템포의 숏폼"
+    guide = ""
+    if direction is not None:
+        guide = "\n연출 지시: {} / {}".format(direction.tone, direction.script_guide)
     numbered = ", ".join(
         "{}번 {}".format(i + 1, path.name) for i, path in enumerate(media_files)
     )
     prompt = (
         "첨부된 사진/영상 프레임을 보고, 유튜브 쇼츠/인스타 릴스용 "
         "한국어 나레이션 대본만 작성하세요.\n"
-        "영상 스타일/분위기: {}\n"
+        "영상 스타일/분위기: {}{}\n"
         "이미지 번호: {}\n"
         "규칙:\n"
         "- 말할 때 20~30초 (대략 90~160자, 너무 길지 않게)\n"
@@ -360,7 +639,7 @@ def generate_script(settings, media_files, style_prompt=""):
         "- 대본 본문만 먼저 쓰고, 마지막 줄에 사진 배치를 이렇게 적으세요:\n"
         "PHOTO_ORDER: 1,3,2\n"
         "- PHOTO_ORDER는 대본 흐름에 맞게 이미지 번호(1부터)를 의미 있는 순서로 나열. 반복 가능"
-    ).format(style, numbered)
+    ).format(style, guide, numbered)
     content = [{"type": "text", "text": prompt}]
 
     attached = 0
@@ -812,13 +1091,14 @@ def wrap_subtitle_lines(text, font, max_width, stroke_width):
     return lines or [text]
 
 
-def render_subtitle_png(text, font_path, out_path):
-    # type: (str, str, Path) -> Path
+def render_subtitle_png(text, font_path, out_path, fill=(255, 255, 255), stroke=(0, 0, 0), font_scale=1.0):
+    # type: (str, str, Path, Tuple[int, int, int], Tuple[int, int, int], float) -> Path
     text = sanitize_narration(text)
     if not text:
         Image.new("RGBA", (8, 8), (0, 0, 0, 0)).save(out_path, "PNG")
         return out_path
-    font = _load_font(font_path, SUB_FONT_SIZE)
+    size = max(32, int(round(SUB_FONT_SIZE * float(font_scale or 1.0))))
+    font = _load_font(font_path, size)
     inner_width = SUB_MAX_WIDTH - SUB_PAD_X * 2
     lines = wrap_subtitle_lines(text, font, inner_width, SUB_STROKE)
 
@@ -832,6 +1112,8 @@ def render_subtitle_png(text, font_path, out_path):
     height = max(1, content_h + SUB_PAD_Y * 2)
     img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
+    fill_rgba = (int(fill[0]), int(fill[1]), int(fill[2]), 255)
+    stroke_rgba = (int(stroke[0]), int(stroke[1]), int(stroke[2]), 255)
 
     y = SUB_PAD_Y
     for line, (lw, lh, bbox) in zip(lines, sizes):
@@ -840,9 +1122,9 @@ def render_subtitle_png(text, font_path, out_path):
             (x, y - bbox[1]),
             line,
             font=font,
-            fill=(255, 255, 255, 255),
+            fill=fill_rgba,
             stroke_width=SUB_STROKE,
-            stroke_fill=(0, 0, 0, 255),
+            stroke_fill=stroke_rgba,
         )
         y += lh + SUB_LINE_GAP
 
@@ -969,10 +1251,14 @@ def pick_bgm_for_mood(mood):
     if mood == "none":
         return None
     keywords = {
-        "upbeat": ("upbeat", "beat", "energetic", "happy", "fun", "신나"),
-        "emotional": ("emotional", "vlog", "soft", "chill", "calm", "감성"),
-        "tense": ("tense", "funk", "punk", "pulse", "dark", "긴박"),
-    }.get(mood, ())
+        "variety": ("variety", "fun", "comedy", "예능", "gag"),
+        "lofi": ("lofi", "chill", "soft", "감성", "vlog"),
+        "phonk": ("phonk", "funk", "drift", "dark"),
+        "pop": ("pop", "upbeat", "happy", "beat"),
+        "acoustic": ("acoustic", "guitar", "folk", "warm"),
+        "suspense": ("suspense", "tense", "thriller", "pulse"),
+        "cinematic": ("cinematic", "epic", "score", "film"),
+    }.get(mood, (mood,))
     files = list_audio_files(BGM_DIR)
     matched = [
         path
@@ -992,17 +1278,23 @@ def synthesize_bgm(mood, duration, dest):
     sr = 22050
     n = max(sr, int(sr * max(1.0, float(duration) + 0.4)))
     t = np.arange(n, dtype=np.float64) / float(sr)
-    if mood == "emotional":
+    if mood in ("lofi", "acoustic"):
         wave_data = (
-            0.11 * np.sin(2 * np.pi * 196 * t)
-            + 0.08 * np.sin(2 * np.pi * 247 * t)
-            + 0.05 * np.sin(2 * np.pi * 294 * t)
+            0.10 * np.sin(2 * np.pi * 196 * t)
+            + 0.07 * np.sin(2 * np.pi * 247 * t)
+            + 0.04 * np.sin(2 * np.pi * 294 * t)
         ) * (0.55 + 0.45 * np.sin(2 * np.pi * 0.12 * t))
-    elif mood == "tense":
+    elif mood in ("suspense", "phonk"):
         pulse = (np.sin(2 * np.pi * 2.4 * t) > 0).astype(np.float64)
         wave_data = 0.14 * np.sin(2 * np.pi * 98 * t) * pulse + 0.04 * np.sin(
             2 * np.pi * 392 * t
         )
+    elif mood == "cinematic":
+        wave_data = 0.09 * np.sin(2 * np.pi * 130 * t) + 0.06 * np.sin(2 * np.pi * 196 * t)
+    elif mood == "variety":
+        kick = np.exp(-((t % 0.4) * 16)) * np.sin(2 * np.pi * 80 * t)
+        stab = ((t % 0.4) < 0.07).astype(np.float64) * np.sin(2 * np.pi * 660 * t)
+        wave_data = 0.15 * kick + 0.05 * stab
     else:
         kick = np.exp(-((t % 0.5) * 18)) * np.sin(2 * np.pi * 70 * t)
         stab = ((t % 0.5) < 0.08).astype(np.float64) * np.sin(2 * np.pi * 523 * t)
@@ -1254,7 +1546,7 @@ def arrange_media_for_cues(media_files, cues, photo_order):
     return [cycle[i % len(cycle)] for i in range(len(cues))]
 
 
-def compose_captioned_png(src, caption, font_path, dest_png, work_dir):
+def compose_captioned_png(src, caption, font_path, dest_png, work_dir, direction=None):
     suffix = Path(src).suffix.lower()
     if suffix in IMAGE_EXTS:
         with Image.open(src) as im:
@@ -1270,7 +1562,14 @@ def compose_captioned_png(src, caption, font_path, dest_png, work_dir):
     text = sanitize_narration(caption)
     if text:
         cap_path = dest_png.with_name(dest_png.stem + "_cap.png")
-        render_subtitle_png(text, font_path, cap_path)
+        render_subtitle_png(
+            text,
+            font_path,
+            cap_path,
+            fill=(direction.fill if direction else (255, 255, 255)),
+            stroke=(direction.stroke if direction else (0, 0, 0)),
+            font_scale=(direction.font_scale if direction else 1.0),
+        )
         overlay = Image.open(cap_path).convert("RGBA")
         x = max(0, (TARGET_W - overlay.width) // 2)
         y = max(0, TARGET_H - overlay.height - 64)
@@ -1278,14 +1577,16 @@ def compose_captioned_png(src, caption, font_path, dest_png, work_dir):
     canvas.convert("RGB").save(dest_png, "PNG", compress_level=1)
 
 
-def prepare_captioned_frames(media_files, pieces, photo_order, font_path, work_dir):
+def prepare_captioned_frames(media_files, pieces, photo_order, font_path, work_dir, direction=None):
     dummy_cues = [(text, 0.0, 1.0) for text in pieces]
     assigned = arrange_media_for_cues(media_files, dummy_cues, photo_order or [])
     frames = [None] * len(pieces)
 
     def _one(index):
         framed = work_dir / ("frame_{:03d}.png".format(index))
-        compose_captioned_png(assigned[index], pieces[index], font_path, framed, work_dir)
+        compose_captioned_png(
+            assigned[index], pieces[index], font_path, framed, work_dir, direction=direction
+        )
         return index, framed
 
     workers = min(2, max(1, len(pieces)))
@@ -1313,8 +1614,9 @@ def write_concat_list(entries, list_path):
     return list_path
 
 
-def build_slideshow_entries(frames, durations, work_dir, speed=1.0):
+def build_slideshow_entries(frames, durations, work_dir, speed=1.0, xfade_sec=XFADE_SEC):
     speed = max(0.5, float(speed))
+    xfade_sec = max(0.12, min(0.6, float(xfade_sec or XFADE_SEC)))
     scaled = [max(0.2, float(dur) / speed) for dur in durations]
     if len(frames) == 1:
         return [(frames[0], scaled[0])]
@@ -1326,7 +1628,7 @@ def build_slideshow_entries(frames, durations, work_dir, speed=1.0):
             last = i == len(frames) - 1
             fade = 0.0
             if not last:
-                fade = min(XFADE_SEC, scaled[i] * 0.45, scaled[i + 1] * 0.45)
+                fade = min(xfade_sec, scaled[i] * 0.45, scaled[i + 1] * 0.45)
             hold = scaled[i] if last else max(0.12, scaled[i] - fade)
             entries.append((png, hold))
             if last or fade < 0.12:
@@ -1347,12 +1649,14 @@ def build_slideshow_entries(frames, durations, work_dir, speed=1.0):
     return entries
 
 
-def ffmpeg_single_pass(frames, durations, voice_path, bgm_path, out_file, speed=1.0, work_dir=None):
+def ffmpeg_single_pass(frames, durations, voice_path, bgm_path, out_file, speed=1.0, work_dir=None, xfade_sec=XFADE_SEC):
     speed = normalize_speed(speed)
     if not frames:
         raise RuntimeError("렌더할 프레임이 없습니다.")
     work_dir = Path(work_dir or Path(frames[0]).parent)
-    entries = build_slideshow_entries(frames, durations, work_dir, speed=speed)
+    entries = build_slideshow_entries(
+        frames, durations, work_dir, speed=speed, xfade_sec=xfade_sec
+    )
     concat_path = work_dir / "slides.txt"
     write_concat_list(entries, concat_path)
     total = sum(dur for _png, dur in entries)
@@ -1483,6 +1787,10 @@ def run_pipeline(
     voice_key, _voice_id, _preset = resolve_voice(voice_type)
     progress_lock = threading.Lock()
 
+    work_dir = out_file.parent / ("_ffwork_{}".format(uuid.uuid4().hex[:8]))
+    work_dir.mkdir(parents=True, exist_ok=True)
+    voice_file = out_file.parent / "voice.mp3"
+
     _notify(
         progress_cb,
         4,
@@ -1491,15 +1799,17 @@ def run_pipeline(
         ),
         progress_lock,
     )
-    _notify(progress_cb, 10, "대본 작성 중", progress_lock)
-    script, photo_order = generate_script(settings, media_files, style_prompt=style_prompt)
+    _notify(progress_cb, 7, "긴 영상 하이라이트 추출 중", progress_lock)
+    media_files = [smart_prepare_media(path, work_dir) for path in media_files]
+    _notify(progress_cb, 11, "스타일 연출 해석 중", progress_lock)
+    direction = interpret_style_direction(settings, style_prompt)
+    _notify(progress_cb, 16, "대본 작성 중", progress_lock)
+    script, photo_order = generate_script(
+        settings, media_files, style_prompt=style_prompt, direction=direction
+    )
     script = sanitize_narration(script)
     pieces = split_script_pieces(script)
     _notify(progress_cb, 22, "대본 완료 · 음성/이미지 병렬 처리 시작", progress_lock)
-
-    work_dir = out_file.parent / ("_ffwork_{}".format(uuid.uuid4().hex[:8]))
-    work_dir.mkdir(parents=True, exist_ok=True)
-    voice_file = out_file.parent / "voice.mp3"
 
     try:
         def _voice_job():
@@ -1511,7 +1821,7 @@ def run_pipeline(
         def _frame_job():
             _notify(progress_cb, 30, "이미지·자막 병렬 합성 중", progress_lock)
             frames = prepare_captioned_frames(
-                media_files, pieces, photo_order, font_path, work_dir
+                media_files, pieces, photo_order, font_path, work_dir, direction=direction
             )
             _notify(progress_cb, 52, "이미지·자막 합성 완료", progress_lock)
             return frames
@@ -1531,7 +1841,9 @@ def run_pipeline(
             n = min(len(durations), len(frames))
             frames = frames[:n]
             durations = durations[:n]
-        print("   음성 길이: {:.2f}초 / 배속 {}x / BGM {}".format(audio_duration, speed, mood))
+        print("   음성 길이: {:.2f}초 / 배속 {}x / BGM {} / xfade {:.2f}".format(
+            audio_duration, speed, mood, direction.xfade
+        ))
 
         _notify(progress_cb, 68, "BGM 준비 중", progress_lock)
         bgm_path = resolve_bgm(mood, audio_duration, work_dir / "bgm.wav")
@@ -1545,6 +1857,7 @@ def run_pipeline(
             out_file,
             speed=speed,
             work_dir=work_dir,
+            xfade_sec=direction.xfade,
         )
         _notify(progress_cb, 96, "출력 파일 정리 중", progress_lock)
     finally:

@@ -22,7 +22,17 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from license_lock import mobile_hwid, verify_or_activate_mobile
-from main import IMAGE_EXTS, OUTPUT_DIR, VIDEO_EXTS, normalize_bgm_mood, normalize_speed, resolve_voice, run_pipeline
+from main import (
+    IMAGE_EXTS,
+    OUTPUT_DIR,
+    VIDEO_EXTS,
+    analyze_media_styles,
+    load_settings,
+    normalize_bgm_mood,
+    normalize_speed,
+    resolve_voice,
+    run_pipeline,
+)
 
 load_dotenv()
 
@@ -127,6 +137,7 @@ def root():
         "service": "AI 숏폼 모바일 서버",
         "endpoints": [
             "/verify-license",
+            "/analyze-media",
             "/create-video",
             "/job-status/{job_id}",
             "/download/{job_id}",
@@ -157,6 +168,49 @@ def verify_license(body: VerifyLicenseBody):
     }
 
 
+@app.post("/analyze-media")
+async def analyze_media(
+    files: List[UploadFile] = File(..., description="사진/동영상"),
+    license_key: str = Form(..., description="라이선스 키"),
+    device_id: str = Form(..., description="Android ID / iOS Vendor ID"),
+    platform: str = Form("", description="android 또는 ios"),
+):
+    ok, message = verify_or_activate_mobile(license_key, device_id, platform)
+    if not ok:
+        raise HTTPException(status_code=403, detail=message)
+    if not files:
+        raise HTTPException(status_code=400, detail="분석할 미디어를 올려 주세요.")
+
+    job_id = uuid.uuid4().hex[:12]
+    tmp_dir = JOBS_DIR / ("analyze_{}".format(job_id))
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    saved = []
+    try:
+        for index, item in enumerate(files[:3]):
+            filename = _safe_name(item.filename)
+            if not filename:
+                continue
+            dest = tmp_dir / "{:03d}_{}".format(index + 1, filename)
+            data = await item.read()
+            if not data:
+                continue
+            dest.write_bytes(data)
+            saved.append(dest)
+            await item.close()
+        if not saved:
+            raise HTTPException(status_code=400, detail="지원하는 미디어가 없습니다.")
+        result = analyze_media_styles(load_settings(), saved)
+        result["ok"] = True
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="미디어 분석 실패: {}".format(exc))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 @app.post("/create-video")
 async def create_video(
     files: List[UploadFile] = File(..., description="사진/동영상 (여러 개 가능)"),
@@ -165,9 +219,10 @@ async def create_video(
     license_key: str = Form(..., description="라이선스 키"),
     device_id: str = Form(..., description="Android ID / iOS Vendor ID"),
     platform: str = Form("", description="android 또는 ios"),
-    voice_type: str = Form("bright_female", description="energetic_male/bright_female/calm_male/story_female"),
-    speed_multiplier: str = Form("1.0", description="1.0, 1.2, 1.5"),
-    bgm_mood: str = Form("upbeat", description="upbeat/emotional/tense/none"),
+    voice_type: str = Form("vlog_female", description="variety_male 등 8종"),
+    speed_multiplier: str = Form("1.2", description="1.0, 1.2, 1.5"),
+    bgm_mood: str = Form("pop", description="구버전 별칭"),
+    bgm_type: str = Form("pop", description="variety/lofi/phonk/pop/acoustic/suspense/cinematic/none"),
 ):
     ok, message = verify_or_activate_mobile(license_key, device_id, platform)
     if not ok:
@@ -179,7 +234,7 @@ async def create_video(
 
     voice_key, _vid, _preset = resolve_voice(voice_type)
     speed = normalize_speed(speed_multiplier)
-    mood = normalize_bgm_mood(bgm_mood)
+    mood = normalize_bgm_mood(bgm_type or bgm_mood)
 
     job_id = uuid.uuid4().hex[:16]
     job_dir = JOBS_DIR / job_id
@@ -227,6 +282,7 @@ async def create_video(
         "status": "processing",
         "voice_type": voice_key,
         "speed_multiplier": speed,
+        "bgm_type": mood,
         "bgm_mood": mood,
     }
 
