@@ -34,7 +34,7 @@ WORKER = ThreadPoolExecutor(max_workers=1)
 
 app = FastAPI(
     title="AI 숏폼 모바일 서버",
-    description="비동기 작업 큐 + Pillow/FFmpeg 초고속 릴스 엔진",
+    description="비동기 작업 큐 + 블러 배경/크로스페이드 초고속 릴스 엔진",
     version="3.0.0",
 )
 app.add_middleware(

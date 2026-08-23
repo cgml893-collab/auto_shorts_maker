@@ -24,7 +24,7 @@ import numpy as np
 import requests
 from dotenv import load_dotenv
 from openai import OpenAI
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from license_lock import require_license, verify_saved_license
 
 try:
@@ -61,6 +61,9 @@ FINAL_PATH = OUTPUT_DIR / "final_shorts.mp4"
 TARGET_W = 720
 TARGET_H = 1280
 FPS = 24
+XFADE_SEC = 0.4
+BLUR_RADIUS = 26
+BLUR_DIM = 0.38
 FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "60"))
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
@@ -1205,13 +1208,30 @@ def fit_cover_rgb(im, width, height, fast=True):
     return img.crop((left, top, left + width, top + height))
 
 
+def fit_contain_on_blur(im, width, height):
+    src = im.convert("RGB")
+    resampling = getattr(Image, "Resampling", Image)
+    bg = fit_cover_rgb(src, width, height, fast=True)
+    bg = bg.filter(ImageFilter.GaussianBlur(radius=BLUR_RADIUS))
+    bg = Image.blend(bg, Image.new("RGB", (width, height), (0, 0, 0)), BLUR_DIM)
+    scale = min(width / float(src.width), height / float(src.height))
+    nw = max(2, int(round(src.width * scale)))
+    nh = max(2, int(round(src.height * scale)))
+    nw -= nw % 2
+    nh -= nh % 2
+    fg = src.resize((nw, nh), resampling.BILINEAR)
+    canvas = bg.copy()
+    canvas.paste(fg, ((width - nw) // 2, (height - nh) // 2))
+    return canvas
+
+
 def still_from_media(path, dest_jpg, work_dir, width=None, height=None):
     width = int(width or TARGET_W)
     height = int(height or TARGET_H)
     suffix = Path(path).suffix.lower()
     if suffix in IMAGE_EXTS:
         with Image.open(path) as im:
-            fit_cover_rgb(im, width, height).save(dest_jpg, "JPEG", quality=85)
+            fit_contain_on_blur(im, width, height).save(dest_jpg, "JPEG", quality=85)
         return dest_jpg
     tmp = work_dir / (dest_jpg.stem + "_grab.jpg")
     run_ffmpeg(
@@ -1219,7 +1239,7 @@ def still_from_media(path, dest_jpg, work_dir, width=None, height=None):
         timeout=20,
     )
     with Image.open(tmp) as im:
-        fit_cover_rgb(im, width, height).save(dest_jpg, "JPEG", quality=85)
+        fit_contain_on_blur(im, width, height).save(dest_jpg, "JPEG", quality=85)
     return dest_jpg
 
 
@@ -1238,7 +1258,7 @@ def compose_captioned_png(src, caption, font_path, dest_png, work_dir):
     suffix = Path(src).suffix.lower()
     if suffix in IMAGE_EXTS:
         with Image.open(src) as im:
-            canvas = fit_cover_rgb(im, TARGET_W, TARGET_H).convert("RGBA")
+            canvas = fit_contain_on_blur(im, TARGET_W, TARGET_H).convert("RGBA")
     else:
         tmp = work_dir / (dest_png.stem + "_grab.jpg")
         run_ffmpeg(
@@ -1246,7 +1266,7 @@ def compose_captioned_png(src, caption, font_path, dest_png, work_dir):
             timeout=12,
         )
         with Image.open(tmp) as im:
-            canvas = fit_cover_rgb(im, TARGET_W, TARGET_H).convert("RGBA")
+            canvas = fit_contain_on_blur(im, TARGET_W, TARGET_H).convert("RGBA")
     text = sanitize_narration(caption)
     if text:
         cap_path = dest_png.with_name(dest_png.stem + "_cap.png")
@@ -1281,17 +1301,50 @@ def _concat_file_line(path):
     return "file '{}'".format(Path(path).resolve().as_posix().replace("'", r"'\''"))
 
 
-def write_concat_list(frames, durations, list_path, speed=1.0):
-    speed = max(0.5, float(speed))
+def write_concat_list(entries, list_path):
     lines = ["ffconcat version 1.0"]
-    last = frames[-1]
-    for png, dur in zip(frames, durations):
+    last = entries[-1][0]
+    for png, dur in entries:
         last = png
         lines.append(_concat_file_line(png))
-        lines.append("duration {:.3f}".format(max(0.2, float(dur) / speed)))
+        lines.append("duration {:.4f}".format(max(0.04, float(dur))))
     lines.append(_concat_file_line(last))
     list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return list_path
+
+
+def build_slideshow_entries(frames, durations, work_dir, speed=1.0):
+    speed = max(0.5, float(speed))
+    scaled = [max(0.2, float(dur) / speed) for dur in durations]
+    if len(frames) == 1:
+        return [(frames[0], scaled[0])]
+
+    opened = [Image.open(path).convert("RGB") for path in frames]
+    entries = []
+    try:
+        for i, png in enumerate(frames):
+            last = i == len(frames) - 1
+            fade = 0.0
+            if not last:
+                fade = min(XFADE_SEC, scaled[i] * 0.45, scaled[i + 1] * 0.45)
+            hold = scaled[i] if last else max(0.12, scaled[i] - fade)
+            entries.append((png, hold))
+            if last or fade < 0.12:
+                continue
+            count = max(6, int(round(FPS * fade)))
+            step = fade / float(count)
+            src_a = opened[i]
+            src_b = opened[i + 1]
+            for k in range(count):
+                alpha = (k + 1) / float(count)
+                mix = Image.blend(src_a, src_b, alpha)
+                out = work_dir / "xfade_{:03d}_{:02d}.jpg".format(i, k)
+                mix.save(out, "JPEG", quality=82)
+                entries.append((out, step))
+    finally:
+        for img in opened:
+            img.close()
+    return entries
 
 
 def ffmpeg_single_pass(frames, durations, voice_path, bgm_path, out_file, speed=1.0, work_dir=None):
@@ -1299,9 +1352,10 @@ def ffmpeg_single_pass(frames, durations, voice_path, bgm_path, out_file, speed=
     if not frames:
         raise RuntimeError("렌더할 프레임이 없습니다.")
     work_dir = Path(work_dir or Path(frames[0]).parent)
+    entries = build_slideshow_entries(frames, durations, work_dir, speed=speed)
     concat_path = work_dir / "slides.txt"
-    write_concat_list(frames, durations, concat_path, speed=speed)
-    total = sum(max(0.2, float(dur) / max(0.5, speed)) for dur in durations)
+    write_concat_list(entries, concat_path)
+    total = sum(dur for _png, dur in entries)
 
     voice_mp3 = work_dir / "voice.mp3"
     if Path(voice_path).resolve() != voice_mp3.resolve():
@@ -1320,7 +1374,7 @@ def ffmpeg_single_pass(frames, durations, voice_path, bgm_path, out_file, speed=
         else:
             bgm_mp3 = src
 
-    if len(frames) == 1:
+    if len(entries) == 1:
         args = [
             "-loop",
             "1",
@@ -1329,7 +1383,7 @@ def ffmpeg_single_pass(frames, durations, voice_path, bgm_path, out_file, speed=
             "-t",
             "{:.3f}".format(total),
             "-i",
-            str(frames[0]),
+            str(entries[0][0]),
             "-i",
             str(voice_mp3),
         ]
