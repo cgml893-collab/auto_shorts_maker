@@ -95,6 +95,7 @@ class StudioScreen extends StatefulWidget {
 }
 
 class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver {
+  static const String _kJobId = "active_job_id";
   final _styleCtrl = TextEditingController(text: '신나는 브이로그');
   final _picker = ImagePicker();
   List<XFile> _media = [];
