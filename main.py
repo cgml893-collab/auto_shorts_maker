@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import gc
 import io
 import json
 import math
@@ -67,8 +69,10 @@ BLUR_RADIUS = 26
 BLUR_DIM = 0.38
 FAL_I2V_PRIMARY = os.getenv("FAL_I2V_MODEL", "fal-ai/minimax/video-01/image-to-video")
 FAL_I2V_FALLBACK = "fal-ai/kling-video/v1/standard/image-to-video"
-RUNWAY_CLIP_SEC = 5.0
-RUNWAY_MAX_CLIPS = 3
+SPARK_CLIP_SEC = 5.0
+SPARK_MAX_CLIPS = 3
+HD_W = 1080
+HD_H = 1920
 CAMERA_MOTIONS = {
     "zoom_in": "[Zoom in] Cinematic slow push-in, natural subtle motion, keep the subject centered, photorealistic.",
     "drone": "[Pedestal up, Tracking shot] Smooth drone-style rise and gentle forward glide over the scene.",
@@ -213,8 +217,6 @@ def load_settings():
         missing.append("OPENAI_API_KEY")
     if not eleven_key:
         missing.append("ELEVENLABS_API_KEY")
-    if not fal_key:
-        missing.append("FAL_KEY")
     if missing:
         raise RuntimeError(
             ".env에 다음 키가 없습니다: "
@@ -786,21 +788,42 @@ def generate_voice(settings, script, output_path=None, voice_type=DEFAULT_VOICE_
 
 
 FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "60"))
+FFMPEG_ENCODE = [
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-tune",
+    "stillimage",
+    "-crf",
+    "23",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
+    "-threads",
+    "2",
+    "-shortest",
+    "-movflags",
+    "+faststart",
+]
 FFMPEG_PRESET = [
     "-c:v",
     "libx264",
-    "-tune",
-    "stillimage",
     "-preset",
     "ultrafast",
+    "-tune",
+    "stillimage",
     "-crf",
     "23",
     "-pix_fmt",
     "yuv420p",
     "-threads",
-    "1",
+    "2",
 ]
-FFMPEG_LIGHT = ["-threads", "1"]
+FFMPEG_LIGHT = ["-threads", "2"]
 
 SCALE_PAD_VF = (
     "scale={w}:{h}:force_original_aspect_ratio=decrease,"
@@ -1693,14 +1716,33 @@ def compose_captioned_png(src, caption, font_path, dest_png, work_dir, direction
     return Path(dest_png)
 
 
-def prepare_captioned_frames(media_files, pieces, photo_order, font_path, work_dir, direction=None):
+def prepare_captioned_frames(
+    media_files,
+    pieces,
+    photo_order,
+    font_path,
+    work_dir,
+    direction=None,
+    width=None,
+    height=None,
+):
     dummy_cues = [(text, 0.0, 1.0) for text in pieces]
     assigned = arrange_media_for_cues(media_files, dummy_cues, photo_order or [])
-    frames = []
+    width = int(width or TARGET_W)
+    height = int(height or TARGET_H)
+    jobs = []
     for index, src in enumerate(assigned):
         framed = work_dir / ("frame_{:03d}.jpg".format(index))
-        still_from_media(src, framed, work_dir, TARGET_W, TARGET_H)
-        frames.append(framed)
+        jobs.append((src, framed))
+
+    def _one(item):
+        src, dest = item
+        still_from_media(src, dest, work_dir, width, height)
+        return dest
+
+    workers = min(4, max(1, len(jobs)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        frames = list(pool.map(_one, jobs))
     return frames
 
 
@@ -1843,27 +1885,7 @@ def ffmpeg_single_pass(
 
     args += extra
     args += audio_map
-    args += [
-        "-r",
-        str(FPS),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-tune",
-        "stillimage",
-        "-crf",
-        "23",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-shortest",
-        "-movflags",
-        "+faststart",
-    ] + FFMPEG_LIGHT + [str(out_file)]
+    args += ["-r", str(FPS)] + FFMPEG_ENCODE + [str(out_file)]
     run_ffmpeg(args, timeout=min(60, FFMPEG_TIMEOUT))
 
 
@@ -1941,29 +1963,58 @@ def fal_image_to_video(image_path, prompt, dest_mp4):
     raise RuntimeError("Image-to-Video 생성 실패: {}".format(last_error))
 
 
-def generate_runway_clips(media_files, style_prompt, camera_motion, work_dir, progress_cb=None, lock=None):
+def generate_spark_cinema_clips(
+    media_files,
+    style_prompt,
+    camera_motion,
+    work_dir,
+    progress_cb=None,
+    lock=None,
+    width=None,
+    height=None,
+):
     motion = normalize_camera_motion(camera_motion)
     motion_prompt = CAMERA_MOTIONS[motion]
     prompt = "{} {}".format((style_prompt or "cinematic vertical short").strip(), motion_prompt)
-    sources = list(media_files)[:RUNWAY_MAX_CLIPS]
-    clips = []
+    sources = list(media_files)[:SPARK_MAX_CLIPS]
+    width = int(width or TARGET_W)
+    height = int(height or TARGET_H)
     total = max(1, len(sources))
-    for index, src in enumerate(sources):
-        _notify(
-            progress_cb,
-            34 + int(28 * index / total),
-            "런웨이 AI 비디오 생성 중 ({}/{})...".format(index + 1, total),
-            lock,
-        )
+    _notify(progress_cb, 34, "✨ 스파크 시네마 AI 병렬 생성 중 ({}장)".format(total), lock)
+
+    def _one(index, src):
         frame = work_dir / ("i2v_src_{:02d}.jpg".format(index + 1))
-        still_from_media(src, frame, work_dir, TARGET_W, TARGET_H)
+        still_from_media(src, frame, work_dir, width, height)
         clip = work_dir / ("i2v_{:02d}.mp4".format(index + 1))
         fal_image_to_video(frame, prompt, clip)
-        clips.append(clip)
+        return clip
+
+    async def _gather():
+        tasks = [asyncio.to_thread(_one, index, src) for index, src in enumerate(sources)]
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+    results = asyncio.run(_gather())
+    clips = []
+    errors = []
+    for item in results:
+        if isinstance(item, Exception):
+            errors.append(item)
+            print("[안내] 스파크 시네마 클립 실패: {}".format(item))
+        elif item:
+            clips.append(item)
+    if not clips:
+        raise RuntimeError("✨ 스파크 시네마 AI 비디오를 만들지 못했습니다: {}".format(errors[:2]))
+    _notify(progress_cb, 62, "✨ 스파크 시네마 AI 클립 {}개 준비 완료".format(len(clips)), lock)
     return clips
 
 
-def normalize_runway_clip(src, dest):
+def generate_runway_clips(*args, **kwargs):
+    return generate_spark_cinema_clips(*args, **kwargs)
+
+
+def normalize_spark_clip(src, dest, width=None, height=None):
+    width = int(width or TARGET_W)
+    height = int(height or TARGET_H)
     run_ffmpeg(
         [
             "-i",
@@ -1971,24 +2022,18 @@ def normalize_runway_clip(src, dest):
             "-an",
             "-vf",
             "scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,fps={fps},format=yuv420p".format(
-                w=TARGET_W, h=TARGET_H, fps=FPS
+                w=width, h=height, fps=FPS
             ),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-crf",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
         ]
-        + FFMPEG_LIGHT
-        + [str(dest)],
+        + FFMPEG_PRESET
+        + ["-movflags", "+faststart", str(dest)],
         timeout=30,
     )
     return dest
+
+
+def normalize_runway_clip(src, dest):
+    return normalize_spark_clip(src, dest)
 
 
 def concat_loop_copy(clips, dest, duration, work_dir):
@@ -2075,27 +2120,47 @@ def overlay_cues_on_video(video_path, cues, font_path, direction, work_dir, dest
     return overlay_subtitles(video_path, cues, font_path, dest, work_dir)
 
 
-def ffmpeg_runway_pass(
-    clips, durations, cues, font_path, direction, voice_path, bgm_path, out_file, work_dir, audio_duration
+def ffmpeg_spark_pass(
+    clips,
+    durations,
+    cues,
+    font_path,
+    direction,
+    voice_path,
+    bgm_path,
+    out_file,
+    work_dir,
+    audio_duration,
+    width=None,
+    height=None,
 ):
     if not clips:
-        raise RuntimeError("런웨이 비디오 클립이 없습니다.")
+        raise RuntimeError("✨ 스파크 시네마 AI 비디오 클립이 없습니다.")
+    width = int(width or TARGET_W)
+    height = int(height or TARGET_H)
     target = max(float(audio_duration), 1.0)
-    unique = []
-    cache = {}
-    for clip in clips:
-        key = str(Path(clip).resolve())
-        if key not in cache:
-            dest = work_dir / ("rw_n_{:02d}.mp4".format(len(cache)))
-            cache[key] = normalize_runway_clip(clip, dest)
-        unique.append(cache[key])
-
-    body = work_dir / "runway_body.mp4"
-    concat_loop_copy(unique, body, target, work_dir)
+    durs = []
+    for path in clips:
+        try:
+            durs.append(max(0.4, probe_duration(path)))
+        except Exception:
+            durs.append(SPARK_CLIP_SEC)
+    list_path = work_dir / "spark_loop.txt"
+    lines = ["ffconcat version 1.0"]
+    elapsed = 0.0
+    index = 0
+    while elapsed < target + 0.05 and index < 24:
+        path = clips[index % len(clips)]
+        lines.append(_concat_file_line(path))
+        elapsed += durs[index % len(clips)]
+        index += 1
+    list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     srt = write_cues_srt(cues, work_dir / "subs.srt")
-    vf = subtitles_vf(srt, font_path)
-    args = ["-i", str(body), "-i", str(voice_path)]
+    vf = (
+        "scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,fps={fps},format=yuv420p,{subs}"
+    ).format(w=width, h=height, fps=FPS, subs=subtitles_vf(srt, font_path))
+    args = ["-f", "concat", "-safe", "0", "-i", str(list_path), "-i", str(voice_path)]
     maps = ["-map", "[v]", "-map", "1:a:0"]
     extra = ["-filter_complex", "[0:v]{}[v]".format(vf)]
     if bgm_path:
@@ -2108,25 +2173,79 @@ def ffmpeg_runway_pass(
             ),
         ]
         maps = ["-map", "[v]", "-map", "[a]"]
-    args += extra + maps + [
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-crf",
-        "23",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-t",
-        "{:.3f}".format(float(audio_duration)),
-        "-movflags",
-        "+faststart",
-    ] + FFMPEG_LIGHT + [str(out_file)]
+    args += extra + maps + FFMPEG_ENCODE + ["-t", "{:.3f}".format(float(audio_duration)), str(out_file)]
     run_ffmpeg(args, timeout=50)
+
+
+def ffmpeg_runway_pass(*args, **kwargs):
+    return ffmpeg_spark_pass(*args, **kwargs)
+
+
+def fallback_script(style_prompt=""):
+    style = sanitize_narration(style_prompt) or "이 장면"
+    text = (
+        "지금 이 장면을 그냥 넘기지 마세요. {}의 공기와 빛이 한순간에 마음을 붙잡습니다. "
+        "가까이 다가갈수록 디테일이 살아나고, 잠깐의 숨이 길게 남아요. "
+        "오늘은 이 순간을 기록하고, 내일의 나에게 따뜻한 여운으로 건넵니다."
+    ).format(style[:24])
+    return sanitize_narration(text), []
+
+
+def ensure_voice_track(settings, script, dest, voice_key, duration=18.0):
+    try:
+        path = generate_voice(settings, script, output_path=dest, voice_type=voice_key)
+        if Path(path).is_file() and Path(path).stat().st_size > 500:
+            return Path(path)
+    except Exception as exc:
+        print("[안내] TTS 실패, 무음 트랙으로 폴백: {}".format(exc))
+    silent = Path(dest).with_suffix(".wav")
+    run_ffmpeg(
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=44100:cl=stereo",
+            "-t",
+            "{:.3f}".format(max(8.0, float(duration))),
+            "-c:a",
+            "pcm_s16le",
+            str(silent),
+        ],
+        timeout=15,
+    )
+    return silent
+
+
+def blur_fallback_render(media_files, script, voice_path, bgm_path, out_file, work_dir, font_path, speed, width, height):
+    pieces = split_script_pieces(script) or [script]
+    frames = prepare_captioned_frames(
+        media_files, pieces, [], font_path, work_dir, width=width, height=height
+    )
+    try:
+        audio_duration = probe_duration(voice_path)
+    except Exception:
+        audio_duration = 12.0
+    cues = split_script_cues(script, audio_duration)
+    durations = [max(0.2, float(end) - float(start)) for _text, start, end in cues]
+    if len(durations) != len(frames):
+        n = min(len(durations), len(frames)) or 1
+        if not frames:
+            raise RuntimeError("폴백 프레임이 없습니다.")
+        frames = (frames * n)[:n]
+        durations = (durations or [audio_duration])[:n]
+    ffmpeg_single_pass(
+        frames,
+        durations,
+        voice_path,
+        bgm_path,
+        out_file,
+        speed=speed,
+        work_dir=work_dir,
+        xfade_sec=0.12,
+        cues=cues,
+        font_path=font_path,
+    )
+    return out_file
 
 
 def run_pipeline(
@@ -2139,9 +2258,11 @@ def run_pipeline(
     speed_multiplier=1.0,
     bgm_mood=DEFAULT_BGM_MOOD,
     is_runway_mode=False,
+    is_spark_cinema=None,
     camera_motion="zoom_in",
+    output_height=720,
+    fast_mode=True,
 ):
-    # type: (List[Path], str, object, Optional[Path], bool, str, float, str, bool, str) -> Tuple[Path, str]
     if check_license:
         ok, message = verify_saved_license()
         if not ok:
@@ -2156,57 +2277,86 @@ def run_pipeline(
     out_file.parent.mkdir(parents=True, exist_ok=True)
     speed = normalize_speed(speed_multiplier)
     mood = normalize_bgm_mood(bgm_mood)
-    runway = bool(is_runway_mode)
+    spark = bool(is_spark_cinema) if is_spark_cinema is not None else bool(is_runway_mode)
     motion = normalize_camera_motion(camera_motion)
-    if runway and mood == "none":
+    height = HD_H if int(output_height or 720) >= 1080 else TARGET_H
+    width = HD_W if height == HD_H else TARGET_W
+    if spark and mood == "none":
         mood = "lofi"
     voice_key, _voice_id, _preset = resolve_voice(voice_type)
     progress_lock = threading.Lock()
+    used_fallback = False
 
     work_dir = out_file.parent / ("_ffwork_{}".format(uuid.uuid4().hex[:8]))
     work_dir.mkdir(parents=True, exist_ok=True)
     voice_file = out_file.parent / "voice.mp3"
 
-    _notify(
-        progress_cb,
-        4,
-        "미디어 {}개 준비: {}".format(
-            len(media_files), ", ".join(p.name for p in media_files)
-        ),
-        progress_lock,
-    )
-    _notify(progress_cb, 7, "긴 영상 하이라이트 추출 중", progress_lock)
-    media_files = [smart_prepare_media(path, work_dir) for path in media_files]
-    _notify(progress_cb, 11, "스타일 연출 해석 중", progress_lock)
-    direction = interpret_style_direction(settings, style_prompt)
-    _notify(progress_cb, 16, "대본 작성 중", progress_lock)
-    script, photo_order = generate_script(
-        settings, media_files, style_prompt=style_prompt, direction=direction
-    )
-    script = sanitize_narration(script)
-    pieces = split_script_pieces(script)
-    _notify(progress_cb, 22, "대본 완료 · 음성/이미지 병렬 처리 시작", progress_lock)
-
     try:
+        _notify(
+            progress_cb,
+            4,
+            "미디어 {}개 준비: {}".format(len(media_files), ", ".join(p.name for p in media_files)),
+            progress_lock,
+        )
+        _notify(progress_cb, 8, "긴 영상 하이라이트 추출 중", progress_lock)
+        media_files = [smart_prepare_media(path, work_dir) for path in media_files]
+
+        if spark or not fast_mode:
+            _notify(progress_cb, 12, "스타일 연출 해석 중", progress_lock)
+            try:
+                direction = interpret_style_direction(settings, style_prompt)
+            except Exception as exc:
+                print("[안내] 스타일 해석 실패, 기본 연출 사용: {}".format(exc))
+                direction = default_style_direction(style_prompt)
+        else:
+            direction = default_style_direction(style_prompt)
+            _notify(progress_cb, 12, "⚡ 10초 쾌속 모드 · 기본 연출 적용", progress_lock)
+
+        _notify(progress_cb, 16, "대본 작성 중", progress_lock)
+        try:
+            script, photo_order = generate_script(
+                settings, media_files, style_prompt=style_prompt, direction=direction
+            )
+        except Exception as exc:
+            print("[안내] 대본 API 실패, 로컬 스토리로 폴백: {}".format(exc))
+            script, photo_order = fallback_script(style_prompt)
+            used_fallback = True
+        script = sanitize_narration(script)
+        pieces = split_script_pieces(script)
+        _notify(progress_cb, 24, "대본 완료 · 음성 합성과 사진 보정을 동시에 시작", progress_lock)
+
         def _voice_job():
-            _notify(progress_cb, 28, "음성 생성 중", progress_lock)
-            path = generate_voice(settings, script, output_path=voice_file, voice_type=voice_key)
-            _notify(progress_cb, 58, "음성 생성 완료", progress_lock)
+            _notify(progress_cb, 28, "ElevenLabs 음성 합성 중", progress_lock)
+            path = ensure_voice_track(settings, script, voice_file, voice_key)
+            _notify(progress_cb, 56, "음성 생성 완료", progress_lock)
             return path
 
         def _frame_job():
-            if runway:
-                return generate_runway_clips(
-                    media_files,
-                    style_prompt,
-                    motion,
-                    work_dir,
-                    progress_cb=progress_cb,
-                    lock=progress_lock,
-                )
-            _notify(progress_cb, 30, "장면 프레임 준비 중", progress_lock)
+            if spark:
+                try:
+                    return generate_spark_cinema_clips(
+                        media_files,
+                        style_prompt,
+                        motion,
+                        work_dir,
+                        progress_cb=progress_cb,
+                        lock=progress_lock,
+                        width=width,
+                        height=height,
+                    )
+                except Exception as exc:
+                    print("[안내] 스파크 시네마 실패, 블러 렌더로 전환: {}".format(exc))
+                    return None
+            _notify(progress_cb, 30, "EXIF 회전 보정 및 720x1280 리사이즈 병렬 처리 중", progress_lock)
             frames = prepare_captioned_frames(
-                media_files, pieces, photo_order, font_path, work_dir, direction=direction
+                media_files,
+                pieces,
+                photo_order,
+                font_path,
+                work_dir,
+                direction=direction,
+                width=width,
+                height=height,
             )
             _notify(progress_cb, 52, "장면 프레임 준비 완료", progress_lock)
             return frames
@@ -2225,53 +2375,82 @@ def run_pipeline(
         _notify(progress_cb, 68, "BGM 준비 중", progress_lock)
         bgm_path = resolve_bgm(mood, audio_duration, work_dir / "bgm.wav")
 
-        if runway:
-            clips = generated
-            if not clips:
-                raise RuntimeError("런웨이 비디오를 만들지 못했습니다.")
-            if mood == "none":
-                bgm_path = resolve_bgm("lofi", audio_duration, work_dir / "bgm.wav")
-            _notify(progress_cb, 78, "런웨이 클립·자막 합성 중", progress_lock)
-            ffmpeg_runway_pass(
-                clips,
-                durations,
-                cues,
-                font_path,
-                direction,
+        spark_clips = generated if spark and generated else None
+        try:
+            if spark_clips:
+                if mood == "none":
+                    bgm_path = resolve_bgm("lofi", audio_duration, work_dir / "bgm.wav")
+                _notify(progress_cb, 78, "✨ 스파크 시네마 · 음성·BGM·자막 단일 패스 합성", progress_lock)
+                ffmpeg_spark_pass(
+                    spark_clips,
+                    durations,
+                    cues,
+                    font_path,
+                    direction,
+                    voice_path,
+                    bgm_path,
+                    out_file,
+                    work_dir,
+                    audio_duration,
+                    width=width,
+                    height=height,
+                )
+            else:
+                frames = generated
+                if not frames:
+                    raise RuntimeError("프레임 준비 실패")
+                if len(durations) != len(frames):
+                    n = min(len(durations), len(frames))
+                    frames = frames[:n]
+                    durations = durations[:n]
+                print("   음성 길이: {:.2f}초 / 배속 {}x / BGM {} / xfade {:.2f}".format(
+                    audio_duration, speed, mood, direction.xfade
+                ))
+                _notify(progress_cb, 76, "단일 패스 초고속 렌더링 중", progress_lock)
+                ffmpeg_single_pass(
+                    frames,
+                    durations,
+                    voice_path,
+                    bgm_path,
+                    out_file,
+                    speed=speed,
+                    work_dir=work_dir,
+                    xfade_sec=0.12 if fast_mode and not spark else direction.xfade,
+                    cues=cues,
+                    font_path=font_path,
+                )
+        except Exception as exc:
+            print("[안내] 렌더 실패, 초고속 블러 폴백: {}".format(exc))
+            used_fallback = True
+            _notify(progress_cb, 80, "외부 API 지연 · 초고속 블러 렌더링으로 전환", progress_lock)
+            blur_fallback_render(
+                media_files,
+                script,
                 voice_path,
                 bgm_path,
                 out_file,
                 work_dir,
-                audio_duration,
+                font_path,
+                speed,
+                width,
+                height,
             )
-        else:
-            frames = generated
-            if len(durations) != len(frames):
-                n = min(len(durations), len(frames))
-                frames = frames[:n]
-                durations = durations[:n]
-            print("   음성 길이: {:.2f}초 / 배속 {}x / BGM {} / xfade {:.2f}".format(
-                audio_duration, speed, mood, direction.xfade
-            ))
-            _notify(progress_cb, 76, "영상 렌더링 중 (단일 패스)", progress_lock)
-            ffmpeg_single_pass(
-                frames,
-                durations,
-                voice_path,
-                bgm_path,
-                out_file,
-                speed=speed,
-                work_dir=work_dir,
-                xfade_sec=direction.xfade,
-                cues=cues,
-                font_path=font_path,
-            )
-        _notify(progress_cb, 96, "출력 파일 정리 중", progress_lock)
+
+        if not Path(out_file).is_file():
+            raise RuntimeError("완성된 영상 파일을 찾지 못했습니다.")
+        _notify(
+            progress_cb,
+            96,
+            "출력 정리 및 메모리 회수 중" + (" (안전장치 적용)" if used_fallback else ""),
+            progress_lock,
+        )
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+        cleanup_temp_files()
+        gc.collect()
 
-    cleanup_temp_files()
     _notify(progress_cb, 100, "완료: {}".format(out_file), progress_lock)
+    gc.collect()
     return out_file, script
 
 

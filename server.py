@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import os
 import shutil
 import threading
@@ -21,11 +22,19 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
-from license_lock import mobile_hwid, verify_or_activate_mobile
+from license_lock import (
+    PAYMENT_MESSAGE,
+    PAYMENT_REQUIRED,
+    authorize_create_job,
+    consume_entitlement,
+    mobile_hwid,
+    resolve_mobile_entitlement,
+    verify_or_activate_mobile,
+)
 from main import (
     IMAGE_EXTS,
     OUTPUT_DIR,
@@ -49,9 +58,9 @@ JOBS_LOCK = threading.Lock()
 WORKER = ThreadPoolExecutor(max_workers=1)
 
 app = FastAPI(
-    title="AI 숏폼 모바일 서버",
-    description="저메모리 SRT 하드서브 + fal Image-to-Video (512MB)",
-    version="3.2.1",
+    title="ClipSpark AI 모바일 서버",
+    description="⚡ 10초 쾌속 / ✨ 스파크 시네마 AI · 3단계 라이선스",
+    version="4.0.0",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -64,8 +73,14 @@ app.add_middleware(
 
 class VerifyLicenseBody(BaseModel):
     device_id: str = Field(..., description="Android ID 또는 iOS identifierForVendor")
-    license_key: str = Field(..., description="이 스마트폰용 라이선스 키")
+    license_key: str = Field("", description="베이직/프로 라이선스 키")
     platform: str = Field("", description="android 또는 ios")
+
+
+class LicenseStatusBody(BaseModel):
+    device_id: str
+    platform: str = ""
+    license_key: str = ""
 
 
 def _safe_name(name):
@@ -80,9 +95,28 @@ def _safe_name(name):
 def _job_snapshot(job_id):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
-        if not job:
+        if job:
+            return dict(job)
+    status_file = JOBS_DIR / job_id / "status.json"
+    if status_file.is_file():
+        try:
+            data = json.loads(status_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                with JOBS_LOCK:
+                    JOBS[job_id] = data
+                return dict(data)
+        except Exception:
             return None
-        return dict(job)
+    return None
+
+
+def _persist_job(job_id):
+    snap = _job_snapshot(job_id)
+    if not snap:
+        return
+    job_dir = Path(snap.get("output") or (JOBS_DIR / job_id / "final_shorts.mp4")).parent
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "status.json").write_text(json.dumps(snap, ensure_ascii=True), encoding="utf-8")
 
 
 def _release_memory():
@@ -106,6 +140,7 @@ def _purge_job_temps(job_dir, keep_file=None):
     if not job_dir.exists():
         return
     keep = None
+    keep_names = {"status.json", "final_shorts.mp4"}
     if keep_file:
         try:
             keep = Path(keep_file).resolve()
@@ -114,6 +149,8 @@ def _purge_job_temps(job_dir, keep_file=None):
     for child in list(job_dir.iterdir()):
         try:
             if keep is not None and child.resolve() == keep:
+                continue
+            if child.name in keep_names:
                 continue
         except OSError:
             pass
@@ -134,6 +171,14 @@ def _update_job(job_id, **fields):
     with JOBS_LOCK:
         if job_id in JOBS:
             JOBS[job_id].update(fields)
+    _persist_job(job_id)
+
+
+def _payment_response(message=PAYMENT_MESSAGE):
+    return JSONResponse(
+        status_code=402,
+        content={"error": PAYMENT_REQUIRED, "message": message},
+    )
 
 
 def _run_job(
@@ -144,8 +189,10 @@ def _run_job(
     voice_type,
     speed_multiplier,
     bgm_mood,
-    is_runway_mode,
+    spark_cinema,
     camera_motion,
+    output_height,
+    features,
 ):
     started = time.time()
 
@@ -155,11 +202,12 @@ def _run_job(
             status="processing",
             stage=message,
             percent=max(0, min(100, int(percent))),
+            progress=max(0, min(100, int(percent))),
             elapsed_sec=round(time.time() - started, 1),
         )
 
     try:
-        _update_job(job_id, stage="대본 작성 중", percent=8, elapsed_sec=0)
+        _update_job(job_id, stage="대본 작성 중", percent=8, progress=8, elapsed_sec=0)
         run_pipeline(
             media_files,
             style_prompt=prompt,
@@ -169,16 +217,21 @@ def _run_job(
             voice_type=voice_type,
             speed_multiplier=speed_multiplier,
             bgm_mood=bgm_mood,
-            is_runway_mode=is_runway_mode,
+            is_runway_mode=spark_cinema,
+            is_spark_cinema=spark_cinema,
             camera_motion=camera_motion,
+            output_height=output_height,
+            fast_mode=not spark_cinema,
         )
         if not Path(out_file).is_file():
             raise RuntimeError("완성된 영상 파일을 찾지 못했습니다.")
+        consume_entitlement(features)
         _update_job(
             job_id,
             status="completed",
             stage="완료",
             percent=100,
+            progress=100,
             error=None,
             elapsed_sec=round(time.time() - started, 1),
         )
@@ -207,9 +260,11 @@ def _run_job(
 def root():
     return {
         "ok": True,
-        "service": "AI 숏폼 모바일 서버",
+        "service": "ClipSpark AI 모바일 서버",
+        "branding": "✨ 스파크 시네마 AI",
         "endpoints": [
             "/verify-license",
+            "/license-status",
             "/analyze-media",
             "/create-video",
             "/job-status/{job_id}",
@@ -225,32 +280,47 @@ def health():
 
 @app.post("/verify-license")
 def verify_license(body: VerifyLicenseBody):
-    ok, message = verify_or_activate_mobile(
-        body.license_key, body.device_id, body.platform
-    )
+    ok, message = verify_or_activate_mobile(body.license_key, body.device_id, body.platform)
     hwid = mobile_hwid(body.device_id, body.platform)
     short = "-".join(hwid[i : i + 4] for i in range(0, 16, 4))
     if not ok:
         raise HTTPException(status_code=403, detail=message)
+    _ok, _msg, features = resolve_mobile_entitlement(body.device_id, body.platform, body.license_key)
     return {
         "ok": True,
         "message": message,
         "device_bound": True,
         "machine_code": short,
         "platform": (body.platform or "").strip().lower(),
+        "plan": features.get("plan"),
+        "plan_label": features.get("label"),
+        "status_bar": features.get("status_bar"),
+        "features": features,
+    }
+
+
+@app.post("/license-status")
+def license_status(body: LicenseStatusBody):
+    ok, message, features = resolve_mobile_entitlement(body.device_id, body.platform, body.license_key)
+    return {
+        "ok": ok or features.get("plan") in ("basic", "pro"),
+        "message": message,
+        "plan": features.get("plan"),
+        "plan_label": features.get("label"),
+        "status_bar": features.get("status_bar"),
+        "free_remaining": features.get("free_remaining", 0),
+        "features": features,
+        "payment_required": (not ok) and features.get("plan") == "free",
     }
 
 
 @app.post("/analyze-media")
 async def analyze_media(
     files: List[UploadFile] = File(..., description="사진/동영상"),
-    license_key: str = Form(..., description="라이선스 키"),
+    license_key: str = Form("", description="라이선스 키 (무료 체험은 생략 가능)"),
     device_id: str = Form(..., description="Android ID / iOS Vendor ID"),
     platform: str = Form("", description="android 또는 ios"),
 ):
-    ok, message = verify_or_activate_mobile(license_key, device_id, platform)
-    if not ok:
-        raise HTTPException(status_code=403, detail=message)
     if not files:
         raise HTTPException(status_code=400, detail="분석할 미디어를 올려 주세요.")
 
@@ -291,20 +361,18 @@ async def create_video(
     files: List[UploadFile] = File(..., description="사진/동영상 (EXIF 회전 자동 보정)"),
     style: str = Form("", description="스타일 프롬프트"),
     style_prompt: str = Form("", description="style 별칭"),
-    license_key: str = Form(..., description="라이선스 키"),
+    license_key: str = Form("", description="라이선스 키 (무료 체험은 생략 가능)"),
     device_id: str = Form(..., description="Android ID / iOS Vendor ID"),
     platform: str = Form("", description="android 또는 ios"),
-    voice_type: str = Form("vlog_female", description="variety_male 등 8종"),
-    speed_multiplier: str = Form("1.0", description="시네마틱은 1.0 권장"),
+    voice_type: str = Form("vlog_female", description="한국어 성우"),
+    speed_multiplier: str = Form("1.0", description="1.0 / 1.2 / 1.5"),
     bgm_mood: str = Form("lofi", description="구버전 별칭"),
-    bgm_type: str = Form("lofi", description="variety/lofi/phonk/pop/acoustic/suspense/cinematic/none"),
-    is_runway_mode: str = Form("false", description="true면 fal I2V 클립을 음성 길이(15~20초)에 맞춰 이어붙임"),
+    bgm_type: str = Form("lofi", description="BGM 분위기"),
+    is_runway_mode: str = Form("false", description="하위 호환"),
+    is_spark_cinema: str = Form("false", description="✨ 스파크 시네마 AI"),
     camera_motion: str = Form("zoom_in", description="zoom_in/drone/pan"),
+    output_height: str = Form("720", description="720 또는 1080 (프로)"),
 ):
-    ok, message = verify_or_activate_mobile(license_key, device_id, platform)
-    if not ok:
-        raise HTTPException(status_code=403, detail=message)
-
     prompt = (style or style_prompt or "").strip()
     if not files:
         raise HTTPException(status_code=400, detail="사진 또는 동영상을 한 개 이상 업로드해 주세요.")
@@ -312,8 +380,30 @@ async def create_video(
     voice_key, _vid, _preset = resolve_voice(voice_type)
     speed = normalize_speed(speed_multiplier)
     mood = normalize_bgm_mood(bgm_type or bgm_mood)
-    runway = parse_flag(is_runway_mode)
+    spark = parse_flag(is_spark_cinema) or parse_flag(is_runway_mode)
     motion = normalize_camera_motion(camera_motion)
+    try:
+        height = int(float(output_height or 720))
+    except (TypeError, ValueError):
+        height = 720
+    if height >= 1080:
+        height = 1080
+    else:
+        height = 720
+
+    allowed, err_code, err_msg, features = authorize_create_job(
+        device_id,
+        platform,
+        license_key,
+        spark,
+        voice_key,
+        mood,
+        speed,
+        height,
+        style_prompt=prompt,
+    )
+    if not allowed:
+        return _payment_response(err_msg or PAYMENT_MESSAGE)
 
     job_id = uuid.uuid4().hex[:16]
     job_dir = JOBS_DIR / job_id
@@ -350,10 +440,12 @@ async def create_video(
             "status": "processing",
             "stage": "대기 중",
             "percent": 1,
+            "progress": 1,
             "error": None,
             "elapsed_sec": 0,
             "output": str(out_file),
         }
+    _persist_job(job_id)
 
     WORKER.submit(
         _run_job,
@@ -364,8 +456,10 @@ async def create_video(
         voice_key,
         speed,
         mood,
-        runway,
+        spark,
         motion,
+        height,
+        features,
     )
     return {
         "job_id": job_id,
@@ -374,8 +468,12 @@ async def create_video(
         "speed_multiplier": speed,
         "bgm_type": mood,
         "bgm_mood": mood,
-        "is_runway_mode": runway,
+        "is_spark_cinema": spark,
+        "is_runway_mode": spark,
         "camera_motion": motion,
+        "output_height": height,
+        "plan": features.get("plan"),
+        "error_code": err_code,
     }
 
 
@@ -384,11 +482,13 @@ def job_status(job_id: str):
     job = _job_snapshot(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+    percent = int(job.get("percent") or job.get("progress") or 0)
     return {
         "job_id": job["job_id"],
         "status": job["status"],
         "stage": job.get("stage") or "processing",
-        "percent": int(job.get("percent") or 0),
+        "percent": percent,
+        "progress": percent,
         "elapsed_sec": float(job.get("elapsed_sec") or 0),
         "error": job.get("error"),
     }
