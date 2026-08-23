@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""스마트폰 앱과 통신하는 FastAPI 모바일 서버."""
+"""스마트폰 앱과 통신하는 FastAPI 모바일 서버 (비동기 작업 큐)."""
 
 from __future__ import annotations
 
@@ -8,8 +8,9 @@ import shutil
 import threading
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 os.environ.setdefault("FFMPEG_TIMEOUT", "300")
 
@@ -17,9 +18,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field
-from starlette.background import BackgroundTask
 
 from license_lock import mobile_hwid, verify_or_activate_mobile
 from main import IMAGE_EXTS, OUTPUT_DIR, VIDEO_EXTS, run_pipeline
@@ -27,13 +26,15 @@ from main import IMAGE_EXTS, OUTPUT_DIR, VIDEO_EXTS, run_pipeline
 load_dotenv()
 
 JOBS_DIR = OUTPUT_DIR / "mobile_jobs"
-RENDER_LOCK = threading.Lock()
 ALLOWED_EXTS = IMAGE_EXTS | VIDEO_EXTS
+JOBS: Dict[str, dict] = {}
+JOBS_LOCK = threading.Lock()
+WORKER = ThreadPoolExecutor(max_workers=1)
 
 app = FastAPI(
     title="AI 숏폼 모바일 서버",
-    description="사진/영상 업로드로 9:16 숏폼을 만들고, 스마트폰 1대 라이선스를 검증합니다.",
-    version="1.0.0",
+    description="비동기 작업 큐 + Pillow/FFmpeg 초고속 릴스 엔진",
+    version="2.0.0",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -59,11 +60,55 @@ def _safe_name(name):
     return stem + suffix
 
 
-def _cleanup_job(job_dir):
+def _job_snapshot(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return None
+        return dict(job)
+
+
+def _update_job(job_id, **fields):
+    with JOBS_LOCK:
+        if job_id in JOBS:
+            JOBS[job_id].update(fields)
+
+
+def _run_job(job_id, media_files, prompt, out_file):
+    def progress(percent, message):
+        _update_job(
+            job_id,
+            status="processing",
+            stage=message,
+            percent=max(0, min(100, int(percent))),
+        )
+
     try:
-        shutil.rmtree(job_dir, ignore_errors=True)
-    except Exception:
-        pass
+        _update_job(job_id, stage="대본 작성 중", percent=8)
+        run_pipeline(
+            media_files,
+            style_prompt=prompt,
+            progress_cb=progress,
+            output_path=out_file,
+            check_license=False,
+        )
+        if not Path(out_file).is_file():
+            raise RuntimeError("완성된 영상 파일을 찾지 못했습니다.")
+        _update_job(
+            job_id,
+            status="completed",
+            stage="완료",
+            percent=100,
+            error=None,
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        _update_job(
+            job_id,
+            status="failed",
+            stage="실패",
+            error=str(exc),
+        )
 
 
 @app.get("/")
@@ -71,7 +116,12 @@ def root():
     return {
         "ok": True,
         "service": "AI 숏폼 모바일 서버",
-        "endpoints": ["/verify-license", "/create-video"],
+        "endpoints": [
+            "/verify-license",
+            "/create-video",
+            "/job-status/{job_id}",
+            "/download/{job_id}",
+        ],
     }
 
 
@@ -115,7 +165,7 @@ async def create_video(
     if not files:
         raise HTTPException(status_code=400, detail="사진 또는 동영상을 한 개 이상 업로드해 주세요.")
 
-    job_id = uuid.uuid4().hex[:12]
+    job_id = uuid.uuid4().hex[:16]
     job_dir = JOBS_DIR / job_id
     media_dir = job_dir / "media"
     media_dir.mkdir(parents=True, exist_ok=True)
@@ -138,41 +188,56 @@ async def create_video(
             saved.append(dest)
             await item.close()
     except HTTPException:
-        _cleanup_job(job_dir)
+        shutil.rmtree(job_dir, ignore_errors=True)
         raise
     except Exception as exc:
-        _cleanup_job(job_dir)
+        shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail="업로드 처리 실패: {}".format(exc))
 
-    if not RENDER_LOCK.acquire(blocking=False):
-        _cleanup_job(job_dir)
-        raise HTTPException(
-            status_code=429,
-            detail="다른 영상을 만드는 중입니다. 잠시 후 다시 시도해 주세요.",
-        )
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "processing",
+            "stage": "대기 중",
+            "percent": 1,
+            "error": None,
+            "output": str(out_file),
+        }
 
-    try:
-        run_pipeline(
-            saved,
-            style_prompt=prompt,
-            output_path=out_file,
-            check_license=False,
-        )
-    except Exception as exc:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="영상 제작 실패: {}".format(exc))
-    finally:
-        RENDER_LOCK.release()
+    WORKER.submit(_run_job, job_id, saved, prompt, out_file)
+    return {"job_id": job_id, "status": "processing"}
 
+
+@app.get("/job-status/{job_id}")
+def job_status(job_id: str):
+    job = _job_snapshot(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "stage": job.get("stage") or "processing",
+        "percent": int(job.get("percent") or 0),
+        "error": job.get("error"),
+    }
+
+
+@app.get("/download/{job_id}")
+def download_job(job_id: str):
+    job = _job_snapshot(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+    if job["status"] == "processing":
+        raise HTTPException(status_code=409, detail="아직 영상이 준비되지 않았습니다.")
+    if job["status"] != "completed":
+        raise HTTPException(status_code=500, detail=job.get("error") or "영상 제작에 실패했습니다.")
+    out_file = Path(job["output"])
     if not out_file.is_file():
-        _cleanup_job(job_dir)
-        raise HTTPException(status_code=500, detail="완성된 영상 파일을 찾지 못했습니다.")
-
+        raise HTTPException(status_code=404, detail="완성된 영상 파일을 찾지 못했습니다.")
     return FileResponse(
         path=str(out_file),
         media_type="video/mp4",
         filename="final_shorts.mp4",
-        background=BackgroundTask(_cleanup_job, job_dir),
     )
 
 

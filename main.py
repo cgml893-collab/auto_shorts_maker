@@ -271,10 +271,11 @@ def generate_script(settings, media_files, style_prompt=""):
     return script
 
 
-def generate_voice(settings, script):
-    # type: (Settings, str) -> Path
+def generate_voice(settings, script, output_path=None):
+    # type: (Settings, str, Optional[Path]) -> Path
     print("2) ElevenLabs로 한국어 음성 생성 중...")
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    dest = Path(output_path) if output_path else VOICE_PATH
+    dest.parent.mkdir(parents=True, exist_ok=True)
     url = "https://api.elevenlabs.io/v1/text-to-speech/{}".format(
         settings.elevenlabs_voice_id
     )
@@ -300,9 +301,9 @@ def generate_voice(settings, script):
                 response.status_code, response.text[:500]
             )
         )
-    VOICE_PATH.write_bytes(response.content)
-    print("   저장: {}".format(VOICE_PATH))
-    return VOICE_PATH
+    dest.write_bytes(response.content)
+    print("   저장: {}".format(dest))
+    return dest
 
 
 FFMPEG_PRESET = [
@@ -1001,6 +1002,122 @@ def mix_soundtrack(voice, duration, cue_starts, scene_starts):
     return mixed
 
 
+def fit_cover_rgb(im, width, height):
+    img = im.convert("RGB")
+    scale = max(width / float(img.width), height / float(img.height))
+    nw = max(width, int(round(img.width * scale)))
+    nh = max(height, int(round(img.height * scale)))
+    resample = getattr(Image, "Resampling", Image).LANCZOS
+    img = img.resize((nw, nh), resample)
+    left = max(0, (nw - width) // 2)
+    top = max(0, (nh - height) // 2)
+    return img.crop((left, top, left + width, top + height))
+
+
+def still_from_media(path, dest_jpg, work_dir):
+    suffix = Path(path).suffix.lower()
+    if suffix in IMAGE_EXTS:
+        with Image.open(path) as im:
+            fit_cover_rgb(im, TARGET_W, TARGET_H).save(dest_jpg, "JPEG", quality=86)
+        return dest_jpg
+    tmp = work_dir / (dest_jpg.stem + "_grab.jpg")
+    run_ffmpeg(
+        ["-ss", "0.15", "-i", str(path), "-frames:v", "1", "-q:v", "4", str(tmp)],
+        timeout=20,
+    )
+    with Image.open(tmp) as im:
+        fit_cover_rgb(im, TARGET_W, TARGET_H).save(dest_jpg, "JPEG", quality=86)
+    return dest_jpg
+
+
+def bake_caption_on_still(base_jpg, caption, font_path, dest_jpg):
+    canvas = Image.open(base_jpg).convert("RGBA")
+    text = (caption or "").strip()
+    if text:
+        cap_path = dest_jpg.with_name(dest_jpg.stem + "_cap.png")
+        render_subtitle_png(text, font_path, cap_path)
+        overlay = Image.open(cap_path).convert("RGBA")
+        x = max(0, (TARGET_W - overlay.width) // 2)
+        y = max(0, TARGET_H - overlay.height - 64)
+        canvas.paste(overlay, (x, y), overlay)
+    canvas.convert("RGB").save(dest_jpg, "JPEG", quality=88)
+
+
+def ffmpeg_stillimage_pass(frames, voice_path, out_file):
+    args = []
+    for jpg, dur in frames:
+        args += [
+            "-loop",
+            "1",
+            "-framerate",
+            str(FPS),
+            "-t",
+            "{:.3f}".format(max(0.2, float(dur))),
+            "-i",
+            str(jpg),
+        ]
+    args += ["-i", str(voice_path)]
+    n = len(frames)
+    voice_idx = n
+    if n == 1:
+        args += ["-map", "0:v:0", "-map", "{}:a:0".format(voice_idx), "-vf", "format=yuv420p"]
+    else:
+        parts = []
+        for i in range(n):
+            parts.append("[{}:v]format=yuv420p,setsar=1[v{}]".format(i, i))
+        parts.append(
+            "".join("[v{}]".format(i) for i in range(n))
+            + "concat=n={}:v=1:a=0[v]".format(n)
+        )
+        args += [
+            "-filter_complex",
+            ";".join(parts),
+            "-map",
+            "[v]",
+            "-map",
+            "{}:a:0".format(voice_idx),
+        ]
+    args += [
+        "-c:v",
+        "libx264",
+        "-tune",
+        "stillimage",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "26",
+        "-threads",
+        "2",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        str(out_file),
+    ]
+    run_ffmpeg(args)
+
+
+def render_stillimage_reel(media_files, script, voice_path, duration, font_path, work_dir, out_file):
+    cues = split_script_cues(script, duration)
+    if not cues:
+        cues = [(script, 0.0, duration)]
+    n = max(1, len(media_files))
+    frames = []
+    for i, (text, start, end) in enumerate(cues):
+        src = media_files[i % n]
+        still = work_dir / ("still_{:03d}.jpg".format(i))
+        still_from_media(src, still, work_dir)
+        framed = work_dir / ("frame_{:03d}.jpg".format(i))
+        bake_caption_on_still(still, text, font_path, framed)
+        frames.append((framed, max(0.2, float(end) - float(start))))
+    ffmpeg_stillimage_pass(frames, voice_path, out_file)
+
+
 def _notify(progress_cb, percent, message):
     print(message)
     if progress_cb is not None:
@@ -1029,13 +1146,14 @@ def run_pipeline(media_files, style_prompt="", progress_cb=None, output_path=Non
             len(media_files), ", ".join(p.name for p in media_files)
         ),
     )
-    _notify(progress_cb, 12, "1/5 대본 작성 중...")
+    _notify(progress_cb, 12, "대본 작성 중")
     script = generate_script(settings, media_files, style_prompt=style_prompt)
 
-    _notify(progress_cb, 32, "2/5 한국어 음성 생성 중...")
-    generate_voice(settings, script)
+    _notify(progress_cb, 32, "음성 생성 중")
+    voice_file = out_file.parent / "voice.mp3"
+    generate_voice(settings, script, output_path=voice_file)
 
-    audio_duration = probe_duration(VOICE_PATH)
+    audio_duration = probe_duration(voice_file)
     if audio_duration < 1:
         raise RuntimeError("생성된 음성이 너무 짧습니다. 대본/TTS를 확인하세요.")
     print("   음성 길이: {:.2f}초".format(audio_duration))
@@ -1043,29 +1161,17 @@ def run_pipeline(media_files, style_prompt="", progress_cb=None, output_path=Non
     work_dir = out_file.parent / ("_ffwork_{}".format(uuid.uuid4().hex[:8]))
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
-        _notify(progress_cb, 48, "3/5 FFmpeg 720x1280 24fps 편집 중...")
-        per = audio_duration / float(len(media_files))
-        clips = []
-        for i, path in enumerate(media_files):
-            src = _safe_src_copy(path, work_dir, i)
-            clip_path = work_dir / ("clip_{:03d}.mp4".format(i))
-            make_scene_clip(src, clip_path, per)
-            clips.append(clip_path)
-        silent_path = work_dir / "silent.mp4"
-        concat_scene_clips(clips, silent_path)
-
-        voiced_path = work_dir / "voiced.mp4"
-        mux_voice(silent_path, VOICE_PATH, audio_duration, voiced_path)
-
-        _notify(progress_cb, 72, "4/5 자막 입히기...")
-        try:
-            sub_assets = build_subtitle_assets(script, audio_duration, font_path, work_dir)
-            overlay_subtitles(voiced_path, sub_assets, out_file)
-        except Exception as sub_exc:
-            print("[경고] 자막 합성 실패, 음성만 입힌 영상으로 저장: {}".format(sub_exc), flush=True)
-            shutil.copy2(str(voiced_path), str(out_file))
-
-        _notify(progress_cb, 90, "5/5 완료 처리...")
+        _notify(progress_cb, 70, "영상 렌더링 중")
+        render_stillimage_reel(
+            media_files,
+            script,
+            voice_file,
+            audio_duration,
+            font_path,
+            work_dir,
+            out_file,
+        )
+        _notify(progress_cb, 95, "완료 처리 중")
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 

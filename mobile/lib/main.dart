@@ -186,19 +186,36 @@ class _LicenseScreenState extends State<LicenseScreen> {
       _error = null;
     });
     try {
-      final res = await http
-          .post(
-            Uri.parse('$url/verify-license'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'license_key': key,
-              'device_id': _deviceId,
-              'platform': _platform,
-            }),
-          )
-          .timeout(const Duration(seconds: 20));
-      if (res.statusCode != 200) {
-        throw _apiError(res);
+      Object? last;
+      http.Response? res;
+      for (var i = 0; i < 5; i++) {
+        try {
+          res = await http
+              .post(
+                Uri.parse('$url/verify-license'),
+                headers: {'Content-Type': 'application/json'},
+                body: jsonEncode({
+                  'license_key': key,
+                  'device_id': _deviceId,
+                  'platform': _platform,
+                }),
+              )
+              .timeout(const Duration(seconds: 20));
+          if (res.statusCode == 200) {
+            last = null;
+            break;
+          }
+          if (res.statusCode >= 400 && res.statusCode < 500 && res.statusCode != 429) {
+            throw Exception(_apiError(res));
+          }
+          last = Exception(_apiError(res));
+        } catch (e) {
+          last = e;
+        }
+        await Future.delayed(Duration(milliseconds: 400 * (i + 1)));
+      }
+      if (res == null || res.statusCode != 200) {
+        throw last ?? Exception('인증 실패');
       }
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool('licensed', true);
@@ -295,6 +312,7 @@ class _StudioScreenState extends State<StudioScreen> {
   List<XFile> _media = [];
   bool _busy = false;
   String _busyText = '릴스를 만들고 있어요...';
+  double _progress = 0;
   File? _resultVideo;
   VideoPlayerController? _player;
 
@@ -311,6 +329,42 @@ class _StudioScreenState extends State<StudioScreen> {
       return;
     }
     setState(() => _media = picked);
+  }
+
+  Future<http.Response> _retryGet(Uri uri, {Duration timeout = const Duration(seconds: 25)}) async {
+    Object? last;
+    for (var i = 0; i < 5; i++) {
+      try {
+        final res = await http.get(uri).timeout(timeout);
+        if (res.statusCode >= 400 && res.statusCode < 500 && res.statusCode != 429) {
+          return res;
+        }
+        if (res.statusCode >= 500 || res.statusCode == 429) {
+          throw Exception(_apiError(res));
+        }
+        return res;
+      } catch (e) {
+        last = e;
+        await Future.delayed(Duration(milliseconds: 500 * (i + 1)));
+      }
+    }
+    throw last ?? Exception('네트워크 오류');
+  }
+
+  String _stageLabel(String stage) {
+    if (stage.contains('대본')) {
+      return '대본 생성 중';
+    }
+    if (stage.contains('음성')) {
+      return '음성 생성 중';
+    }
+    if (stage.contains('렌더') || stage.contains('합성') || stage.contains('영상')) {
+      return '영상 합성 중';
+    }
+    if (stage.contains('완료')) {
+      return '완료';
+    }
+    return stage;
   }
 
   Future<void> _create() async {
@@ -337,34 +391,100 @@ class _StudioScreenState extends State<StudioScreen> {
 
     setState(() {
       _busy = true;
-      _busyText = '미디어를 올리고 릴스를 제작 중입니다.\n1~3분 걸릴 수 있어요.';
+      _progress = 0.02;
+      _busyText = '업로드 중...';
     });
 
     try {
-      final req = http.MultipartRequest('POST', Uri.parse('$url/create-video'));
-      req.fields['style'] = _styleCtrl.text.trim();
-      req.fields['license_key'] = key;
-      req.fields['device_id'] = deviceId;
-      req.fields['platform'] = platform;
-      for (final file in _media) {
-        req.files.add(
-          await http.MultipartFile.fromPath(
-            'files',
-            file.path,
-            filename: p.basename(file.path),
-          ),
-        );
+      http.Response created = http.Response('', 500);
+      Object? uploadErr;
+      for (var i = 0; i < 5; i++) {
+        try {
+          final req = http.MultipartRequest('POST', Uri.parse('$url/create-video'));
+          req.fields['style'] = _styleCtrl.text.trim();
+          req.fields['license_key'] = key;
+          req.fields['device_id'] = deviceId;
+          req.fields['platform'] = platform;
+          for (final file in _media) {
+            req.files.add(
+              await http.MultipartFile.fromPath(
+                'files',
+                file.path,
+                filename: p.basename(file.path),
+              ),
+            );
+          }
+          final streamed = await req.send().timeout(const Duration(seconds: 60));
+          created = await http.Response.fromStream(streamed).timeout(const Duration(seconds: 60));
+          if (created.statusCode == 200) {
+            uploadErr = null;
+            break;
+          }
+          if (created.statusCode >= 400 && created.statusCode < 500 && created.statusCode != 429) {
+            throw Exception(_apiError(created));
+          }
+          uploadErr = Exception(_apiError(created));
+        } catch (e) {
+          uploadErr = e;
+        }
+        await Future.delayed(Duration(milliseconds: 500 * (i + 1)));
       }
-      final res = await Future(() async {
-        final streamed = await req.send();
-        return http.Response.fromStream(streamed);
-      }).timeout(const Duration(seconds: 180));
-      if (res.statusCode != 200) {
-        throw _apiError(res);
+      if (created.statusCode != 200) {
+        throw uploadErr ?? Exception('작업 요청에 실패했습니다.');
+      }
+      final body = jsonDecode(created.body) as Map<String, dynamic>;
+      final jobId = (body['job_id'] ?? '').toString();
+      if (jobId.isEmpty) {
+        throw Exception('job_id를 받지 못했습니다.');
+      }
+
+      String status = 'processing';
+      var polls = 0;
+      while (status == 'processing') {
+        if (polls >= 300) {
+          throw Exception('작업이 너무 오래 걸립니다. 잠시 후 다시 시도해 주세요.');
+        }
+        if (polls > 0) {
+          await Future.delayed(const Duration(seconds: 2));
+        }
+        polls += 1;
+        final st = await _retryGet(Uri.parse('$url/job-status/$jobId'));
+        if (st.statusCode == 404) {
+          throw Exception('작업을 찾을 수 없습니다.');
+        }
+        if (st.statusCode != 200) {
+          throw Exception(_apiError(st));
+        }
+        final js = jsonDecode(st.body) as Map<String, dynamic>;
+        status = (js['status'] ?? 'processing').toString();
+        final stage = (js['stage'] ?? '처리 중').toString();
+        final percent = ((js['percent'] ?? 0) as num).toDouble().clamp(0, 100);
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _progress = percent / 100.0;
+          _busyText = _stageLabel(stage);
+        });
+        if (status == 'failed') {
+          throw Exception((js['error'] ?? '영상 제작에 실패했습니다.').toString());
+        }
+      }
+
+      setState(() {
+        _busyText = '다운로드 중...';
+        _progress = 0.98;
+      });
+      final dl = await _retryGet(
+        Uri.parse('$url/download/$jobId'),
+        timeout: const Duration(seconds: 60),
+      );
+      if (dl.statusCode != 200) {
+        throw Exception(_apiError(dl));
       }
       final dir = await getTemporaryDirectory();
       final out = File('${dir.path}/final_shorts_${DateTime.now().millisecondsSinceEpoch}.mp4');
-      await out.writeAsBytes(res.bodyBytes, flush: true);
+      await out.writeAsBytes(dl.bodyBytes, flush: true);
       await _player?.dispose();
       final player = VideoPlayerController.file(out);
       await player.initialize();
@@ -377,6 +497,12 @@ class _StudioScreenState extends State<StudioScreen> {
         _resultVideo = out;
         _player = player;
       });
+      try {
+        await Gal.putVideo(out.path);
+        if (mounted) {
+          _toast('갤러리에 저장했습니다.');
+        }
+      } catch (_) {}
     } catch (e) {
       if (mounted) {
         _toast(e.toString().replaceFirst('Exception: ', ''));
@@ -553,7 +679,7 @@ class _StudioScreenState extends State<StudioScreen> {
               ),
             ),
           ),
-          if (_busy) _LoadingMask(text: _busyText),
+          if (_busy) _LoadingMask(text: _busyText, progress: _progress),
         ],
       ),
     );
@@ -666,25 +792,44 @@ class _PrimaryButton extends StatelessWidget {
 }
 
 class _LoadingMask extends StatelessWidget {
-  const _LoadingMask({required this.text});
+  const _LoadingMask({required this.text, required this.progress});
   final String text;
+  final double progress;
 
   @override
   Widget build(BuildContext context) {
     return ColoredBox(
       color: Colors.black.withValues(alpha: 0.62),
       child: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const CircularProgressIndicator(color: Color(0xFFFF4D8D)),
-            const SizedBox(height: 18),
-            Text(
-              text,
-              textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 15, height: 1.4),
-            ),
-          ],
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 36),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const CircularProgressIndicator(color: Color(0xFFFF4D8D)),
+              const SizedBox(height: 18),
+              Text(
+                text,
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700, height: 1.4),
+              ),
+              const SizedBox(height: 16),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(99),
+                child: LinearProgressIndicator(
+                  value: progress.clamp(0.02, 1.0),
+                  minHeight: 8,
+                  backgroundColor: Colors.white24,
+                  color: const Color(0xFFFF4D8D),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                '${(progress.clamp(0, 1) * 100).round()}%',
+                style: TextStyle(color: Colors.white.withValues(alpha: 0.7)),
+              ),
+            ],
+          ),
         ),
       ),
     );
