@@ -313,6 +313,9 @@ class _StudioScreenState extends State<StudioScreen> {
   bool _busy = false;
   String _busyText = '릴스를 만들고 있어요...';
   double _progress = 0;
+  String _voiceType = 'bright_female';
+  String _speed = '1.2';
+  String _bgmMood = 'upbeat';
   File? _resultVideo;
   VideoPlayerController? _player;
 
@@ -405,6 +408,9 @@ class _StudioScreenState extends State<StudioScreen> {
           req.fields['license_key'] = key;
           req.fields['device_id'] = deviceId;
           req.fields['platform'] = platform;
+          req.fields['voice_type'] = _voiceType;
+          req.fields['speed_multiplier'] = _speed;
+          req.fields['bgm_mood'] = _bgmMood;
           for (final file in _media) {
             req.files.add(
               await http.MultipartFile.fromPath(
@@ -625,6 +631,41 @@ class _StudioScreenState extends State<StudioScreen> {
                       hintText: "예: 신나는 브이로그, 감동적인 일상",
                     ),
                   ),
+                  const SizedBox(height: 20),
+                  const _Label('3. 목소리 선택'),
+                  _OptionWrap(
+                    options: const [
+                      _Option('bright_female', '밝은 여성'),
+                      _Option('energetic_male', '활기찬 남성'),
+                      _Option('calm_male', '차분한 남성'),
+                      _Option('story_female', '감성 여성'),
+                    ],
+                    value: _voiceType,
+                    onChanged: (v) => setState(() => _voiceType = v),
+                  ),
+                  const SizedBox(height: 18),
+                  const _Label('4. 영상 속도'),
+                  _OptionWrap(
+                    options: const [
+                      _Option('1.0', '1.0x 보통'),
+                      _Option('1.2', '1.2x 숏폼 추천'),
+                      _Option('1.5', '1.5x 빠른 템포'),
+                    ],
+                    value: _speed,
+                    onChanged: (v) => setState(() => _speed = v),
+                  ),
+                  const SizedBox(height: 18),
+                  const _Label('5. BGM 분위기'),
+                  _OptionWrap(
+                    options: const [
+                      _Option('upbeat', '신나는 비트'),
+                      _Option('emotional', '감성 브이로그'),
+                      _Option('tense', '긴박한 펑크'),
+                      _Option('none', '음악 없음'),
+                    ],
+                    value: _bgmMood,
+                    onChanged: (v) => setState(() => _bgmMood = v),
+                  ),
                   const SizedBox(height: 22),
                   _PrimaryButton(
                     label: '원클릭 릴스 제작하기',
@@ -722,6 +763,50 @@ class _Hero extends StatelessWidget {
           style: TextStyle(color: Colors.white.withValues(alpha: 0.7), height: 1.4),
         ),
       ],
+    );
+  }
+}
+
+class _Option {
+  const _Option(this.id, this.label);
+  final String id;
+  final String label;
+}
+
+class _OptionWrap extends StatelessWidget {
+  const _OptionWrap({
+    required this.options,
+    required this.value,
+    required this.onChanged,
+  });
+
+  final List<_Option> options;
+  final String value;
+  final ValueChanged<String> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: options.map((option) {
+        final selected = option.id == value;
+        return ChoiceChip(
+          label: Text(option.label),
+          selected: selected,
+          onSelected: (_) => onChanged(option.id),
+          selectedColor: const Color(0xFFFF4D8D),
+          backgroundColor: const Color(0x331A1028),
+          labelStyle: TextStyle(
+            color: selected ? Colors.white : Colors.white.withValues(alpha: 0.82),
+            fontWeight: selected ? FontWeight.w800 : FontWeight.w600,
+          ),
+          side: BorderSide(
+            color: selected ? const Color(0xFFFF4D8D) : Colors.white.withValues(alpha: 0.12),
+          ),
+          showCheckmark: false,
+        );
+      }).toList(),
     );
   }
 }

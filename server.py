@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from license_lock import mobile_hwid, verify_or_activate_mobile
-from main import IMAGE_EXTS, OUTPUT_DIR, VIDEO_EXTS, run_pipeline
+from main import IMAGE_EXTS, OUTPUT_DIR, VIDEO_EXTS, normalize_bgm_mood, normalize_speed, resolve_voice, run_pipeline
 
 load_dotenv()
 
@@ -74,7 +74,7 @@ def _update_job(job_id, **fields):
             JOBS[job_id].update(fields)
 
 
-def _run_job(job_id, media_files, prompt, out_file):
+def _run_job(job_id, media_files, prompt, out_file, voice_type, speed_multiplier, bgm_mood):
     def progress(percent, message):
         _update_job(
             job_id,
@@ -91,6 +91,9 @@ def _run_job(job_id, media_files, prompt, out_file):
             progress_cb=progress,
             output_path=out_file,
             check_license=False,
+            voice_type=voice_type,
+            speed_multiplier=speed_multiplier,
+            bgm_mood=bgm_mood,
         )
         if not Path(out_file).is_file():
             raise RuntimeError("완성된 영상 파일을 찾지 못했습니다.")
@@ -156,6 +159,9 @@ async def create_video(
     license_key: str = Form(..., description="라이선스 키"),
     device_id: str = Form(..., description="Android ID / iOS Vendor ID"),
     platform: str = Form("", description="android 또는 ios"),
+    voice_type: str = Form("bright_female", description="energetic_male/bright_female/calm_male/story_female"),
+    speed_multiplier: str = Form("1.0", description="1.0, 1.2, 1.5"),
+    bgm_mood: str = Form("upbeat", description="upbeat/emotional/tense/none"),
 ):
     ok, message = verify_or_activate_mobile(license_key, device_id, platform)
     if not ok:
@@ -164,6 +170,10 @@ async def create_video(
     prompt = (style or style_prompt or "").strip()
     if not files:
         raise HTTPException(status_code=400, detail="사진 또는 동영상을 한 개 이상 업로드해 주세요.")
+
+    voice_key, _vid, _preset = resolve_voice(voice_type)
+    speed = normalize_speed(speed_multiplier)
+    mood = normalize_bgm_mood(bgm_mood)
 
     job_id = uuid.uuid4().hex[:16]
     job_dir = JOBS_DIR / job_id
@@ -204,8 +214,14 @@ async def create_video(
             "output": str(out_file),
         }
 
-    WORKER.submit(_run_job, job_id, saved, prompt, out_file)
-    return {"job_id": job_id, "status": "processing"}
+    WORKER.submit(_run_job, job_id, saved, prompt, out_file, voice_key, speed, mood)
+    return {
+        "job_id": job_id,
+        "status": "processing",
+        "voice_type": voice_key,
+        "speed_multiplier": speed,
+        "bgm_mood": mood,
+    }
 
 
 @app.get("/job-status/{job_id}")

@@ -63,8 +63,43 @@ FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "300"))
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
-DEFAULT_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"
+DEFAULT_VOICE_ID = "cgSgspJ2msm6clMCkdW9"
 ELEVENLABS_MODEL = "eleven_multilingual_v2"
+KENBURNS_W = 900
+KENBURNS_H = 1600
+ALLOWED_SPEEDS = (1.0, 1.2, 1.5)
+DEFAULT_VOICE_TYPE = "bright_female"
+DEFAULT_BGM_MOOD = "upbeat"
+
+# Premade multilingual voices that speak Korean well on eleven_multilingual_v2.
+# Override with ELEVENLABS_VOICE_<TYPE> in .env if needed.
+VOICE_PRESETS = {
+    "energetic_male": {
+        "id": "iP95p4xoKVk53GoZ742B",  # Chris
+        "stability": 0.28,
+        "similarity_boost": 0.70,
+        "style": 0.74,
+    },
+    "bright_female": {
+        "id": "cgSgspJ2msm6clMCkdW9",  # Jessica
+        "stability": 0.36,
+        "similarity_boost": 0.78,
+        "style": 0.58,
+    },
+    "calm_male": {
+        "id": "onwK4e9ZLuTAKqWW03F9",  # Daniel
+        "stability": 0.64,
+        "similarity_boost": 0.82,
+        "style": 0.18,
+    },
+    "story_female": {
+        "id": "pFZP5JQG7iQjIQuC4Bku",  # Lily
+        "stability": 0.48,
+        "similarity_boost": 0.84,
+        "style": 0.46,
+    },
+}
+BGM_MOODS = ("upbeat", "emotional", "tense", "none")
 
 SUB_MAX_WIDTH = 640
 SUB_FONT_SIZE = 48
@@ -218,22 +253,111 @@ def media_to_preview_b64(path):
     return None
 
 
+def sanitize_narration(text):
+    # type: (str) -> str
+    cleaned = (text or "").replace("\r", "\n")
+    cleaned = re.sub(r"(?i)https?://\S+", " ", cleaned)
+    cleaned = re.sub(r"[#＃][0-9A-Za-z가-힣_]+", " ", cleaned)
+    cleaned = cleaned.replace("#", " ").replace("＃", " ")
+    cleaned = re.sub(r"[^\S\n]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"^[\s\-•·]+", "", cleaned, flags=re.M)
+    return cleaned.strip(" \"'`")
+
+
+def resolve_voice(voice_type):
+    key = (voice_type or DEFAULT_VOICE_TYPE).strip().lower()
+    aliases = {
+        "bright_female": "bright_female",
+        "female": "bright_female",
+        "energetic_male": "energetic_male",
+        "male": "energetic_male",
+        "calm_male": "calm_male",
+        "story_female": "story_female",
+    }
+    key = aliases.get(key, DEFAULT_VOICE_TYPE)
+    preset = VOICE_PRESETS[key]
+    env_name = "ELEVENLABS_VOICE_" + key.upper()
+    voice_id = (os.getenv(env_name) or preset["id"] or DEFAULT_VOICE_ID).strip()
+    return key, voice_id, preset
+
+
+def normalize_speed(value):
+    try:
+        speed = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    closest = min(ALLOWED_SPEEDS, key=lambda item: abs(item - speed))
+    return float(closest)
+
+
+def normalize_bgm_mood(value):
+    mood = (value or DEFAULT_BGM_MOOD).strip().lower()
+    aliases = {
+        "upbeat": "upbeat",
+        "beat": "upbeat",
+        "energetic": "upbeat",
+        "emotional": "emotional",
+        "vlog": "emotional",
+        "soft": "emotional",
+        "tense": "tense",
+        "funk": "tense",
+        "punk": "tense",
+        "none": "none",
+        "off": "none",
+        "mute": "none",
+    }
+    return aliases.get(mood, DEFAULT_BGM_MOOD)
+
+
+def atempo_chain(speed):
+    remaining = float(speed)
+    parts = []
+    while remaining > 2.0001:
+        parts.append("atempo=2.0")
+        remaining /= 2.0
+    while remaining < 0.5:
+        parts.append("atempo=0.5")
+        remaining /= 0.5
+    parts.append("atempo={:.4f}".format(remaining))
+    return ",".join(parts)
+
+
+def parse_photo_order(raw, media_count):
+    # type: (str, int) -> Tuple[str, List[int]]
+    text = (raw or "").strip()
+    order = []
+    match = re.search(r"(?:PHOTO_ORDER|사진순서|순서)\s*[:：]\s*([0-9,\s\-]+)", text, re.I)
+    if match:
+        order = [int(num) - 1 for num in re.findall(r"\d+", match.group(1))]
+        text = (text[: match.start()] + text[match.end() :]).strip()
+    order = [idx for idx in order if 0 <= idx < media_count]
+    return text, order
+
+
 def generate_script(settings, media_files, style_prompt=""):
-    # type: (Settings, List[Path], str) -> str
+    # type: (Settings, List[Path], str) -> Tuple[str, List[int]]
     print("1) OpenAI(gpt-4o-mini)로 숏폼 나레이션 대본 작성 중...")
     style = (style_prompt or "").strip() or "시선을 사로잡는 빠른 템포의 숏폼"
+    numbered = ", ".join(
+        "{}번 {}".format(i + 1, path.name) for i, path in enumerate(media_files)
+    )
     prompt = (
         "첨부된 사진/영상 프레임을 보고, 유튜브 쇼츠/인스타 릴스용 "
         "한국어 나레이션 대본만 작성하세요.\n"
         "영상 스타일/분위기: {}\n"
+        "이미지 번호: {}\n"
         "규칙:\n"
         "- 말할 때 20~30초 (대략 90~160자, 너무 길지 않게)\n"
         "- 첫 문장은 시선을 사로잡는 훅\n"
         "- 지정한 스타일에 맞게 톤과 템포를 맞출 것\n"
-        "- 구어체, 짧은 문장\n"
-        "- 장면 지시, 이모지, 해시태그, 따옴표, 제목 없이 대본 본문만\n"
-        "- 화면에 보이는 소재를 구체적으로 언급"
-    ).format(style)
+        "- 구어체, 짧은 문장. 사람이 실제로 말하는 대사만\n"
+        "- 장면 지시, 이모지, 해시태그, #기호, 영어 태그, 따옴표, 제목 금지\n"
+        "- 화면에 보이는 소재를 구체적으로 언급\n"
+        "- 대본 본문만 먼저 쓰고, 마지막 줄에 사진 배치를 이렇게 적으세요:\n"
+        "PHOTO_ORDER: 1,3,2\n"
+        "- PHOTO_ORDER는 대본 흐름에 맞게 이미지 번호(1부터)를 의미 있는 순서로 나열. 반복 가능"
+    ).format(style, numbered)
     content = [{"type": "text", "text": prompt}]
 
     attached = 0
@@ -252,45 +376,47 @@ def generate_script(settings, media_files, style_prompt=""):
             break
 
     if attached == 0:
-        names = ", ".join(p.name for p in media_files)
-        content[0]["text"] += "\n미디어 파일명 힌트: {}".format(names)
+        content[0]["text"] += "\n미디어 파일명 힌트: {}".format(numbered)
 
     client = OpenAI(api_key=settings.openai_api_key)
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": content}],
         temperature=0.85,
-        max_tokens=400,
+        max_tokens=420,
     )
-    script = (response.choices[0].message.content or "").strip()
-    script = script.strip("\"'`")
-    script = re.sub(r"^대본\s*[:：]\s*", "", script)
+    raw = (response.choices[0].message.content or "").strip()
+    raw = re.sub(r"^대본\s*[:：]\s*", "", raw)
+    raw, order = parse_photo_order(raw, len(media_files))
+    script = sanitize_narration(raw)
     if not script:
         raise RuntimeError("대본 생성에 실패했습니다. OpenAI 응답이 비어 있습니다.")
     print("   대본:\n   {}\n".format(script))
-    return script
+    if order:
+        print("   사진 배치: {}".format([i + 1 for i in order]))
+    return script, order
 
 
-def generate_voice(settings, script, output_path=None):
-    # type: (Settings, str, Optional[Path]) -> Path
-    print("2) ElevenLabs로 한국어 음성 생성 중...")
+def generate_voice(settings, script, output_path=None, voice_type=DEFAULT_VOICE_TYPE):
+    # type: (Settings, str, Optional[Path], str) -> Path
+    key, voice_id, preset = resolve_voice(voice_type)
+    spoken = sanitize_narration(script)
+    print("2) ElevenLabs({}) 한국어 네이티브 음성 생성 중... voice={}".format(ELEVENLABS_MODEL, key))
     dest = Path(output_path) if output_path else VOICE_PATH
     dest.parent.mkdir(parents=True, exist_ok=True)
-    url = "https://api.elevenlabs.io/v1/text-to-speech/{}".format(
-        settings.elevenlabs_voice_id
-    )
+    url = "https://api.elevenlabs.io/v1/text-to-speech/{}".format(voice_id)
     headers = {
         "xi-api-key": settings.elevenlabs_api_key,
         "Accept": "audio/mpeg",
         "Content-Type": "application/json",
     }
     payload = {
-        "text": script,
+        "text": spoken,
         "model_id": ELEVENLABS_MODEL,
         "voice_settings": {
-            "stability": 0.42,
-            "similarity_boost": 0.78,
-            "style": 0.55,
+            "stability": preset["stability"],
+            "similarity_boost": preset["similarity_boost"],
+            "style": preset["style"],
             "use_speaker_boost": True,
         },
     }
@@ -681,6 +807,10 @@ def wrap_subtitle_lines(text, font, max_width, stroke_width):
 
 def render_subtitle_png(text, font_path, out_path):
     # type: (str, str, Path) -> Path
+    text = sanitize_narration(text)
+    if not text:
+        Image.new("RGBA", (8, 8), (0, 0, 0, 0)).save(out_path, "PNG")
+        return out_path
     font = _load_font(font_path, SUB_FONT_SIZE)
     inner_width = SUB_MAX_WIDTH - SUB_PAD_X * 2
     lines = wrap_subtitle_lines(text, font, inner_width, SUB_STROKE)
@@ -825,6 +955,62 @@ def pick_bgm_file():
     if not files:
         return None
     return random.choice(files)
+
+
+def pick_bgm_for_mood(mood):
+    mood = normalize_bgm_mood(mood)
+    if mood == "none":
+        return None
+    keywords = {
+        "upbeat": ("upbeat", "beat", "energetic", "happy", "fun", "신나"),
+        "emotional": ("emotional", "vlog", "soft", "chill", "calm", "감성"),
+        "tense": ("tense", "funk", "punk", "pulse", "dark", "긴박"),
+    }.get(mood, ())
+    files = list_audio_files(BGM_DIR)
+    matched = [
+        path
+        for path in files
+        if any(word in path.stem.lower() for word in keywords)
+    ]
+    pool = matched or files
+    if pool:
+        return random.choice(pool)
+    return None
+
+
+def synthesize_bgm(mood, duration, dest):
+    mood = normalize_bgm_mood(mood)
+    if mood == "none":
+        return None
+    sr = 22050
+    n = max(sr, int(sr * max(1.0, float(duration) + 0.4)))
+    t = np.arange(n, dtype=np.float64) / float(sr)
+    if mood == "emotional":
+        wave_data = (
+            0.11 * np.sin(2 * np.pi * 196 * t)
+            + 0.08 * np.sin(2 * np.pi * 247 * t)
+            + 0.05 * np.sin(2 * np.pi * 294 * t)
+        ) * (0.55 + 0.45 * np.sin(2 * np.pi * 0.12 * t))
+    elif mood == "tense":
+        pulse = (np.sin(2 * np.pi * 2.4 * t) > 0).astype(np.float64)
+        wave_data = 0.14 * np.sin(2 * np.pi * 98 * t) * pulse + 0.04 * np.sin(
+            2 * np.pi * 392 * t
+        )
+    else:
+        kick = np.exp(-((t % 0.5) * 18)) * np.sin(2 * np.pi * 70 * t)
+        stab = ((t % 0.5) < 0.08).astype(np.float64) * np.sin(2 * np.pi * 523 * t)
+        wave_data = 0.16 * kick + 0.05 * stab
+    fade = np.minimum(1.0, np.minimum(t / 0.12, (t[-1] - t) / 0.25))
+    samples = np.clip(wave_data * fade, -0.35, 0.35)
+    pcm = (samples * 32767.0).astype(np.int16)
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(dest), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sr)
+        wav_file.writeframes(pcm.tobytes())
+    return dest
 
 
 def find_named_sfx(name):
@@ -1014,11 +1200,13 @@ def fit_cover_rgb(im, width, height):
     return img.crop((left, top, left + width, top + height))
 
 
-def still_from_media(path, dest_jpg, work_dir):
+def still_from_media(path, dest_jpg, work_dir, width=None, height=None):
+    width = int(width or TARGET_W)
+    height = int(height or TARGET_H)
     suffix = Path(path).suffix.lower()
     if suffix in IMAGE_EXTS:
         with Image.open(path) as im:
-            fit_cover_rgb(im, TARGET_W, TARGET_H).save(dest_jpg, "JPEG", quality=86)
+            fit_cover_rgb(im, width, height).save(dest_jpg, "JPEG", quality=88)
         return dest_jpg
     tmp = work_dir / (dest_jpg.stem + "_grab.jpg")
     run_ffmpeg(
@@ -1026,66 +1214,97 @@ def still_from_media(path, dest_jpg, work_dir):
         timeout=20,
     )
     with Image.open(tmp) as im:
-        fit_cover_rgb(im, TARGET_W, TARGET_H).save(dest_jpg, "JPEG", quality=86)
+        fit_cover_rgb(im, width, height).save(dest_jpg, "JPEG", quality=88)
     return dest_jpg
 
 
-def bake_caption_on_still(base_jpg, caption, font_path, dest_jpg):
-    canvas = Image.open(base_jpg).convert("RGBA")
-    text = (caption or "").strip()
-    if text:
-        cap_path = dest_jpg.with_name(dest_jpg.stem + "_cap.png")
-        render_subtitle_png(text, font_path, cap_path)
-        overlay = Image.open(cap_path).convert("RGBA")
-        x = max(0, (TARGET_W - overlay.width) // 2)
-        y = max(0, TARGET_H - overlay.height - 64)
-        canvas.paste(overlay, (x, y), overlay)
-    canvas.convert("RGB").save(dest_jpg, "JPEG", quality=88)
-
-
-def ffmpeg_stillimage_pass(frames, voice_path, out_file):
-    args = []
-    for jpg, dur in frames:
-        args += [
-            "-loop",
-            "1",
-            "-framerate",
-            str(FPS),
-            "-t",
-            "{:.3f}".format(max(0.2, float(dur))),
-            "-i",
-            str(jpg),
-        ]
-    args += ["-i", str(voice_path)]
-    n = len(frames)
-    voice_idx = n
-    if n == 1:
-        args += ["-map", "0:v:0", "-map", "{}:a:0".format(voice_idx), "-vf", "format=yuv420p"]
+def arrange_media_for_cues(media_files, cues, photo_order):
+    n = max(1, len(media_files))
+    if photo_order:
+        cycle = [media_files[i] for i in photo_order if 0 <= i < n]
     else:
-        parts = []
-        for i in range(n):
-            parts.append("[{}:v]format=yuv420p,setsar=1[v{}]".format(i, i))
-        parts.append(
-            "".join("[v{}]".format(i) for i in range(n))
-            + "concat=n={}:v=1:a=0[v]".format(n)
+        cycle = list(media_files)
+    if not cycle:
+        cycle = list(media_files)
+    return [cycle[i % len(cycle)] for i in range(len(cues))]
+
+
+def kenburns_zoom_expr(index):
+    if index % 2 == 0:
+        return "min(1+0.00135*on,1.14)"
+    return "if(eq(on,0),1.14,max(1.14-0.00135*on,1.0))"
+
+
+def ffmpeg_motion_pass(scenes, voice_path, out_file, speed=1.0, bgm_path=None):
+    speed = normalize_speed(speed)
+    args = []
+    n = len(scenes)
+    for still, _cap, _dur in scenes:
+        args += ["-loop", "1", "-i", str(still)]
+    for _still, cap, _dur in scenes:
+        args += ["-loop", "1", "-i", str(cap)]
+    args += ["-i", str(voice_path)]
+    if bgm_path:
+        args += ["-i", str(bgm_path)]
+
+    filters = []
+    labels = []
+    for i, (_still, _cap, dur) in enumerate(scenes):
+        frames = max(int(round(max(0.2, float(dur)) * FPS)), 10)
+        cap_i = n + i
+        filters.append(
+            "[{i}:v]scale={w}:{h}:force_original_aspect_ratio=increase,"
+            "crop={w}:{h},zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+            "d={d}:s={tw}x{th}:fps={fps},format=yuv420p[z{i}]".format(
+                i=i,
+                w=KENBURNS_W,
+                h=KENBURNS_H,
+                z=kenburns_zoom_expr(i),
+                d=frames,
+                tw=TARGET_W,
+                th=TARGET_H,
+                fps=FPS,
+            )
         )
-        args += [
-            "-filter_complex",
-            ";".join(parts),
-            "-map",
-            "[v]",
-            "-map",
-            "{}:a:0".format(voice_idx),
-        ]
+        filters.append(
+            "[z{i}][{c}:v]overlay=(W-w)/2:H-h-64[v{i}]".format(i=i, c=cap_i)
+        )
+        labels.append("[v{}]".format(i))
+    filters.append("".join(labels) + "concat=n={}:v=1:a=0[vcat]".format(n))
+    if abs(speed - 1.0) > 0.001:
+        filters.append("[vcat]setpts=PTS/{:.4f},fps={},format=yuv420p[v]".format(speed, FPS))
+        audio_fx = atempo_chain(speed)
+    else:
+        filters.append("[vcat]fps={},format=yuv420p,setsar=1[v]".format(FPS))
+        audio_fx = "anull"
+
+    voice_i = 2 * n
+    filters.append("[{}:a]{}[va]".format(voice_i, audio_fx))
+    if bgm_path:
+        bgm_i = voice_i + 1
+        filters.append(
+            "[{}:a]aformat=sample_fmts=fltp:channel_layouts=stereo,volume=0.16,{}[ba]".format(
+                bgm_i, audio_fx
+            )
+        )
+        filters.append("[va][ba]amix=inputs=2:duration=first:dropout_transition=2[a]")
+        a_map = "[a]"
+    else:
+        a_map = "[va]"
+
     args += [
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        "[v]",
+        "-map",
+        a_map,
         "-c:v",
         "libx264",
-        "-tune",
-        "stillimage",
         "-preset",
         "ultrafast",
         "-crf",
-        "26",
+        "24",
         "-threads",
         "2",
         "-pix_fmt",
@@ -1102,20 +1321,47 @@ def ffmpeg_stillimage_pass(frames, voice_path, out_file):
     run_ffmpeg(args)
 
 
-def render_stillimage_reel(media_files, script, voice_path, duration, font_path, work_dir, out_file):
-    cues = split_script_cues(script, duration)
+def render_stillimage_reel(
+    media_files,
+    script,
+    voice_path,
+    duration,
+    font_path,
+    work_dir,
+    out_file,
+    photo_order=None,
+    speed_multiplier=1.0,
+    bgm_mood=DEFAULT_BGM_MOOD,
+):
+    cues = split_script_cues(sanitize_narration(script), duration)
     if not cues:
-        cues = [(script, 0.0, duration)]
-    n = max(1, len(media_files))
-    frames = []
-    for i, (text, start, end) in enumerate(cues):
-        src = media_files[i % n]
+        cues = [(sanitize_narration(script), 0.0, duration)]
+    assigned = arrange_media_for_cues(media_files, cues, photo_order or [])
+    scenes = []
+    for i, ((text, start, end), src) in enumerate(zip(cues, assigned)):
         still = work_dir / ("still_{:03d}.jpg".format(i))
-        still_from_media(src, still, work_dir)
-        framed = work_dir / ("frame_{:03d}.jpg".format(i))
-        bake_caption_on_still(still, text, font_path, framed)
-        frames.append((framed, max(0.2, float(end) - float(start))))
-    ffmpeg_stillimage_pass(frames, voice_path, out_file)
+        still_from_media(src, still, work_dir, KENBURNS_W, KENBURNS_H)
+        cap = work_dir / ("cap_{:03d}.png".format(i))
+        render_subtitle_png(text, font_path, cap)
+        scenes.append((still, cap, max(0.2, float(end) - float(start))))
+
+    mood = normalize_bgm_mood(bgm_mood)
+    bgm_path = None
+    if mood != "none":
+        bgm_path = pick_bgm_for_mood(mood)
+        if bgm_path is None:
+            bgm_path = synthesize_bgm(mood, duration, work_dir / "bgm_mood.wav")
+            print("   합성 BGM: {}".format(mood))
+        else:
+            print("   BGM 파일: {}".format(bgm_path.name))
+
+    ffmpeg_motion_pass(
+        scenes,
+        voice_path,
+        out_file,
+        speed=speed_multiplier,
+        bgm_path=bgm_path,
+    )
 
 
 def _notify(progress_cb, percent, message):
@@ -1124,8 +1370,17 @@ def _notify(progress_cb, percent, message):
         progress_cb(percent, message)
 
 
-def run_pipeline(media_files, style_prompt="", progress_cb=None, output_path=None, check_license=True):
-    # type: (List[Path], str, object, Optional[Path], bool) -> Tuple[Path, str]
+def run_pipeline(
+    media_files,
+    style_prompt="",
+    progress_cb=None,
+    output_path=None,
+    check_license=True,
+    voice_type=DEFAULT_VOICE_TYPE,
+    speed_multiplier=1.0,
+    bgm_mood=DEFAULT_BGM_MOOD,
+):
+    # type: (List[Path], str, object, Optional[Path], bool, str, float, str) -> Tuple[Path, str]
     if check_license:
         ok, message = verify_saved_license()
         if not ok:
@@ -1138,6 +1393,9 @@ def run_pipeline(media_files, style_prompt="", progress_cb=None, output_path=Non
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_file = Path(output_path) if output_path else FINAL_PATH
     out_file.parent.mkdir(parents=True, exist_ok=True)
+    speed = normalize_speed(speed_multiplier)
+    mood = normalize_bgm_mood(bgm_mood)
+    voice_key, _voice_id, _preset = resolve_voice(voice_type)
 
     _notify(
         progress_cb,
@@ -1147,16 +1405,17 @@ def run_pipeline(media_files, style_prompt="", progress_cb=None, output_path=Non
         ),
     )
     _notify(progress_cb, 12, "대본 작성 중")
-    script = generate_script(settings, media_files, style_prompt=style_prompt)
+    script, photo_order = generate_script(settings, media_files, style_prompt=style_prompt)
+    script = sanitize_narration(script)
 
     _notify(progress_cb, 32, "음성 생성 중")
     voice_file = out_file.parent / "voice.mp3"
-    generate_voice(settings, script, output_path=voice_file)
+    generate_voice(settings, script, output_path=voice_file, voice_type=voice_key)
 
     audio_duration = probe_duration(voice_file)
     if audio_duration < 1:
         raise RuntimeError("생성된 음성이 너무 짧습니다. 대본/TTS를 확인하세요.")
-    print("   음성 길이: {:.2f}초".format(audio_duration))
+    print("   음성 길이: {:.2f}초 / 배속 {}x / BGM {}".format(audio_duration, speed, mood))
 
     work_dir = out_file.parent / ("_ffwork_{}".format(uuid.uuid4().hex[:8]))
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -1170,6 +1429,9 @@ def run_pipeline(media_files, style_prompt="", progress_cb=None, output_path=Non
             font_path,
             work_dir,
             out_file,
+            photo_order=photo_order,
+            speed_multiplier=speed,
+            bgm_mood=mood,
         )
         _notify(progress_cb, 95, "완료 처리 중")
     finally:
