@@ -46,8 +46,8 @@ WORKER = ThreadPoolExecutor(max_workers=1)
 
 app = FastAPI(
     title="AI 숏폼 모바일 서버",
-    description="초고속 스틸 렌더 + fal Image-to-Video 런웨이 모드",
-    version="3.0.0",
+    description="EXIF 회전 보정 + 15~20초 시네마틱 숏폼 / fal Image-to-Video",
+    version="3.1.0",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -227,17 +227,17 @@ async def analyze_media(
 
 @app.post("/create-video")
 async def create_video(
-    files: List[UploadFile] = File(..., description="사진/동영상 (여러 개 가능)"),
+    files: List[UploadFile] = File(..., description="사진/동영상 (EXIF 회전 자동 보정)"),
     style: str = Form("", description="스타일 프롬프트"),
     style_prompt: str = Form("", description="style 별칭"),
     license_key: str = Form(..., description="라이선스 키"),
     device_id: str = Form(..., description="Android ID / iOS Vendor ID"),
     platform: str = Form("", description="android 또는 ios"),
     voice_type: str = Form("vlog_female", description="variety_male 등 8종"),
-    speed_multiplier: str = Form("1.2", description="1.0, 1.2, 1.5"),
-    bgm_mood: str = Form("pop", description="구버전 별칭"),
-    bgm_type: str = Form("pop", description="variety/lofi/phonk/pop/acoustic/suspense/cinematic/none"),
-    is_runway_mode: str = Form("false", description="true면 fal Image-to-Video"),
+    speed_multiplier: str = Form("1.0", description="시네마틱은 1.0 권장"),
+    bgm_mood: str = Form("lofi", description="구버전 별칭"),
+    bgm_type: str = Form("lofi", description="variety/lofi/phonk/pop/acoustic/suspense/cinematic/none"),
+    is_runway_mode: str = Form("false", description="true면 fal I2V 클립을 음성 길이(15~20초)에 맞춰 이어붙임"),
     camera_motion: str = Form("zoom_in", description="zoom_in/drone/pan"),
 ):
     ok, message = verify_or_activate_mobile(license_key, device_id, platform)

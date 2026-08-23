@@ -25,7 +25,7 @@ import numpy as np
 import requests
 from dotenv import load_dotenv
 from openai import OpenAI
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 from license_lock import require_license, verify_saved_license
 
 try:
@@ -136,9 +136,9 @@ VOICE_PRESETS = {
 }
 BGM_MOODS = ("variety", "lofi", "phonk", "pop", "acoustic", "suspense", "cinematic", "none")
 
-SUB_MAX_WIDTH = 640
-SUB_FONT_SIZE = 48
-SUB_STROKE = 6
+SUB_MAX_WIDTH = 680
+SUB_FONT_SIZE = 58
+SUB_STROKE = 8
 SUB_LINE_GAP = 10
 SUB_PAD_X = 28
 SUB_PAD_Y = 20
@@ -282,8 +282,28 @@ def _load_font(font_path, size):
         return ImageFont.truetype(font_path, size, index=0)
 
 
+def open_image_upright(path):
+    img = Image.open(path)
+    try:
+        fixed = ImageOps.exif_transpose(img)
+        if fixed is not None and fixed is not img:
+            img.close()
+            img = fixed
+        elif fixed is not None:
+            img = fixed
+    except Exception:
+        pass
+    return img
+
+
 def _pil_to_jpeg_b64(image, max_side=1024):
     # type: (Image.Image, int) -> str
+    try:
+        transposed = ImageOps.exif_transpose(image)
+        if transposed is not None:
+            image = transposed
+    except Exception:
+        pass
     img = image.convert("RGB")
     width, height = img.size
     scale = min(1.0, float(max_side) / float(max(width, height)))
@@ -303,7 +323,7 @@ def media_to_preview_b64(path):
     suffix = path.suffix.lower()
     try:
         if suffix in IMAGE_EXTS:
-            with Image.open(path) as im:
+            with open_image_upright(path) as im:
                 return _pil_to_jpeg_b64(im)
         if suffix in VIDEO_EXTS:
             preview = OUTPUT_DIR / ("_preview_{}.jpg".format(path.stem))
@@ -313,7 +333,7 @@ def media_to_preview_b64(path):
                     ["-ss", "0.3", "-i", str(path), "-frames:v", "1", "-q:v", "6", str(preview)],
                     timeout=20,
                 )
-                with Image.open(preview) as im:
+                with open_image_upright(preview) as im:
                     return _pil_to_jpeg_b64(im)
             except Exception:
                 clip = VideoFileClip(str(path))
@@ -657,11 +677,12 @@ def generate_script(settings, media_files, style_prompt="", direction=None):
         "한국어 나레이션 대본만 작성하세요.\n"
         "영상 스타일/분위기: {}{}\n"
         "이미지 번호: {}\n"
+        "사진이 1장이어도 반드시 15~20초짜리 완성형 스토리로 작성하세요.\n"
         "규칙:\n"
-        "- 말할 때 20~30초 (대략 90~160자, 너무 길지 않게)\n"
-        "- 첫 문장은 시선을 사로잡는 훅\n"
+        "- 말할 때 15~20초 (공백 제외 150~200자. 짧으면 실패)\n"
+        "- 구성: (1) 첫 3초를 잡는 훅 (2) 감성 분위기·장면 묘사 (3) 여운 있는 마무리\n"
         "- 지정한 스타일에 맞게 톤과 템포를 맞출 것\n"
-        "- 구어체, 짧은 문장. 사람이 실제로 말하는 대사만\n"
+        "- 구어체, 짧은 문장을 이어 붙여 호흡 있게\n"
         "- 장면 지시, 이모지, 해시태그, #기호, 영어 태그, 따옴표, 제목 금지\n"
         "- 화면에 보이는 소재를 구체적으로 언급\n"
         "- 대본 본문만 먼저 쓰고, 마지막 줄에 사진 배치를 이렇게 적으세요:\n"
@@ -689,19 +710,38 @@ def generate_script(settings, media_files, style_prompt="", direction=None):
         content[0]["text"] += "\n미디어 파일명 힌트: {}".format(numbered)
 
     client = OpenAI(api_key=settings.openai_api_key)
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": content}],
-        temperature=0.85,
-        max_tokens=420,
-    )
-    raw = (response.choices[0].message.content or "").strip()
-    raw = re.sub(r"^대본\s*[:：]\s*", "", raw)
-    raw, order = parse_photo_order(raw, len(media_files))
-    script = sanitize_narration(raw)
-    if not script:
-        raise RuntimeError("대본 생성에 실패했습니다. OpenAI 응답이 비어 있습니다.")
-    print("   대본:\n   {}\n".format(script))
+
+    def _ask(extra=""):
+        body = list(content)
+        if extra:
+            body = [dict(body[0])] + body[1:]
+            body[0]["text"] = content[0]["text"] + extra
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": body}],
+            temperature=0.85,
+            max_tokens=700,
+        )
+        raw_text = (response.choices[0].message.content or "").strip()
+        raw_text = re.sub(r"^대본\s*[:：]\s*", "", raw_text)
+        raw_text, order_ids = parse_photo_order(raw_text, len(media_files))
+        return sanitize_narration(raw_text), order_ids
+
+    script, order = _ask()
+    compact = re.sub(r"\s+", "", script)
+    if len(compact) < 150:
+        script, order = _ask(
+            "\n이전 대본이 너무 짧습니다. 공백 제외 150~200자로 훅-묘사-마무리를 다시 쓰세요."
+        )
+        compact = re.sub(r"\s+", "", script)
+    if len(compact) < 150:
+        script, order = _ask(
+            "\n150자 미만입니다. 첫 3초 훅, 분위기 묘사, 여운 있는 마무리를 넣어 공백 제외 160자 전후로 다시 쓰세요."
+        )
+        compact = re.sub(r"\s+", "", script)
+    if not script or len(compact) < 80:
+        raise RuntimeError("대본 생성에 실패했습니다. OpenAI 응답이 비어 있거나 너무 짧습니다.")
+    print("   대본 ({}자):\n   {}\n".format(len(compact), script))
     if order:
         print("   사진 배치: {}".format([i + 1 for i in order]))
     return script, order
@@ -998,7 +1038,7 @@ def load_visual_clip(path):
     if suffix in IMAGE_EXTS:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         tmp = OUTPUT_DIR / ("_frame_{}.jpg".format(path.stem))
-        with Image.open(path) as im:
+        with open_image_upright(path) as im:
             im.convert("RGB").save(tmp, quality=95)
         clip = ImageClip(str(tmp))
         clip = to_vertical(clip)
@@ -1529,6 +1569,12 @@ def fit_cover_rgb(im, width, height, fast=True):
 
 
 def fit_contain_on_blur(im, width, height):
+    try:
+        fixed = ImageOps.exif_transpose(im)
+        if fixed is not None:
+            im = fixed
+    except Exception:
+        pass
     src = im.convert("RGB")
     resampling = getattr(Image, "Resampling", Image)
     bg = fit_cover_rgb(src, width, height, fast=True)
@@ -1550,7 +1596,7 @@ def still_from_media(path, dest_jpg, work_dir, width=None, height=None):
     height = int(height or TARGET_H)
     suffix = Path(path).suffix.lower()
     if suffix in IMAGE_EXTS:
-        with Image.open(path) as im:
+        with open_image_upright(path) as im:
             fit_contain_on_blur(im, width, height).save(dest_jpg, "JPEG", quality=85)
         return dest_jpg
     tmp = work_dir / (dest_jpg.stem + "_grab.jpg")
@@ -1558,7 +1604,7 @@ def still_from_media(path, dest_jpg, work_dir, width=None, height=None):
         ["-ss", "0.15", "-i", str(path), "-frames:v", "1", "-q:v", "4", str(tmp)],
         timeout=20,
     )
-    with Image.open(tmp) as im:
+    with open_image_upright(tmp) as im:
         fit_contain_on_blur(im, width, height).save(dest_jpg, "JPEG", quality=85)
     return dest_jpg
 
@@ -1577,7 +1623,7 @@ def arrange_media_for_cues(media_files, cues, photo_order):
 def compose_captioned_png(src, caption, font_path, dest_png, work_dir, direction=None):
     suffix = Path(src).suffix.lower()
     if suffix in IMAGE_EXTS:
-        with Image.open(src) as im:
+        with open_image_upright(src) as im:
             canvas = fit_contain_on_blur(im, TARGET_W, TARGET_H).convert("RGBA")
     else:
         tmp = work_dir / (dest_png.stem + "_grab.jpg")
@@ -1585,7 +1631,7 @@ def compose_captioned_png(src, caption, font_path, dest_png, work_dir, direction
             ["-ss", "0.12", "-i", str(src), "-frames:v", "1", "-q:v", "6", str(tmp)],
             timeout=12,
         )
-        with Image.open(tmp) as im:
+        with open_image_upright(tmp) as im:
             canvas = fit_contain_on_blur(im, TARGET_W, TARGET_H).convert("RGBA")
     text = sanitize_narration(caption)
     if text:
@@ -1649,7 +1695,7 @@ def build_slideshow_entries(frames, durations, work_dir, speed=1.0, xfade_sec=XF
     if len(frames) == 1:
         return [(frames[0], scaled[0])]
 
-    opened = [Image.open(path).convert("RGB") for path in frames]
+    opened = [open_image_upright(path).convert("RGB") for path in frames]
     entries = []
     try:
         for i, png in enumerate(frames):
@@ -1862,12 +1908,14 @@ def generate_runway_clips(media_files, style_prompt, camera_motion, work_dir, pr
 def fit_runway_clip(src, dest, duration):
     run_ffmpeg(
         [
+            "-fflags",
+            "+genpts",
             "-stream_loop",
             "-1",
             "-i",
             str(src),
             "-t",
-            "{:.3f}".format(max(0.4, float(duration))),
+            "{:.3f}".format(max(1.0, float(duration))),
             "-vf",
             "scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,fps={fps},format=yuv420p".format(
                 w=TARGET_W, h=TARGET_H, fps=FPS
@@ -1901,7 +1949,7 @@ def overlay_cues_on_video(video_path, cues, font_path, direction, work_dir, dest
             png,
             fill=(direction.fill if direction else (255, 255, 255)),
             stroke=(direction.stroke if direction else (0, 0, 0)),
-            font_scale=(direction.font_scale if direction else 1.0),
+            font_scale=(1.25 * (direction.font_scale if direction else 1.0)),
         )
         if not png.is_file():
             continue
@@ -1945,20 +1993,36 @@ def overlay_cues_on_video(video_path, cues, font_path, direction, work_dir, dest
     return dest
 
 
-def ffmpeg_runway_pass(clips, durations, cues, font_path, direction, voice_path, bgm_path, out_file, work_dir):
+def ffmpeg_runway_pass(
+    clips, durations, cues, font_path, direction, voice_path, bgm_path, out_file, work_dir, audio_duration
+):
     if not clips:
         raise RuntimeError("런웨이 비디오 클립이 없습니다.")
+    target = max(15.0, float(audio_duration) + 0.35)
+    n = max(1, len(clips))
     fitted = []
-    n = len(clips)
-    for i, dur in enumerate(durations):
-        src = clips[i % n]
-        dest = work_dir / ("runway_fit_{:03d}.mp4".format(i))
-        fit_runway_clip(src, dest, dur)
+    elapsed = 0.0
+    index = 0
+    while elapsed < target - 0.05 and index < 16:
+        remain = target - elapsed
+        piece = min(float(RUNWAY_CLIP_SEC), remain)
+        if remain > RUNWAY_CLIP_SEC and remain - RUNWAY_CLIP_SEC < 1.2:
+            piece = remain
+        dest = work_dir / ("runway_fit_{:03d}.mp4".format(index))
+        fit_runway_clip(clips[index % n], dest, piece)
         fitted.append(dest)
+        elapsed += piece
+        index += 1
+
     concat_path = work_dir / "runway_concat.txt"
     lines = ["ffconcat version 1.0"]
+    last = fitted[-1]
     for clip in fitted:
+        last = clip
+        dur = max(0.4, probe_duration(clip))
         lines.append("file '{}'".format(Path(clip).resolve().as_posix().replace("'", r"'\''")))
+        lines.append("duration {:.3f}".format(dur))
+    lines.append("file '{}'".format(Path(last).resolve().as_posix().replace("'", r"'\''")))
     concat_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     silent_video = work_dir / "runway_body.mp4"
     run_ffmpeg(
@@ -1969,6 +2033,8 @@ def ffmpeg_runway_pass(clips, durations, cues, font_path, direction, voice_path,
             "0",
             "-i",
             str(concat_path),
+            "-t",
+            "{:.3f}".format(target),
             "-c:v",
             "libx264",
             "-preset",
@@ -1992,7 +2058,10 @@ def ffmpeg_runway_pass(clips, durations, cues, font_path, direction, voice_path,
         args += ["-i", str(bgm_path)]
         extra = [
             "-filter_complex",
-            "[1:a]volume=1.05[va];[2:a]volume=0.16[ba];[va][ba]amix=inputs=2:duration=first:dropout_transition=0[a]",
+            "[1:a]volume=1.08[va];[2:a]volume=0.22,afade=t=in:st=0:d=0.4,afade=t=out:st={:.2f}:d=0.8[ba];"
+            "[va][ba]amix=inputs=2:duration=first:dropout_transition=0[a]".format(
+                max(0.5, float(audio_duration) - 0.8)
+            ),
         ]
         maps = ["-map", "0:v:0", "-map", "[a]"]
     args += extra + maps + [
@@ -2007,8 +2076,9 @@ def ffmpeg_runway_pass(clips, durations, cues, font_path, direction, voice_path,
         "-c:a",
         "aac",
         "-b:a",
-        "128k",
-        "-shortest",
+        "192k",
+        "-t",
+        "{:.3f}".format(float(audio_duration)),
         "-movflags",
         "+faststart",
         str(out_file),
@@ -2045,6 +2115,8 @@ def run_pipeline(
     mood = normalize_bgm_mood(bgm_mood)
     runway = bool(is_runway_mode)
     motion = normalize_camera_motion(camera_motion)
+    if runway and mood == "none":
+        mood = "lofi"
     voice_key, _voice_id, _preset = resolve_voice(voice_type)
     progress_lock = threading.Lock()
 
@@ -2114,15 +2186,8 @@ def run_pipeline(
             clips = generated
             if not clips:
                 raise RuntimeError("런웨이 비디오를 만들지 못했습니다.")
-            if len(durations) != len(clips):
-                # match cue count to available I2V clips by grouping
-                if len(durations) > len(clips):
-                    durations = durations[: len(clips)]
-                    cues = cues[: len(clips)]
-                else:
-                    durations = durations + [max(0.4, audio_duration / max(1, len(clips)))] * (
-                        len(clips) - len(durations)
-                    )
+            if mood == "none":
+                bgm_path = resolve_bgm("lofi", audio_duration, work_dir / "bgm.wav")
             _notify(progress_cb, 78, "런웨이 클립·자막 합성 중", progress_lock)
             ffmpeg_runway_pass(
                 clips,
@@ -2134,6 +2199,7 @@ def run_pipeline(
                 bgm_path,
                 out_file,
                 work_dir,
+                audio_duration,
             )
         else:
             frames = generated
