@@ -42,9 +42,11 @@ from license_lock import (
 from main import (
     IMAGE_EXTS,
     OUTPUT_DIR,
+    PIPELINE_HARD_LIMIT,
     VIDEO_EXTS,
     analyze_media_styles,
     diet_image_file,
+    fast_blur_slideshow,
     load_settings,
     normalize_bgm_mood,
     normalize_camera_motion,
@@ -235,6 +237,9 @@ def _run_job(
     features,
 ):
     started = time.time()
+    deadline = started + PIPELINE_HARD_LIMIT
+    finished = threading.Event()
+    write_lock = threading.Lock()
 
     def progress(percent, message):
         _update_job(
@@ -246,10 +251,34 @@ def _run_job(
             elapsed_sec=round(time.time() - started, 1),
         )
 
+    def _force_blur():
+        if Path(out_file).is_file():
+            return
+        work = Path(out_file).parent / "_force_blur"
+        work.mkdir(parents=True, exist_ok=True)
+        with write_lock:
+            if Path(out_file).is_file():
+                return
+            progress(92, "30초 강제 완성 · 초고속 3초 블러 슬라이드쇼")
+            fast_blur_slideshow(media_files, out_file, work, duration=3.0)
+
+    def _watchdog():
+        if finished.wait(timeout=max(1.0, PIPELINE_HARD_LIMIT - 5.0)):
+            return
+        try:
+            _force_blur()
+        except Exception as exc:
+            print("[안내] 강제 완성 워치독 실패: {}".format(exc))
+
+    watcher = threading.Thread(target=_watchdog, daemon=True)
+    watcher.start()
+
     try:
         _update_job(job_id, stage="대본 작성 중", percent=8, progress=8, elapsed_sec=0)
+        runner = ThreadPoolExecutor(max_workers=1)
         try:
-            run_pipeline(
+            fut = runner.submit(
+                run_pipeline,
                 media_files,
                 style_prompt=prompt,
                 progress_cb=progress,
@@ -263,26 +292,22 @@ def _run_job(
                 camera_motion=camera_motion,
                 output_height=output_height,
                 fast_mode=not spark_cinema,
+                deadline_ts=deadline,
             )
-        except Exception as exc:
-            traceback.print_exc()
-            progress(80, "외부 API 오류 · 쾌속 블러 슬라이드쇼로 전환")
-            run_pipeline(
-                media_files,
-                style_prompt=prompt,
-                progress_cb=progress,
-                output_path=out_file,
-                check_license=False,
-                voice_type=voice_type,
-                speed_multiplier=speed_multiplier,
-                bgm_mood=bgm_mood,
-                is_runway_mode=False,
-                is_spark_cinema=False,
-                camera_motion=camera_motion,
-                output_height=720,
-                fast_mode=True,
-            )
-            print("[안내] 서버 안전장치 폴백 완료: {}".format(exc))
+            try:
+                fut.result(timeout=max(4.0, PIPELINE_HARD_LIMIT - 4.0))
+            except Exception as exc:
+                if not isinstance(exc, TimeoutError):
+                    traceback.print_exc()
+                progress(80, "외부 API 대기열 · 초고속 3초 블러 슬라이드쇼로 전환")
+                try:
+                    _force_blur()
+                except Exception:
+                    print("[안내] 서버 안전장치 폴백 실패: {}".format(exc))
+        finally:
+            runner.shutdown(wait=False)
+        if not Path(out_file).is_file():
+            _force_blur()
         if not Path(out_file).is_file():
             raise RuntimeError("완성된 영상 파일을 찾지 못했습니다.")
         consume_entitlement(features)
@@ -305,6 +330,7 @@ def _run_job(
             elapsed_sec=round(time.time() - started, 1),
         )
     finally:
+        finished.set()
         job_dir = Path(out_file).parent
         keep = out_file if Path(out_file).is_file() else None
         if isinstance(media_files, list):

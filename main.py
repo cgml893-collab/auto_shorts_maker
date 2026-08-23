@@ -69,8 +69,9 @@ BLUR_RADIUS = 26
 BLUR_DIM = 0.38
 FAL_I2V_PRIMARY = os.getenv("FAL_I2V_MODEL", "fal-ai/minimax/video-01/image-to-video")
 FAL_I2V_FALLBACK = "fal-ai/kling-video/v1/standard/image-to-video"
-SPARK_CLIP_SEC = 5.0
-SPARK_MAX_CLIPS = 3
+FAL_WAIT_TIMEOUT = 25.0
+PIPELINE_HARD_LIMIT = 30.0
+FAST_BLUR_SEC = 3.0
 HD_W = 1080
 HD_H = 1920
 CAMERA_MOTIONS = {
@@ -2018,7 +2019,7 @@ def fal_image_to_video(image_path, prompt, dest_mp4):
                 url = _fal_video_url(result)
                 if not url:
                     raise RuntimeError("fal 응답에 video url이 없습니다: {}".format(str(result)[:400]))
-                download_http_file(url, dest_mp4)
+                download_http_file(url, dest_mp4, timeout=20)
                 if Path(dest_mp4).is_file() and Path(dest_mp4).stat().st_size > 1000:
                     return Path(dest_mp4)
             except Exception as exc:
@@ -2028,6 +2029,17 @@ def fal_image_to_video(image_path, prompt, dest_mp4):
     except Exception as exc:
         print("[안내] fal.ai 전체 실패(프로세스 유지): {}".format(exc))
         raise RuntimeError("✨ 스파크 시네마 AI 호출 실패: {}".format(exc))
+
+
+async def fal_image_to_video_timed(image_path, prompt, dest_mp4, timeout=FAL_WAIT_TIMEOUT):
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(fal_image_to_video, image_path, prompt, dest_mp4),
+            timeout=float(timeout),
+        )
+    except asyncio.TimeoutError:
+        print("[안내] fal.ai {}초 타임아웃 → 블러 폴백".format(timeout))
+        raise RuntimeError("fal.ai 대기열 타임아웃 ({}s)".format(timeout))
 
 
 def generate_spark_cinema_clips(
@@ -2049,24 +2061,30 @@ def generate_spark_cinema_clips(
     total = max(1, len(sources))
     _notify(progress_cb, 34, "✨ 스파크 시네마 AI 병렬 생성 중 ({}장)".format(total), lock)
 
-    def _one(index, src):
+    async def _one(index, src):
         try:
             frame = work_dir / ("i2v_src_{:02d}.jpg".format(index + 1))
-            still_from_media(src, frame, work_dir, width, height)
-            diet_image_file(frame, dest=frame)
+            await asyncio.to_thread(still_from_media, src, frame, work_dir, width, height)
+            await asyncio.to_thread(diet_image_file, frame, frame)
             clip = work_dir / ("i2v_{:02d}.mp4".format(index + 1))
-            fal_image_to_video(frame, prompt, clip)
+            await fal_image_to_video_timed(frame, prompt, clip, timeout=FAL_WAIT_TIMEOUT)
             return clip
         except Exception as exc:
-            print("[안내] 스파크 클립 {} 실패: {}".format(index + 1, exc))
+            print("[안내] 스파크 클립 {} 실패/타임아웃: {}".format(index + 1, exc))
             return exc
 
     async def _gather():
-        tasks = [asyncio.to_thread(_one, index, src) for index, src in enumerate(sources)]
-        return await asyncio.gather(*tasks, return_exceptions=True)
+        tasks = [_one(index, src) for index, src in enumerate(sources)]
+        return await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=FAL_WAIT_TIMEOUT,
+        )
 
     try:
         results = asyncio.run(_gather())
+    except asyncio.TimeoutError:
+        print("[안내] 스파크 시네마 25초 대기열 초과 → 초고속 블러 전환")
+        return []
     except Exception as exc:
         print("[안내] 스파크 시네마 병렬 호출 실패: {}".format(exc))
         return []
@@ -2293,7 +2311,62 @@ def ensure_voice_track(settings, script, dest, voice_key, duration=18.0):
     return silent
 
 
+def fast_blur_slideshow(media_files, out_file, work_dir, voice_path=None, duration=None):
+    duration = float(duration or FAST_BLUR_SEC)
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    out_file = Path(out_file)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    src = Path(media_files[0]) if media_files else None
+    frame = work_dir / "fast_blur.jpg"
+    try:
+        if src is not None and src.suffix.lower() in IMAGE_EXTS:
+            diet_image_file(src, dest=frame)
+        elif src is not None:
+            still_from_media(src, frame, work_dir, TARGET_W, TARGET_H)
+        else:
+            raise RuntimeError("no media")
+    except Exception:
+        Image.new("RGB", (TARGET_W, TARGET_H), (18, 10, 28)).save(frame, "JPEG", quality=80)
+    args = [
+        "-loop",
+        "1",
+        "-framerate",
+        str(FPS),
+        "-t",
+        "{:.3f}".format(duration),
+        "-i",
+        str(frame),
+    ]
+    if voice_path and Path(voice_path).is_file():
+        args += ["-i", str(voice_path)]
+    else:
+        args += [
+            "-f",
+            "lavfi",
+            "-t",
+            "{:.3f}".format(duration),
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=44100",
+        ]
+    args += [
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-t",
+        "{:.3f}".format(duration),
+    ] + FFMPEG_ENCODE + [str(out_file)]
+    run_ffmpeg(args, timeout=5)
+    gc.collect()
+    return out_file
+
+
 def blur_fallback_render(media_files, script, voice_path, bgm_path, out_file, work_dir, font_path, speed, width, height):
+    try:
+        return fast_blur_slideshow(media_files, out_file, work_dir, voice_path=voice_path, duration=FAST_BLUR_SEC)
+    except Exception as exc:
+        print("[안내] 초고속 블러 엔진 1차 실패, 단일 패스 재시도: {}".format(exc))
     pieces = split_script_pieces(script) or [script]
     frames = prepare_captioned_frames(
         media_files, pieces, [], font_path, work_dir, width=width, height=height
@@ -2301,15 +2374,15 @@ def blur_fallback_render(media_files, script, voice_path, bgm_path, out_file, wo
     try:
         audio_duration = probe_duration(voice_path)
     except Exception:
-        audio_duration = 12.0
-    cues = split_script_cues(script, audio_duration)
+        audio_duration = FAST_BLUR_SEC
+    cues = split_script_cues(script, min(float(audio_duration), FAST_BLUR_SEC))
     durations = [max(0.2, float(end) - float(start)) for _text, start, end in cues]
     if len(durations) != len(frames):
         n = min(len(durations), len(frames)) or 1
         if not frames:
             raise RuntimeError("폴백 프레임이 없습니다.")
         frames = (frames * n)[:n]
-        durations = (durations or [audio_duration])[:n]
+        durations = (durations or [FAST_BLUR_SEC])[:n]
     ffmpeg_single_pass(
         frames,
         durations,
@@ -2339,6 +2412,7 @@ def run_pipeline(
     camera_motion="zoom_in",
     output_height=720,
     fast_mode=True,
+    deadline_ts=None,
 ):
     if check_license:
         ok, message = verify_saved_license()
@@ -2363,6 +2437,11 @@ def run_pipeline(
     voice_key, _voice_id, _preset = resolve_voice(voice_type)
     progress_lock = threading.Lock()
     used_fallback = False
+    if deadline_ts is None:
+        deadline_ts = time.time() + PIPELINE_HARD_LIMIT
+
+    def _left():
+        return float(deadline_ts) - time.time()
 
     work_dir = out_file.parent / ("_ffwork_{}".format(uuid.uuid4().hex[:8]))
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -2405,6 +2484,8 @@ def run_pipeline(
 
         _notify(progress_cb, 16, "대본 작성 중", progress_lock)
         try:
+            if _left() < 14:
+                raise RuntimeError("잔여시간 부족")
             script, photo_order = generate_script(
                 settings, media_files, style_prompt=style_prompt, direction=direction
             )
@@ -2423,7 +2504,7 @@ def run_pipeline(
             return path
 
         def _frame_job():
-            if spark:
+            if spark and _left() > 8:
                 try:
                     return generate_spark_cinema_clips(
                         media_files,
@@ -2438,6 +2519,9 @@ def run_pipeline(
                 except Exception as exc:
                     print("[안내] 스파크 시네마 실패, 블러 렌더로 전환: {}".format(exc))
                     return None
+            if spark:
+                print("[안내] 잔여시간 부족 · fal.ai 생략, 초고속 블러 전환")
+                return None
             _notify(progress_cb, 30, "EXIF 회전 보정 및 720x1280 리사이즈 병렬 처리 중", progress_lock)
             frames = prepare_captioned_frames(
                 media_files,
@@ -2455,77 +2539,85 @@ def run_pipeline(
         with ThreadPoolExecutor(max_workers=2) as pool:
             voice_fut = pool.submit(_voice_job)
             frame_fut = pool.submit(_frame_job)
-            voice_path = voice_fut.result()
-            generated = frame_fut.result()
+            try:
+                voice_path = voice_fut.result(timeout=max(4.0, min(18.0, _left() - 7)))
+            except Exception as exc:
+                print("[안내] 음성 대기 중단: {}".format(exc))
+                voice_path = ensure_voice_track(settings, script, voice_file, voice_key, duration=FAST_BLUR_SEC)
+            try:
+                generated = frame_fut.result(timeout=max(3.0, min(FAL_WAIT_TIMEOUT + 1, _left() - 6)))
+            except Exception as exc:
+                print("[안내] 영상 생성 대기 중단: {}".format(exc))
+                generated = None
 
-        audio_duration = probe_duration(voice_path)
-        if audio_duration < 1:
-            raise RuntimeError("생성된 음성이 너무 짧습니다. 대본/TTS를 확인하세요.")
-        cues = split_script_cues(script, audio_duration)
-        durations = [max(0.2, float(end) - float(start)) for _text, start, end in cues]
-        _notify(progress_cb, 68, "BGM 준비 중", progress_lock)
-        bgm_path = resolve_bgm(mood, audio_duration, work_dir / "bgm.wav")
-
-        spark_clips = generated if spark and generated else None
-        try:
-            if spark_clips:
-                if mood == "none":
-                    bgm_path = resolve_bgm("lofi", audio_duration, work_dir / "bgm.wav")
-                _notify(progress_cb, 78, "✨ 스파크 시네마 · 음성·BGM·자막 단일 패스 합성", progress_lock)
-                ffmpeg_spark_pass(
-                    spark_clips,
-                    durations,
-                    cues,
-                    font_path,
-                    direction,
-                    voice_path,
-                    bgm_path,
-                    out_file,
-                    work_dir,
-                    audio_duration,
-                    width=width,
-                    height=height,
-                )
-            else:
-                frames = generated
-                if not frames:
-                    raise RuntimeError("프레임 준비 실패")
-                if len(durations) != len(frames):
-                    n = min(len(durations), len(frames))
-                    frames = frames[:n]
-                    durations = durations[:n]
-                print("   음성 길이: {:.2f}초 / 배속 {}x / BGM {} / xfade {:.2f}".format(
-                    audio_duration, speed, mood, direction.xfade
-                ))
-                _notify(progress_cb, 76, "단일 패스 초고속 렌더링 중", progress_lock)
-                ffmpeg_single_pass(
-                    frames,
-                    durations,
-                    voice_path,
-                    bgm_path,
-                    out_file,
-                    speed=speed,
-                    work_dir=work_dir,
-                    xfade_sec=0.12 if fast_mode and not spark else direction.xfade,
-                    cues=cues,
-                    font_path=font_path,
-                )
-        except Exception as exc:
-            print("[안내] 렌더 실패, 초고속 블러 폴백: {}".format(exc))
+        if _left() < 7 or not generated:
+            _notify(progress_cb, 85, "초고속 3초 블러 슬라이드쇼 엔진", progress_lock)
+            fast_blur_slideshow(media_files, out_file, work_dir, voice_path=voice_path, duration=FAST_BLUR_SEC)
             used_fallback = True
-            _notify(progress_cb, 80, "외부 API 지연 · 초고속 블러 렌더링으로 전환", progress_lock)
-            blur_fallback_render(
-                media_files,
-                script,
-                voice_path,
-                bgm_path,
-                out_file,
-                work_dir,
-                font_path,
-                speed,
-                width,
-                height,
-            )
+        else:
+            try:
+                audio_duration = probe_duration(voice_path)
+            except Exception:
+                audio_duration = FAST_BLUR_SEC
+            if audio_duration < 1:
+                audio_duration = FAST_BLUR_SEC
+            cues = split_script_cues(script, audio_duration)
+            durations = [max(0.2, float(end) - float(start)) for _text, start, end in cues]
+            _notify(progress_cb, 68, "BGM 준비 중", progress_lock)
+            try:
+                bgm_path = resolve_bgm(mood, audio_duration, work_dir / "bgm.wav")
+            except Exception:
+                bgm_path = None
+
+            spark_clips = generated if spark and generated else None
+            try:
+                if spark_clips and _left() >= 8:
+                    if mood == "none":
+                        bgm_path = resolve_bgm("lofi", audio_duration, work_dir / "bgm.wav")
+                    _notify(progress_cb, 78, "✨ 스파크 시네마 · 음성·BGM·자막 단일 패스 합성", progress_lock)
+                    ffmpeg_spark_pass(
+                        spark_clips,
+                        durations,
+                        cues,
+                        font_path,
+                        direction,
+                        voice_path,
+                        bgm_path,
+                        out_file,
+                        work_dir,
+                        audio_duration,
+                        width=width,
+                        height=height,
+                    )
+                else:
+                    frames = generated
+                    if not frames or _left() < 8:
+                        raise RuntimeError("프레임 준비 실패 또는 시간 부족")
+                    if len(durations) != len(frames):
+                        n = min(len(durations), len(frames))
+                        frames = frames[:n]
+                        durations = durations[:n]
+                    print("   음성 길이: {:.2f}초 / 배속 {}x / BGM {} / xfade {:.2f}".format(
+                        audio_duration, speed, mood, direction.xfade
+                    ))
+                    _notify(progress_cb, 76, "단일 패스 초고속 렌더링 중", progress_lock)
+                    ffmpeg_single_pass(
+                        frames,
+                        durations,
+                        voice_path,
+                        bgm_path,
+                        out_file,
+                        speed=speed,
+                        work_dir=work_dir,
+                        xfade_sec=0.12 if fast_mode and not spark else direction.xfade,
+                        cues=cues,
+                        font_path=font_path,
+                    )
+            except Exception as exc:
+                print("[안내] 렌더 실패, 초고속 블러 폴백: {}".format(exc))
+                used_fallback = True
+                _notify(progress_cb, 80, "외부 API 지연 · 초고속 3초 블러 슬라이드쇼", progress_lock)
+                fast_blur_slideshow(media_files, out_file, work_dir, voice_path=voice_path, duration=FAST_BLUR_SEC)
 
         if not Path(out_file).is_file():
             raise RuntimeError("완성된 영상 파일을 찾지 못했습니다.")
@@ -2542,27 +2634,7 @@ def run_pipeline(
             script, _order = fallback_script(style_prompt)
             script = sanitize_narration(script)
         try:
-            if voice_path is None or not Path(str(voice_path)).is_file():
-                voice_path = ensure_voice_track(settings, script, voice_file, voice_key)
-            if bgm_path is None:
-                try:
-                    dur = probe_duration(voice_path)
-                except Exception:
-                    dur = 12.0
-                bgm_path = resolve_bgm(mood, dur, work_dir / "bgm.wav")
-            _notify(progress_cb, 82, "외부 API 오류 · 쾌속 블러 슬라이드쇼로 전환", progress_lock)
-            blur_fallback_render(
-                media_files,
-                script,
-                voice_path,
-                bgm_path,
-                out_file,
-                work_dir,
-                font_path,
-                speed,
-                width,
-                height,
-            )
+            fast_blur_slideshow(media_files, out_file, work_dir, voice_path=voice_path, duration=FAST_BLUR_SEC)
         except Exception as inner:
             print("[안내] 최종 폴백 실패: {}".format(inner))
             raise
