@@ -58,10 +58,10 @@ SFX_DIR = ROOT / "sfx"
 VOICE_PATH = OUTPUT_DIR / "voice.mp3"
 FINAL_PATH = OUTPUT_DIR / "final_shorts.mp4"
 
-TARGET_W = 1080
-TARGET_H = 1920
+TARGET_W = 720
+TARGET_H = 1280
 FPS = 24
-FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "180"))
+FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "60"))
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
@@ -101,9 +101,9 @@ VOICE_PRESETS = {
 }
 BGM_MOODS = ("upbeat", "emotional", "tense", "none")
 
-SUB_MAX_WIDTH = 960
-SUB_FONT_SIZE = 64
-SUB_STROKE = 8
+SUB_MAX_WIDTH = 640
+SUB_FONT_SIZE = 48
+SUB_STROKE = 6
 SUB_LINE_GAP = 10
 SUB_PAD_X = 28
 SUB_PAD_Y = 20
@@ -440,7 +440,7 @@ FFMPEG_PRESET = [
     "-preset",
     "ultrafast",
     "-crf",
-    "20",
+    "23",
     "-pix_fmt",
     "yuv420p",
 ]
@@ -1192,12 +1192,13 @@ def mix_soundtrack(voice, duration, cue_starts, scene_starts):
     return mixed
 
 
-def fit_cover_rgb(im, width, height):
+def fit_cover_rgb(im, width, height, fast=True):
     img = im.convert("RGB")
     scale = max(width / float(img.width), height / float(img.height))
     nw = max(width, int(round(img.width * scale)))
     nh = max(height, int(round(img.height * scale)))
-    resample = getattr(Image, "Resampling", Image).LANCZOS
+    resampling = getattr(Image, "Resampling", Image)
+    resample = resampling.BILINEAR if fast else resampling.LANCZOS
     img = img.resize((nw, nh), resample)
     left = max(0, (nw - width) // 2)
     top = max(0, (nh - height) // 2)
@@ -1210,7 +1211,7 @@ def still_from_media(path, dest_jpg, work_dir, width=None, height=None):
     suffix = Path(path).suffix.lower()
     if suffix in IMAGE_EXTS:
         with Image.open(path) as im:
-            fit_cover_rgb(im, width, height).save(dest_jpg, "JPEG", quality=90, optimize=True)
+            fit_cover_rgb(im, width, height).save(dest_jpg, "JPEG", quality=85)
         return dest_jpg
     tmp = work_dir / (dest_jpg.stem + "_grab.jpg")
     run_ffmpeg(
@@ -1218,7 +1219,7 @@ def still_from_media(path, dest_jpg, work_dir, width=None, height=None):
         timeout=20,
     )
     with Image.open(tmp) as im:
-        fit_cover_rgb(im, width, height).save(dest_jpg, "JPEG", quality=90, optimize=True)
+        fit_cover_rgb(im, width, height).save(dest_jpg, "JPEG", quality=85)
     return dest_jpg
 
 
@@ -1233,17 +1234,28 @@ def arrange_media_for_cues(media_files, cues, photo_order):
     return [cycle[i % len(cycle)] for i in range(len(cues))]
 
 
-def bake_caption_on_still(base_jpg, caption, font_path, dest_jpg):
-    canvas = Image.open(base_jpg).convert("RGBA")
+def compose_captioned_png(src, caption, font_path, dest_png, work_dir):
+    suffix = Path(src).suffix.lower()
+    if suffix in IMAGE_EXTS:
+        with Image.open(src) as im:
+            canvas = fit_cover_rgb(im, TARGET_W, TARGET_H).convert("RGBA")
+    else:
+        tmp = work_dir / (dest_png.stem + "_grab.jpg")
+        run_ffmpeg(
+            ["-ss", "0.12", "-i", str(src), "-frames:v", "1", "-q:v", "6", str(tmp)],
+            timeout=12,
+        )
+        with Image.open(tmp) as im:
+            canvas = fit_cover_rgb(im, TARGET_W, TARGET_H).convert("RGBA")
     text = sanitize_narration(caption)
     if text:
-        cap_path = dest_jpg.with_name(dest_jpg.stem + "_cap.png")
+        cap_path = dest_png.with_name(dest_png.stem + "_cap.png")
         render_subtitle_png(text, font_path, cap_path)
         overlay = Image.open(cap_path).convert("RGBA")
         x = max(0, (TARGET_W - overlay.width) // 2)
-        y = max(0, TARGET_H - overlay.height - 96)
+        y = max(0, TARGET_H - overlay.height - 64)
         canvas.paste(overlay, (x, y), overlay)
-    canvas.convert("RGB").save(dest_jpg, "JPEG", quality=90, optimize=True)
+    canvas.convert("RGB").save(dest_png, "PNG", compress_level=1)
 
 
 def prepare_captioned_frames(media_files, pieces, photo_order, font_path, work_dir):
@@ -1252,13 +1264,11 @@ def prepare_captioned_frames(media_files, pieces, photo_order, font_path, work_d
     frames = [None] * len(pieces)
 
     def _one(index):
-        still = work_dir / ("base_{:03d}.jpg".format(index))
-        framed = work_dir / ("frame_{:03d}.jpg".format(index))
-        still_from_media(assigned[index], still, work_dir, TARGET_W, TARGET_H)
-        bake_caption_on_still(still, pieces[index], font_path, framed)
+        framed = work_dir / ("frame_{:03d}.png".format(index))
+        compose_captioned_png(assigned[index], pieces[index], font_path, framed, work_dir)
         return index, framed
 
-    workers = min(4, max(1, len(pieces)))
+    workers = min(2, max(1, len(pieces)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(_one, i) for i in range(len(pieces))]
         for fut in as_completed(futures):
@@ -1267,88 +1277,104 @@ def prepare_captioned_frames(media_files, pieces, photo_order, font_path, work_d
     return frames
 
 
-def ffmpeg_single_pass(frames, durations, voice_path, bgm_path, out_file, speed=1.0):
+def _concat_file_line(path):
+    return "file '{}'".format(Path(path).resolve().as_posix().replace("'", r"'\''"))
+
+
+def write_concat_list(frames, durations, list_path, speed=1.0):
+    speed = max(0.5, float(speed))
+    lines = ["ffconcat version 1.0"]
+    last = frames[-1]
+    for png, dur in zip(frames, durations):
+        last = png
+        lines.append(_concat_file_line(png))
+        lines.append("duration {:.3f}".format(max(0.2, float(dur) / speed)))
+    lines.append(_concat_file_line(last))
+    list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return list_path
+
+
+def ffmpeg_single_pass(frames, durations, voice_path, bgm_path, out_file, speed=1.0, work_dir=None):
     speed = normalize_speed(speed)
     if not frames:
         raise RuntimeError("렌더할 프레임이 없습니다.")
-    args = []
-    for jpg, dur in zip(frames, durations):
-        args += [
+    work_dir = Path(work_dir or Path(frames[0]).parent)
+    concat_path = work_dir / "slides.txt"
+    write_concat_list(frames, durations, concat_path, speed=speed)
+    total = sum(max(0.2, float(dur) / max(0.5, speed)) for dur in durations)
+
+    voice_mp3 = work_dir / "voice.mp3"
+    if Path(voice_path).resolve() != voice_mp3.resolve():
+        shutil.copy2(str(voice_path), str(voice_mp3))
+    else:
+        voice_mp3 = Path(voice_path)
+
+    bgm_mp3 = None
+    if bgm_path:
+        bgm_mp3 = work_dir / "bgm.mp3"
+        src = Path(bgm_path)
+        if src.suffix.lower() == ".mp3" and src.resolve() != bgm_mp3.resolve():
+            shutil.copy2(str(src), str(bgm_mp3))
+        elif src.suffix.lower() == ".mp3":
+            bgm_mp3 = src
+        else:
+            bgm_mp3 = src
+
+    if len(frames) == 1:
+        args = [
             "-loop",
             "1",
             "-framerate",
             str(FPS),
             "-t",
-            "{:.3f}".format(max(0.2, float(dur))),
+            "{:.3f}".format(total),
             "-i",
-            str(jpg),
+            str(frames[0]),
+            "-i",
+            str(voice_mp3),
         ]
-    args += ["-i", str(voice_path)]
-    if bgm_path:
-        args += ["-i", str(bgm_path)]
-
-    n = len(frames)
-    voice_i = n
-    filters = []
-    labels = []
-    for i in range(n):
-        filters.append("[{}:v]format=yuv420p,setsar=1[v{}]".format(i, i))
-        labels.append("[v{}]".format(i))
-    if n == 1:
-        vcat = "[v0]"
     else:
-        filters.append("".join(labels) + "concat=n={}:v=1:a=0[vcat]".format(n))
-        vcat = "[vcat]"
+        args = ["-f", "concat", "-safe", "0", "-i", str(concat_path), "-i", str(voice_mp3)]
+    audio_map = ["-map", "0:v:0", "-map", "1:a:0"]
+    extra = []
+    if bgm_mp3 is not None:
+        args += ["-i", str(bgm_mp3)]
+        af = "[1:a]volume=1.05[va];[2:a]volume=0.16[ba];[va][ba]amix=inputs=2:duration=first:dropout_transition=0[a]"
+        if abs(speed - 1.0) > 0.001:
+            af = (
+                "[1:a]volume=1.05,{tempo}[va];[2:a]volume=0.16,{tempo}[ba];"
+                "[va][ba]amix=inputs=2:duration=first:dropout_transition=0[a]"
+            ).format(tempo=atempo_chain(speed))
+        extra = ["-filter_complex", af]
+        audio_map = ["-map", "0:v:0", "-map", "[a]"]
+    elif abs(speed - 1.0) > 0.001:
+        extra = ["-af", atempo_chain(speed)]
 
-    if abs(speed - 1.0) > 0.001:
-        filters.append("{}setpts=PTS/{:.4f}[v]".format(vcat, speed))
-        audio_fx = atempo_chain(speed)
-    else:
-        filters.append("{}format=yuv420p[v]".format(vcat))
-        audio_fx = "anull"
-
-    filters.append("[{}:a]aformat=sample_fmts=fltp:channel_layouts=stereo,volume=1.05,{}[va]".format(voice_i, audio_fx))
-    if bgm_path:
-        bgm_i = voice_i + 1
-        filters.append(
-            "[{}:a]aformat=sample_fmts=fltp:channel_layouts=stereo,volume=0.16,{}[ba]".format(
-                bgm_i, audio_fx
-            )
-        )
-        filters.append("[va][ba]amix=inputs=2:duration=first:dropout_transition=2[a]")
-        a_map = "[a]"
-    else:
-        a_map = "[va]"
-
+    args += extra
+    args += audio_map
     args += [
-        "-filter_complex",
-        ";".join(filters),
-        "-map",
-        "[v]",
-        "-map",
-        a_map,
         "-r",
         str(FPS),
         "-c:v",
         "libx264",
         "-preset",
         "ultrafast",
-        "-crf",
-        "20",
         "-tune",
         "stillimage",
+        "-crf",
+        "23",
         "-pix_fmt",
         "yuv420p",
         "-c:a",
         "aac",
         "-b:a",
-        "192k",
+        "128k",
         "-shortest",
         "-movflags",
         "+faststart",
         str(out_file),
     ]
-    run_ffmpeg(args, timeout=FFMPEG_TIMEOUT)
+    run_ffmpeg(args, timeout=min(60, FFMPEG_TIMEOUT))
 
 
 def resolve_bgm(mood, duration, dest):
@@ -1464,6 +1490,7 @@ def run_pipeline(
             bgm_path,
             out_file,
             speed=speed,
+            work_dir=work_dir,
         )
         _notify(progress_cb, 96, "출력 파일 정리 중", progress_lock)
     finally:

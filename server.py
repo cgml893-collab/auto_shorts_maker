@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List
 
-os.environ.setdefault("FFMPEG_TIMEOUT", "180")
+os.environ.setdefault("FFMPEG_TIMEOUT", "60")
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
