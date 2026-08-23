@@ -590,12 +590,15 @@ def download_job(job_id: str):
     out_file = Path(job["output"])
     if not out_file.is_file():
         raise HTTPException(status_code=404, detail="완성된 영상 파일을 찾지 못했습니다.")
-    return FileResponse(
-        path=str(out_file),
-        media_type="video/mp4",
-        filename="final_shorts.mp4",
-        background=BackgroundTask(_cleanup_after_download, str(out_file.parent)),
-    )
+    # 👇 593번째 줄 수정 내용
+        return FileResponse(
+            path=str(out_file),
+            media_type="video/mp4",
+            filename="final_shorts.mp4",
+            headers={"Accept-Ranges": "bytes"},
+            background=BackgroundTask(_cleanup_job, job_id)
+        )
+
 
 
 if __name__ == "__main__":
