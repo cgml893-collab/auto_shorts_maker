@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 import shutil
 import threading
@@ -22,6 +23,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from license_lock import mobile_hwid, verify_or_activate_mobile
 from main import (
@@ -49,7 +51,7 @@ WORKER = ThreadPoolExecutor(max_workers=1)
 app = FastAPI(
     title="AI 숏폼 모바일 서버",
     description="저메모리 SRT 하드서브 + fal Image-to-Video (512MB)",
-    version="3.2.0",
+    version="3.2.1",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -81,6 +83,51 @@ def _job_snapshot(job_id):
         if not job:
             return None
         return dict(job)
+
+
+def _release_memory():
+    gc.collect()
+    gc.collect()
+
+
+def _purge_path(path):
+    target = Path(path)
+    try:
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        elif target.is_file() or target.is_symlink():
+            target.unlink()
+    except OSError:
+        pass
+
+
+def _purge_job_temps(job_dir, keep_file=None):
+    job_dir = Path(job_dir)
+    if not job_dir.exists():
+        return
+    keep = None
+    if keep_file:
+        try:
+            keep = Path(keep_file).resolve()
+        except OSError:
+            keep = None
+    for child in list(job_dir.iterdir()):
+        try:
+            if keep is not None and child.resolve() == keep:
+                continue
+        except OSError:
+            pass
+        _purge_path(child)
+
+
+def _finish_job_cleanup(job_dir, keep_file=None):
+    _purge_job_temps(job_dir, keep_file=keep_file)
+    _release_memory()
+
+
+def _cleanup_after_download(job_dir):
+    _purge_path(job_dir)
+    _release_memory()
 
 
 def _update_job(job_id, **fields):
@@ -144,6 +191,16 @@ def _run_job(
             error=str(exc),
             elapsed_sec=round(time.time() - started, 1),
         )
+    finally:
+        job_dir = Path(out_file).parent
+        keep = out_file if Path(out_file).is_file() else None
+        if isinstance(media_files, list):
+            media_files.clear()
+        if keep is None:
+            _purge_path(job_dir)
+            _release_memory()
+        else:
+            _finish_job_cleanup(job_dir, keep_file=keep)
 
 
 @app.get("/")
@@ -225,6 +282,8 @@ async def analyze_media(
         raise HTTPException(status_code=500, detail="미디어 분석 실패: {}".format(exc))
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        saved.clear()
+        _release_memory()
 
 
 @app.post("/create-video")
@@ -351,6 +410,7 @@ def download_job(job_id: str):
         path=str(out_file),
         media_type="video/mp4",
         filename="final_shorts.mp4",
+        background=BackgroundTask(_cleanup_after_download, str(out_file.parent)),
     )
 
 
