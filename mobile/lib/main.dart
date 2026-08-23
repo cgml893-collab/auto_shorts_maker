@@ -341,7 +341,7 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
       final auth = await _apiAuth();
       http.Response? res;
       Object? last;
-      for (var i = 0; i < 5; i++) {
+      for (var i = 0; i < 10; i++) {
         try {
           final req = http.MultipartRequest('POST', Uri.parse('${auth['url']}/analyze-media'));
           req.fields['license_key'] = auth['license_key']!;
@@ -358,14 +358,19 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
             last = null;
             break;
           }
-          if (res.statusCode >= 400 && res.statusCode < 500 && res.statusCode != 429) {
+          if (res.statusCode == 502 || res.statusCode == 503 || res.statusCode == 429 || res.statusCode >= 500) {
+            last = Exception(_apiError(res));
+            await Future.delayed(const Duration(seconds: 3));
+            continue;
+          }
+          if (res.statusCode >= 400 && res.statusCode < 500) {
             throw Exception(_apiError(res));
           }
           last = Exception(_apiError(res));
         } catch (e) {
           last = e;
         }
-        await Future.delayed(Duration(milliseconds: 400 * (i + 1)));
+        await Future.delayed(const Duration(seconds: 3));
       }
       if (res == null || res.statusCode != 200) {
         throw last ?? Exception('스타일 추천에 실패했습니다.');
@@ -401,19 +406,41 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
 
   Future<http.Response> _retryGet(Uri uri, {Duration timeout = const Duration(seconds: 25)}) async {
     Object? last;
-    for (var i = 0; i < 5; i++) {
+    for (var i = 0; i < 10; i++) {
       try {
         final res = await http.get(uri).timeout(timeout);
-        if (res.statusCode >= 400 && res.statusCode < 500 && res.statusCode != 429) {
+        if (res.statusCode == 502 || res.statusCode == 503 || res.statusCode == 429) {
+          last = Exception(_apiError(res));
+          if (mounted) {
+            setState(() {
+              _busyText = '서버 재시도 중... (${i + 1}/10)';
+            });
+          }
+          await Future.delayed(const Duration(seconds: 3));
+          continue;
+        }
+        if (res.statusCode >= 400 && res.statusCode < 500) {
           return res;
         }
-        if (res.statusCode >= 500 || res.statusCode == 429) {
-          throw Exception(_apiError(res));
+        if (res.statusCode >= 500) {
+          last = Exception(_apiError(res));
+          if (mounted) {
+            setState(() {
+              _busyText = '서버 재시도 중... (${i + 1}/10)';
+            });
+          }
+          await Future.delayed(const Duration(seconds: 3));
+          continue;
         }
         return res;
       } catch (e) {
         last = e;
-        await Future.delayed(Duration(milliseconds: 500 * (i + 1)));
+        if (mounted) {
+          setState(() {
+            _busyText = '네트워크 재시도 중... (${i + 1}/10)';
+          });
+        }
+        await Future.delayed(const Duration(seconds: 3));
       }
     }
     throw last ?? Exception('네트워크 오류');
@@ -630,7 +657,7 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
     try {
       http.Response created = http.Response('', 500);
       Object? uploadErr;
-      for (var i = 0; i < 5; i++) {
+      for (var i = 0; i < 10; i++) {
         try {
           final req = http.MultipartRequest('POST', Uri.parse('$url/create-video'));
           req.fields['style'] = _styleCtrl.text.trim();
@@ -654,8 +681,11 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
               ),
             );
           }
-          final streamed = await req.send().timeout(const Duration(seconds: 60));
-          created = await http.Response.fromStream(streamed).timeout(const Duration(seconds: 60));
+          if (mounted) {
+            setState(() => _busyText = i == 0 ? '업로드 중...' : '서버 재시도 중... (${i + 1}/10)');
+          }
+          final streamed = await req.send().timeout(const Duration(seconds: 90));
+          created = await http.Response.fromStream(streamed).timeout(const Duration(seconds: 90));
           if (created.statusCode == 200) {
             uploadErr = null;
             break;
@@ -663,7 +693,12 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
           if (_isPayment(created)) {
             throw _PaymentException(_apiError(created));
           }
-          if (created.statusCode >= 400 && created.statusCode < 500 && created.statusCode != 429) {
+          if (created.statusCode == 502 || created.statusCode == 503 || created.statusCode == 429 || created.statusCode >= 500) {
+            uploadErr = Exception(_apiError(created));
+            await Future.delayed(const Duration(seconds: 3));
+            continue;
+          }
+          if (created.statusCode >= 400 && created.statusCode < 500) {
             throw Exception(_apiError(created));
           }
           uploadErr = Exception(_apiError(created));
@@ -672,8 +707,8 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
           if (e is _PaymentException) {
             break;
           }
+          await Future.delayed(const Duration(seconds: 3));
         }
-        await Future.delayed(Duration(milliseconds: 500 * (i + 1)));
       }
       if (uploadErr is _PaymentException) {
         if (mounted) {

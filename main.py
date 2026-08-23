@@ -287,6 +287,12 @@ def _load_font(font_path, size):
         return ImageFont.truetype(font_path, size, index=0)
 
 
+Image.MAX_IMAGE_PIXELS = 25_000_000
+DIET_MAX_W = 720
+DIET_MAX_H = 1280
+DIET_MAX_BYTES = 500 * 1024
+
+
 def open_image_upright(path):
     img = Image.open(path)
     try:
@@ -299,6 +305,58 @@ def open_image_upright(path):
     except Exception:
         pass
     return img
+
+
+def diet_image_file(path, dest=None, max_w=None, max_h=None, max_bytes=None, quality=85):
+    path = Path(path)
+    if path.suffix.lower() not in IMAGE_EXTS:
+        return path
+    dest = Path(dest) if dest else path.with_name(path.stem + "_diet.jpg")
+    max_w = int(max_w or DIET_MAX_W)
+    max_h = int(max_h or DIET_MAX_H)
+    max_bytes = int(max_bytes or DIET_MAX_BYTES)
+    resampling = getattr(Image, "Resampling", Image)
+    try:
+        with Image.open(path) as raw:
+            try:
+                raw.draft("RGB", (max_w, max_h))
+            except Exception:
+                pass
+            try:
+                fixed = ImageOps.exif_transpose(raw)
+                img = fixed if fixed is not None else raw
+            except Exception:
+                img = raw
+            rgb = img.convert("RGB")
+        rgb.thumbnail((max_w, max_h), resampling.BILINEAR)
+        payload = None
+        q = int(quality)
+        while q >= 40:
+            buf = io.BytesIO()
+            rgb.save(buf, format="JPEG", quality=q, optimize=True)
+            payload = buf.getvalue()
+            if len(payload) <= max_bytes:
+                break
+            q -= 10
+            nw = max(2, int(rgb.width * 0.82))
+            nh = max(2, int(rgb.height * 0.82))
+            rgb = rgb.resize((nw, nh), resampling.BILINEAR)
+        rgb.close()
+        if not payload:
+            return path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(payload)
+        if dest.resolve() != path.resolve():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        gc.collect()
+        return dest
+    except Exception as exc:
+        print("[안내] 이미지 초경량 압축 실패, 원본 유지: {}".format(exc))
+        gc.collect()
+        return path
 
 
 def _pil_to_jpeg_b64(image, max_side=1024):
@@ -1686,6 +1744,7 @@ def still_from_media(path, dest_jpg, work_dir, width=None, height=None):
     if suffix in IMAGE_EXTS:
         with open_image_upright(path) as im:
             fit_contain_on_blur(im, width, height).save(dest_jpg, "JPEG", quality=85)
+        diet_image_file(dest_jpg, dest=dest_jpg)
         return dest_jpg
     tmp = work_dir / (dest_jpg.stem + "_grab.jpg")
     run_ffmpeg(
@@ -1938,29 +1997,37 @@ def _fal_video_url(result):
 
 def fal_image_to_video(image_path, prompt, dest_mp4):
     try:
-        import fal_client
-    except ImportError:
-        raise RuntimeError("fal-client가 없습니다. pip install fal-client 후 다시 시도해 주세요.")
-    image_url = fal_client.upload_file(str(image_path))
-    arguments = {"prompt": prompt, "image_url": image_url, "prompt_optimizer": True}
-    last_error = None
-    for model in (FAL_I2V_PRIMARY, FAL_I2V_FALLBACK):
         try:
-            print("   fal I2V: {} ← {}".format(model, Path(image_path).name))
-            payload = dict(arguments)
-            if "kling" in model:
-                payload["duration"] = "5"
-            result = fal_client.subscribe(model, arguments=payload, with_logs=False)
-            url = _fal_video_url(result)
-            if not url:
-                raise RuntimeError("fal 응답에 video url이 없습니다: {}".format(str(result)[:400]))
-            download_http_file(url, dest_mp4)
-            if Path(dest_mp4).is_file() and Path(dest_mp4).stat().st_size > 1000:
-                return Path(dest_mp4)
-        except Exception as exc:
-            last_error = exc
-            print("[안내] {} 실패: {}".format(model, exc))
-    raise RuntimeError("Image-to-Video 생성 실패: {}".format(last_error))
+            import fal_client
+        except ImportError:
+            raise RuntimeError("fal-client가 없습니다. pip install fal-client 후 다시 시도해 주세요.")
+        try:
+            slim = diet_image_file(image_path, dest=Path(image_path).with_name(Path(image_path).stem + "_fal.jpg"))
+        except Exception:
+            slim = image_path
+        image_url = fal_client.upload_file(str(slim))
+        arguments = {"prompt": prompt, "image_url": image_url, "prompt_optimizer": True}
+        last_error = None
+        for model in (FAL_I2V_PRIMARY, FAL_I2V_FALLBACK):
+            try:
+                print("   fal I2V: {} ← {}".format(model, Path(slim).name))
+                payload = dict(arguments)
+                if "kling" in model:
+                    payload["duration"] = "5"
+                result = fal_client.subscribe(model, arguments=payload, with_logs=False)
+                url = _fal_video_url(result)
+                if not url:
+                    raise RuntimeError("fal 응답에 video url이 없습니다: {}".format(str(result)[:400]))
+                download_http_file(url, dest_mp4)
+                if Path(dest_mp4).is_file() and Path(dest_mp4).stat().st_size > 1000:
+                    return Path(dest_mp4)
+            except Exception as exc:
+                last_error = exc
+                print("[안내] {} 실패: {}".format(model, exc))
+        raise RuntimeError("Image-to-Video 생성 실패: {}".format(last_error))
+    except Exception as exc:
+        print("[안내] fal.ai 전체 실패(프로세스 유지): {}".format(exc))
+        raise RuntimeError("✨ 스파크 시네마 AI 호출 실패: {}".format(exc))
 
 
 def generate_spark_cinema_clips(
@@ -1983,17 +2050,26 @@ def generate_spark_cinema_clips(
     _notify(progress_cb, 34, "✨ 스파크 시네마 AI 병렬 생성 중 ({}장)".format(total), lock)
 
     def _one(index, src):
-        frame = work_dir / ("i2v_src_{:02d}.jpg".format(index + 1))
-        still_from_media(src, frame, work_dir, width, height)
-        clip = work_dir / ("i2v_{:02d}.mp4".format(index + 1))
-        fal_image_to_video(frame, prompt, clip)
-        return clip
+        try:
+            frame = work_dir / ("i2v_src_{:02d}.jpg".format(index + 1))
+            still_from_media(src, frame, work_dir, width, height)
+            diet_image_file(frame, dest=frame)
+            clip = work_dir / ("i2v_{:02d}.mp4".format(index + 1))
+            fal_image_to_video(frame, prompt, clip)
+            return clip
+        except Exception as exc:
+            print("[안내] 스파크 클립 {} 실패: {}".format(index + 1, exc))
+            return exc
 
     async def _gather():
         tasks = [asyncio.to_thread(_one, index, src) for index, src in enumerate(sources)]
         return await asyncio.gather(*tasks, return_exceptions=True)
 
-    results = asyncio.run(_gather())
+    try:
+        results = asyncio.run(_gather())
+    except Exception as exc:
+        print("[안내] 스파크 시네마 병렬 호출 실패: {}".format(exc))
+        return []
     clips = []
     errors = []
     for item in results:
@@ -2003,7 +2079,8 @@ def generate_spark_cinema_clips(
         elif item:
             clips.append(item)
     if not clips:
-        raise RuntimeError("✨ 스파크 시네마 AI 비디오를 만들지 못했습니다: {}".format(errors[:2]))
+        print("[안내] 스파크 시네마 클립 없음 → 쾌속 블러 폴백")
+        return []
     _notify(progress_cb, 62, "✨ 스파크 시네마 AI 클립 {}개 준비 완료".format(len(clips)), lock)
     return clips
 
@@ -2291,6 +2368,12 @@ def run_pipeline(
     work_dir.mkdir(parents=True, exist_ok=True)
     voice_file = out_file.parent / "voice.mp3"
 
+    script = ""
+    photo_order = []
+    voice_path = None
+    bgm_path = None
+    direction = default_style_direction(style_prompt)
+
     try:
         _notify(
             progress_cb,
@@ -2298,8 +2381,16 @@ def run_pipeline(
             "미디어 {}개 준비: {}".format(len(media_files), ", ".join(p.name for p in media_files)),
             progress_lock,
         )
-        _notify(progress_cb, 8, "긴 영상 하이라이트 추출 중", progress_lock)
-        media_files = [smart_prepare_media(path, work_dir) for path in media_files]
+        _notify(progress_cb, 8, "사진 초경량 압축 및 하이라이트 추출", progress_lock)
+        slim = []
+        for path in media_files:
+            prepared = smart_prepare_media(path, work_dir)
+            if Path(prepared).suffix.lower() in IMAGE_EXTS:
+                slim.append(diet_image_file(prepared))
+            else:
+                slim.append(prepared)
+        media_files = slim
+        gc.collect()
 
         if spark or not fast_mode:
             _notify(progress_cb, 12, "스타일 연출 해석 중", progress_lock)
@@ -2444,6 +2535,39 @@ def run_pipeline(
             "출력 정리 및 메모리 회수 중" + (" (안전장치 적용)" if used_fallback else ""),
             progress_lock,
         )
+    except Exception as exc:
+        print("[안내] 파이프라인 예외, 최종 블러 폴백(프로세스 유지): {}".format(exc))
+        used_fallback = True
+        if not script:
+            script, _order = fallback_script(style_prompt)
+            script = sanitize_narration(script)
+        try:
+            if voice_path is None or not Path(str(voice_path)).is_file():
+                voice_path = ensure_voice_track(settings, script, voice_file, voice_key)
+            if bgm_path is None:
+                try:
+                    dur = probe_duration(voice_path)
+                except Exception:
+                    dur = 12.0
+                bgm_path = resolve_bgm(mood, dur, work_dir / "bgm.wav")
+            _notify(progress_cb, 82, "외부 API 오류 · 쾌속 블러 슬라이드쇼로 전환", progress_lock)
+            blur_fallback_render(
+                media_files,
+                script,
+                voice_path,
+                bgm_path,
+                out_file,
+                work_dir,
+                font_path,
+                speed,
+                width,
+                height,
+            )
+        except Exception as inner:
+            print("[안내] 최종 폴백 실패: {}".format(inner))
+            raise
+        if not Path(out_file).is_file():
+            raise RuntimeError("완성된 영상 파일을 찾지 못했습니다.")
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
         cleanup_temp_files()

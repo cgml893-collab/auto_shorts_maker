@@ -44,6 +44,7 @@ from main import (
     OUTPUT_DIR,
     VIDEO_EXTS,
     analyze_media_styles,
+    diet_image_file,
     load_settings,
     normalize_bgm_mood,
     normalize_camera_motion,
@@ -56,6 +57,9 @@ from main import (
 load_dotenv()
 
 JOBS_DIR = OUTPUT_DIR / "mobile_jobs"
+UPLOAD_CHUNK = 256 * 1024
+MAX_UPLOAD_FILES = 8
+MAX_SINGLE_UPLOAD = 80 * 1024 * 1024
 ALLOWED_EXTS = IMAGE_EXTS | VIDEO_EXTS
 JOBS: Dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
@@ -101,6 +105,31 @@ def _safe_name(name):
     if suffix not in ALLOWED_EXTS:
         return None
     return stem + suffix
+
+
+async def _persist_upload(item, dest):
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    size = 0
+    with dest.open("wb") as handle:
+        while True:
+            chunk = await item.read(UPLOAD_CHUNK)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_SINGLE_UPLOAD:
+                raise HTTPException(status_code=413, detail="파일이 너무 큽니다. 사진을 줄여 다시 올려 주세요.")
+            handle.write(chunk)
+            del chunk
+    await item.close()
+    if size <= 0:
+        raise HTTPException(status_code=400, detail="빈 파일입니다: {}".format(item.filename))
+    suffix = dest.suffix.lower()
+    if suffix in IMAGE_EXTS:
+        slim = dest.with_suffix(".jpg")
+        dest = diet_image_file(dest, dest=slim)
+    _release_memory()
+    return dest
 
 
 def _job_snapshot(job_id):
@@ -219,21 +248,41 @@ def _run_job(
 
     try:
         _update_job(job_id, stage="대본 작성 중", percent=8, progress=8, elapsed_sec=0)
-        run_pipeline(
-            media_files,
-            style_prompt=prompt,
-            progress_cb=progress,
-            output_path=out_file,
-            check_license=False,
-            voice_type=voice_type,
-            speed_multiplier=speed_multiplier,
-            bgm_mood=bgm_mood,
-            is_runway_mode=spark_cinema,
-            is_spark_cinema=spark_cinema,
-            camera_motion=camera_motion,
-            output_height=output_height,
-            fast_mode=not spark_cinema,
-        )
+        try:
+            run_pipeline(
+                media_files,
+                style_prompt=prompt,
+                progress_cb=progress,
+                output_path=out_file,
+                check_license=False,
+                voice_type=voice_type,
+                speed_multiplier=speed_multiplier,
+                bgm_mood=bgm_mood,
+                is_runway_mode=spark_cinema,
+                is_spark_cinema=spark_cinema,
+                camera_motion=camera_motion,
+                output_height=output_height,
+                fast_mode=not spark_cinema,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            progress(80, "외부 API 오류 · 쾌속 블러 슬라이드쇼로 전환")
+            run_pipeline(
+                media_files,
+                style_prompt=prompt,
+                progress_cb=progress,
+                output_path=out_file,
+                check_license=False,
+                voice_type=voice_type,
+                speed_multiplier=speed_multiplier,
+                bgm_mood=bgm_mood,
+                is_runway_mode=False,
+                is_spark_cinema=False,
+                camera_motion=camera_motion,
+                output_height=720,
+                fast_mode=True,
+            )
+            print("[안내] 서버 안전장치 폴백 완료: {}".format(exc))
         if not Path(out_file).is_file():
             raise RuntimeError("완성된 영상 파일을 찾지 못했습니다.")
         consume_entitlement(features)
@@ -349,12 +398,8 @@ async def analyze_media(
             if not filename:
                 continue
             dest = tmp_dir / "{:03d}_{}".format(index + 1, filename)
-            data = await item.read()
-            if not data:
-                continue
-            dest.write_bytes(data)
+            dest = await _persist_upload(item, dest)
             saved.append(dest)
-            await item.close()
         if not saved:
             raise HTTPException(status_code=400, detail="지원하는 미디어가 없습니다.")
         result = analyze_media_styles(load_settings(), saved)
@@ -429,7 +474,7 @@ async def create_video(
 
     saved = []
     try:
-        for index, item in enumerate(files):
+        for index, item in enumerate(files[:MAX_UPLOAD_FILES]):
             filename = _safe_name(item.filename)
             if not filename:
                 raise HTTPException(
@@ -437,12 +482,9 @@ async def create_video(
                     detail="지원하지 않는 파일입니다: {}".format(item.filename),
                 )
             dest = media_dir / "{:03d}_{}".format(index + 1, filename)
-            data = await item.read()
-            if not data:
-                raise HTTPException(status_code=400, detail="빈 파일입니다: {}".format(item.filename))
-            dest.write_bytes(data)
+            dest = await _persist_upload(item, dest)
             saved.append(dest)
-            await item.close()
+            _release_memory()
     except HTTPException:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
