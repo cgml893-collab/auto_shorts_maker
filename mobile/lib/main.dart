@@ -317,6 +317,8 @@ class _StudioScreenState extends State<StudioScreen> {
   String _bgmMood = 'pop';
   List<Map<String, String>> _aiStyles = [];
   bool _analyzing = false;
+  bool _runwayMode = false;
+  String _cameraMotion = 'zoom_in';
   File? _resultVideo;
   VideoPlayerController? _player;
 
@@ -444,6 +446,9 @@ class _StudioScreenState extends State<StudioScreen> {
   }
 
   String _stageLabel(String stage) {
+    if (stage.contains('런웨이')) {
+      return stage;
+    }
     if (stage.contains('대본')) {
       return '대본 생성 중';
     }
@@ -498,6 +503,8 @@ class _StudioScreenState extends State<StudioScreen> {
           req.fields['speed_multiplier'] = _speed;
           req.fields['bgm_type'] = _bgmMood;
           req.fields['bgm_mood'] = _bgmMood;
+          req.fields['is_runway_mode'] = _runwayMode ? 'true' : 'false';
+          req.fields['camera_motion'] = _cameraMotion;
           for (final file in _media) {
             req.files.add(
               await http.MultipartFile.fromPath(
@@ -652,6 +659,39 @@ class _StudioScreenState extends State<StudioScreen> {
                     title: 'AI 숏폼 & 릴스\n원클릭 자동 제작기',
                     subtitle: '사진과 영상을 올리면 대본·보이스·자막까지 세로 숏폼으로 만들어 줍니다.',
                   ),
+                  const SizedBox(height: 18),
+                  const _Label('제작 모드'),
+                  SegmentedButton<bool>(
+                    segments: const [
+                      ButtonSegment(value: false, label: Text('⚡ 10초 초고속'), icon: Icon(Icons.bolt)),
+                      ButtonSegment(value: true, label: Text('🎬 런웨이 AI'), icon: Icon(Icons.movie_filter_outlined)),
+                    ],
+                    selected: {_runwayMode},
+                    onSelectionChanged: _busy
+                        ? null
+                        : (set) => setState(() => _runwayMode = set.first),
+                    style: ButtonStyle(
+                      backgroundColor: WidgetStateProperty.resolveWith((states) {
+                        if (states.contains(WidgetState.selected)) {
+                          return const Color(0xFFFF4D8D);
+                        }
+                        return const Color(0x331A1028);
+                      }),
+                    ),
+                  ),
+                  if (_runwayMode) ...[
+                    const SizedBox(height: 12),
+                    const _Label('카메라 모션'),
+                    _OptionWrap(
+                      options: const [
+                        _Option('zoom_in', '줌인'),
+                        _Option('drone', '드론 샷'),
+                        _Option('pan', '패닝'),
+                      ],
+                      value: _cameraMotion,
+                      onChanged: (v) => setState(() => _cameraMotion = v),
+                    ),
+                  ],
                   const SizedBox(height: 20),
                   const _Label('1. 갤러리에서 사진 / 동영상 선택'),
                   OutlinedButton.icon(

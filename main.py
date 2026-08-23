@@ -65,7 +65,15 @@ FPS = 24
 XFADE_SEC = 0.4
 BLUR_RADIUS = 26
 BLUR_DIM = 0.38
-FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "60"))
+FAL_I2V_PRIMARY = os.getenv("FAL_I2V_MODEL", "fal-ai/minimax/video-01/image-to-video")
+FAL_I2V_FALLBACK = "fal-ai/kling-video/v1/standard/image-to-video"
+RUNWAY_CLIP_SEC = 5.0
+RUNWAY_MAX_CLIPS = 3
+CAMERA_MOTIONS = {
+    "zoom_in": "[Zoom in] Cinematic slow push-in, natural subtle motion, keep the subject centered, photorealistic.",
+    "drone": "[Pedestal up, Tracking shot] Smooth drone-style rise and gentle forward glide over the scene.",
+    "pan": "[Pan left] Smooth cinematic pan across the scene with natural parallax.",
+}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
@@ -355,6 +363,26 @@ def resolve_voice(voice_type):
     env_name = "ELEVENLABS_VOICE_" + key.upper()
     voice_id = (os.getenv(env_name) or preset["id"] or DEFAULT_VOICE_ID).strip()
     return key, voice_id, preset
+
+
+def parse_flag(value):
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def normalize_camera_motion(value):
+    key = (value or "zoom_in").strip().lower()
+    aliases = {
+        "zoom_in": "zoom_in",
+        "zoom": "zoom_in",
+        "줌인": "zoom_in",
+        "drone": "drone",
+        "drone_shot": "drone",
+        "드론": "drone",
+        "pan": "pan",
+        "panning": "pan",
+        "패닝": "pan",
+    }
+    return aliases.get(key, "zoom_in")
 
 
 def normalize_speed(value):
@@ -1759,6 +1787,235 @@ def _notify(progress_cb, percent, message, lock=None):
         progress_cb(percent, message)
 
 
+def download_http_file(url, dest, timeout=180):
+    response = requests.get(url, timeout=timeout)
+    if response.status_code >= 400:
+        raise RuntimeError("파일 다운로드 실패 ({}): {}".format(response.status_code, url[:120]))
+    Path(dest).write_bytes(response.content)
+    return Path(dest)
+
+
+def _fal_video_url(result):
+    if not isinstance(result, dict):
+        return None
+    video = result.get("video")
+    if isinstance(video, dict):
+        return video.get("url")
+    if isinstance(video, str) and video.startswith("http"):
+        return video
+    for key in ("url", "video_url"):
+        value = result.get(key)
+        if isinstance(value, str) and value.startswith("http"):
+            return value
+    return None
+
+
+def fal_image_to_video(image_path, prompt, dest_mp4):
+    try:
+        import fal_client
+    except ImportError:
+        raise RuntimeError("fal-client가 없습니다. pip install fal-client 후 다시 시도해 주세요.")
+    image_url = fal_client.upload_file(str(image_path))
+    arguments = {"prompt": prompt, "image_url": image_url, "prompt_optimizer": True}
+    last_error = None
+    for model in (FAL_I2V_PRIMARY, FAL_I2V_FALLBACK):
+        try:
+            print("   fal I2V: {} ← {}".format(model, Path(image_path).name))
+            payload = dict(arguments)
+            if "kling" in model:
+                payload["duration"] = "5"
+            result = fal_client.subscribe(model, arguments=payload, with_logs=False)
+            url = _fal_video_url(result)
+            if not url:
+                raise RuntimeError("fal 응답에 video url이 없습니다: {}".format(str(result)[:400]))
+            download_http_file(url, dest_mp4)
+            if Path(dest_mp4).is_file() and Path(dest_mp4).stat().st_size > 1000:
+                return Path(dest_mp4)
+        except Exception as exc:
+            last_error = exc
+            print("[안내] {} 실패: {}".format(model, exc))
+    raise RuntimeError("Image-to-Video 생성 실패: {}".format(last_error))
+
+
+def generate_runway_clips(media_files, style_prompt, camera_motion, work_dir, progress_cb=None, lock=None):
+    motion = normalize_camera_motion(camera_motion)
+    motion_prompt = CAMERA_MOTIONS[motion]
+    prompt = "{} {}".format((style_prompt or "cinematic vertical short").strip(), motion_prompt)
+    sources = list(media_files)[:RUNWAY_MAX_CLIPS]
+    clips = []
+    total = max(1, len(sources))
+    for index, src in enumerate(sources):
+        _notify(
+            progress_cb,
+            34 + int(28 * index / total),
+            "런웨이 AI 비디오 생성 중 ({}/{})...".format(index + 1, total),
+            lock,
+        )
+        frame = work_dir / ("i2v_src_{:02d}.jpg".format(index + 1))
+        still_from_media(src, frame, work_dir, TARGET_W, TARGET_H)
+        clip = work_dir / ("i2v_{:02d}.mp4".format(index + 1))
+        fal_image_to_video(frame, prompt, clip)
+        clips.append(clip)
+    return clips
+
+
+def fit_runway_clip(src, dest, duration):
+    run_ffmpeg(
+        [
+            "-stream_loop",
+            "-1",
+            "-i",
+            str(src),
+            "-t",
+            "{:.3f}".format(max(0.4, float(duration))),
+            "-vf",
+            "scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,fps={fps},format=yuv420p".format(
+                w=TARGET_W, h=TARGET_H, fps=FPS
+            ),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            str(dest),
+        ],
+        timeout=40,
+    )
+    return dest
+
+
+def overlay_cues_on_video(video_path, cues, font_path, direction, work_dir, dest):
+    args = ["-i", str(video_path)]
+    filters = []
+    last = "0:v"
+    valid = 0
+    for i, (text, start, end) in enumerate(cues):
+        png = work_dir / ("runway_sub_{:03d}.png".format(i))
+        render_subtitle_png(
+            text,
+            font_path,
+            png,
+            fill=(direction.fill if direction else (255, 255, 255)),
+            stroke=(direction.stroke if direction else (0, 0, 0)),
+            font_scale=(direction.font_scale if direction else 1.0),
+        )
+        if not png.is_file():
+            continue
+        args += ["-loop", "1", "-i", str(png)]
+        inp = valid + 1
+        out = "ov{}".format(valid)
+        filters.append(
+            "[{src}][{inp}:v]overlay=(W-w)/2:H-h-64:enable='between(t,{start:.3f},{end:.3f})'[{out}]".format(
+                src=last,
+                inp=inp,
+                start=float(start),
+                end=float(end),
+                out=out,
+            )
+        )
+        last = out
+        valid += 1
+    if not filters:
+        shutil.copy2(str(video_path), str(dest))
+        return dest
+    duration = max(0.4, probe_duration(video_path))
+    args += [
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        "[{}]".format(last),
+        "-an",
+        "-t",
+        "{:.3f}".format(duration),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        str(dest),
+    ]
+    run_ffmpeg(args, timeout=50)
+    return dest
+
+
+def ffmpeg_runway_pass(clips, durations, cues, font_path, direction, voice_path, bgm_path, out_file, work_dir):
+    if not clips:
+        raise RuntimeError("런웨이 비디오 클립이 없습니다.")
+    fitted = []
+    n = len(clips)
+    for i, dur in enumerate(durations):
+        src = clips[i % n]
+        dest = work_dir / ("runway_fit_{:03d}.mp4".format(i))
+        fit_runway_clip(src, dest, dur)
+        fitted.append(dest)
+    concat_path = work_dir / "runway_concat.txt"
+    lines = ["ffconcat version 1.0"]
+    for clip in fitted:
+        lines.append("file '{}'".format(Path(clip).resolve().as_posix().replace("'", r"'\''")))
+    concat_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    silent_video = work_dir / "runway_body.mp4"
+    run_ffmpeg(
+        [
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_path),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-an",
+            str(silent_video),
+        ],
+        timeout=50,
+    )
+    captioned = work_dir / "runway_captioned.mp4"
+    overlay_cues_on_video(silent_video, cues, font_path, direction, work_dir, captioned)
+
+    args = ["-i", str(captioned), "-i", str(voice_path)]
+    maps = ["-map", "0:v:0", "-map", "1:a:0"]
+    extra = []
+    if bgm_path:
+        args += ["-i", str(bgm_path)]
+        extra = [
+            "-filter_complex",
+            "[1:a]volume=1.05[va];[2:a]volume=0.16[ba];[va][ba]amix=inputs=2:duration=first:dropout_transition=0[a]",
+        ]
+        maps = ["-map", "0:v:0", "-map", "[a]"]
+    args += extra + maps + [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        str(out_file),
+    ]
+    run_ffmpeg(args, timeout=50)
+
+
 def run_pipeline(
     media_files,
     style_prompt="",
@@ -1768,8 +2025,10 @@ def run_pipeline(
     voice_type=DEFAULT_VOICE_TYPE,
     speed_multiplier=1.0,
     bgm_mood=DEFAULT_BGM_MOOD,
+    is_runway_mode=False,
+    camera_motion="zoom_in",
 ):
-    # type: (List[Path], str, object, Optional[Path], bool, str, float, str) -> Tuple[Path, str]
+    # type: (List[Path], str, object, Optional[Path], bool, str, float, str, bool, str) -> Tuple[Path, str]
     if check_license:
         ok, message = verify_saved_license()
         if not ok:
@@ -1784,6 +2043,8 @@ def run_pipeline(
     out_file.parent.mkdir(parents=True, exist_ok=True)
     speed = normalize_speed(speed_multiplier)
     mood = normalize_bgm_mood(bgm_mood)
+    runway = bool(is_runway_mode)
+    motion = normalize_camera_motion(camera_motion)
     voice_key, _voice_id, _preset = resolve_voice(voice_type)
     progress_lock = threading.Lock()
 
@@ -1819,6 +2080,15 @@ def run_pipeline(
             return path
 
         def _frame_job():
+            if runway:
+                return generate_runway_clips(
+                    media_files,
+                    style_prompt,
+                    motion,
+                    work_dir,
+                    progress_cb=progress_cb,
+                    lock=progress_lock,
+                )
             _notify(progress_cb, 30, "이미지·자막 병렬 합성 중", progress_lock)
             frames = prepare_captioned_frames(
                 media_files, pieces, photo_order, font_path, work_dir, direction=direction
@@ -1830,35 +2100,61 @@ def run_pipeline(
             voice_fut = pool.submit(_voice_job)
             frame_fut = pool.submit(_frame_job)
             voice_path = voice_fut.result()
-            frames = frame_fut.result()
+            generated = frame_fut.result()
 
         audio_duration = probe_duration(voice_path)
         if audio_duration < 1:
             raise RuntimeError("생성된 음성이 너무 짧습니다. 대본/TTS를 확인하세요.")
         cues = split_script_cues(script, audio_duration)
         durations = [max(0.2, float(end) - float(start)) for _text, start, end in cues]
-        if len(durations) != len(frames):
-            n = min(len(durations), len(frames))
-            frames = frames[:n]
-            durations = durations[:n]
-        print("   음성 길이: {:.2f}초 / 배속 {}x / BGM {} / xfade {:.2f}".format(
-            audio_duration, speed, mood, direction.xfade
-        ))
-
         _notify(progress_cb, 68, "BGM 준비 중", progress_lock)
         bgm_path = resolve_bgm(mood, audio_duration, work_dir / "bgm.wav")
 
-        _notify(progress_cb, 76, "영상 렌더링 중 (단일 패스)", progress_lock)
-        ffmpeg_single_pass(
-            frames,
-            durations,
-            voice_path,
-            bgm_path,
-            out_file,
-            speed=speed,
-            work_dir=work_dir,
-            xfade_sec=direction.xfade,
-        )
+        if runway:
+            clips = generated
+            if not clips:
+                raise RuntimeError("런웨이 비디오를 만들지 못했습니다.")
+            if len(durations) != len(clips):
+                # match cue count to available I2V clips by grouping
+                if len(durations) > len(clips):
+                    durations = durations[: len(clips)]
+                    cues = cues[: len(clips)]
+                else:
+                    durations = durations + [max(0.4, audio_duration / max(1, len(clips)))] * (
+                        len(clips) - len(durations)
+                    )
+            _notify(progress_cb, 78, "런웨이 클립·자막 합성 중", progress_lock)
+            ffmpeg_runway_pass(
+                clips,
+                durations,
+                cues,
+                font_path,
+                direction,
+                voice_path,
+                bgm_path,
+                out_file,
+                work_dir,
+            )
+        else:
+            frames = generated
+            if len(durations) != len(frames):
+                n = min(len(durations), len(frames))
+                frames = frames[:n]
+                durations = durations[:n]
+            print("   음성 길이: {:.2f}초 / 배속 {}x / BGM {} / xfade {:.2f}".format(
+                audio_duration, speed, mood, direction.xfade
+            ))
+            _notify(progress_cb, 76, "영상 렌더링 중 (단일 패스)", progress_lock)
+            ffmpeg_single_pass(
+                frames,
+                durations,
+                voice_path,
+                bgm_path,
+                out_file,
+                speed=speed,
+                work_dir=work_dir,
+                xfade_sec=direction.xfade,
+            )
         _notify(progress_cb, 96, "출력 파일 정리 중", progress_lock)
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)

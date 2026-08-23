@@ -29,7 +29,9 @@ from main import (
     analyze_media_styles,
     load_settings,
     normalize_bgm_mood,
+    normalize_camera_motion,
     normalize_speed,
+    parse_flag,
     resolve_voice,
     run_pipeline,
 )
@@ -44,7 +46,7 @@ WORKER = ThreadPoolExecutor(max_workers=1)
 
 app = FastAPI(
     title="AI 숏폼 모바일 서버",
-    description="비동기 작업 큐 + 블러 배경/크로스페이드 초고속 릴스 엔진",
+    description="초고속 스틸 렌더 + fal Image-to-Video 런웨이 모드",
     version="3.0.0",
 )
 app.add_middleware(
@@ -85,7 +87,17 @@ def _update_job(job_id, **fields):
             JOBS[job_id].update(fields)
 
 
-def _run_job(job_id, media_files, prompt, out_file, voice_type, speed_multiplier, bgm_mood):
+def _run_job(
+    job_id,
+    media_files,
+    prompt,
+    out_file,
+    voice_type,
+    speed_multiplier,
+    bgm_mood,
+    is_runway_mode,
+    camera_motion,
+):
     started = time.time()
 
     def progress(percent, message):
@@ -108,6 +120,8 @@ def _run_job(job_id, media_files, prompt, out_file, voice_type, speed_multiplier
             voice_type=voice_type,
             speed_multiplier=speed_multiplier,
             bgm_mood=bgm_mood,
+            is_runway_mode=is_runway_mode,
+            camera_motion=camera_motion,
         )
         if not Path(out_file).is_file():
             raise RuntimeError("완성된 영상 파일을 찾지 못했습니다.")
@@ -223,6 +237,8 @@ async def create_video(
     speed_multiplier: str = Form("1.2", description="1.0, 1.2, 1.5"),
     bgm_mood: str = Form("pop", description="구버전 별칭"),
     bgm_type: str = Form("pop", description="variety/lofi/phonk/pop/acoustic/suspense/cinematic/none"),
+    is_runway_mode: str = Form("false", description="true면 fal Image-to-Video"),
+    camera_motion: str = Form("zoom_in", description="zoom_in/drone/pan"),
 ):
     ok, message = verify_or_activate_mobile(license_key, device_id, platform)
     if not ok:
@@ -235,6 +251,8 @@ async def create_video(
     voice_key, _vid, _preset = resolve_voice(voice_type)
     speed = normalize_speed(speed_multiplier)
     mood = normalize_bgm_mood(bgm_type or bgm_mood)
+    runway = parse_flag(is_runway_mode)
+    motion = normalize_camera_motion(camera_motion)
 
     job_id = uuid.uuid4().hex[:16]
     job_dir = JOBS_DIR / job_id
@@ -276,7 +294,18 @@ async def create_video(
             "output": str(out_file),
         }
 
-    WORKER.submit(_run_job, job_id, saved, prompt, out_file, voice_key, speed, mood)
+    WORKER.submit(
+        _run_job,
+        job_id,
+        saved,
+        prompt,
+        out_file,
+        voice_key,
+        speed,
+        mood,
+        runway,
+        motion,
+    )
     return {
         "job_id": job_id,
         "status": "processing",
@@ -284,6 +313,8 @@ async def create_video(
         "speed_multiplier": speed,
         "bgm_type": mood,
         "bgm_mood": mood,
+        "is_runway_mode": runway,
+        "camera_motion": motion,
     }
 
 
