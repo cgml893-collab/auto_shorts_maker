@@ -33,6 +33,7 @@ BASIC_SPEEDS = (1.0, 1.2)
 PRO_SPEEDS = (1.0, 1.2, 1.5)
 PAYMENT_REQUIRED = "PAYMENT_REQUIRED"
 PAYMENT_MESSAGE = "무료 체험이 만료되었습니다. 라이선스를 구매해 주세요."
+MASTER_PRO_KEY = "MASTER-PRO-7777"
 
 
 def _pepper():
@@ -116,16 +117,70 @@ def formatted_hwid():
     return "-".join(hwid[i : i + 4] for i in range(0, len(hwid), 4))
 
 
+def compact_license(key):
+    return "".join(ch.upper() for ch in (key or "") if ch.isalnum())
+
+
+def is_master_pro_key(key):
+    return compact_license(key) == compact_license(MASTER_PRO_KEY)
+
+
+def _license_body(key):
+    compact = compact_license(key)
+    if compact.startswith("ASMPRO"):
+        return compact[6:22]
+    if compact.startswith("ASMBASIC"):
+        return compact[8:24]
+    if compact.startswith("ASM"):
+        return compact[3:19]
+    return compact[:16]
+
+
+def _license_plan_hint(key):
+    compact = compact_license(key)
+    if compact.startswith("ASMPRO") or is_master_pro_key(key):
+        return PLAN_PRO
+    if compact.startswith("ASMBASIC"):
+        return PLAN_BASIC
+    return None
+
+
+def keys_equivalent(left, right):
+    a = compact_license(left)
+    b = compact_license(right)
+    if a and b and hmac.compare_digest(a, b):
+        return True
+    body_a = _license_body(left)
+    body_b = _license_body(right)
+    if len(body_a) >= 16 and len(body_b) >= 16:
+        return hmac.compare_digest(body_a[:16], body_b[:16])
+    return False
+
+
 def normalize_key(key):
     # type: (str) -> str
-    chars = [ch.upper() for ch in (key or "") if ch.isalnum()]
-    if len(chars) < 12:
-        return "".join(chars)
-    body = "".join(chars)
-    if body.startswith("ASM"):
-        body = body[3:]
+    if is_master_pro_key(key):
+        return MASTER_PRO_KEY
+    compact = compact_license(key)
+    if not compact:
+        return ""
+    hint = _license_plan_hint(key)
+    body = _license_body(key)
+    if len(body) < 12:
+        return compact
     body = body[:16]
-    return "ASM-" + "-".join(body[i : i + 4] for i in range(0, len(body), 4))
+    groups = "-".join(body[i : i + 4] for i in range(0, len(body), 4))
+    if hint == PLAN_PRO:
+        return "ASM-PRO-" + groups
+    if hint == PLAN_BASIC:
+        return "ASM-BASIC-" + groups
+    return "ASM-" + groups
+
+
+def _format_mobile_key(plan, body16):
+    tag = "PRO" if _normalize_plan(plan, default=PLAN_BASIC) == PLAN_PRO else "BASIC"
+    groups = "-".join(body16[i : i + 4] for i in range(0, 16, 4))
+    return "ASM-{}-{}".format(tag, groups)
 
 
 def issue_key_for_hwid(hwid):
@@ -145,8 +200,7 @@ def issue_key_for_mobile_hwid(hwid, plan=PLAN_BASIC):
         ("MOBILE|{}|{}".format(plan_key.upper(), hwid)).encode("utf-8"),
         hashlib.sha256,
     ).hexdigest().upper()
-    body = digest[:16]
-    return "ASM-" + "-".join(body[i : i + 4] for i in range(0, 16, 4))
+    return _format_mobile_key(plan_key, digest[:16])
 
 
 def _legacy_mobile_key(hwid):
@@ -222,16 +276,32 @@ def plan_features(plan):
     }
 
 
-def detect_mobile_plan(license_key, hwid):
-    normalized = normalize_key(license_key)
-    if not normalized:
-        return None
-    for plan in (PLAN_PRO, PLAN_BASIC):
-        expected = issue_key_for_mobile_hwid(hwid, plan)
-        if hmac.compare_digest(normalized, expected):
-            return plan
-    if hmac.compare_digest(normalized, _legacy_mobile_key(hwid)):
+def detect_mobile_plan(license_key, hwid, device_id="", platform=""):
+    if is_master_pro_key(license_key):
         return PLAN_PRO
+    if not compact_license(license_key):
+        return None
+    hwids = []
+    if hwid:
+        hwids.append(hwid)
+    if device_id:
+        for item in candidate_mobile_hwids(device_id, platform):
+            if item not in hwids:
+                hwids.append(item)
+    if not hwids:
+        return None
+    hint = _license_plan_hint(license_key)
+    ordered = []
+    for plan in ((hint,) if hint else ()) + (PLAN_PRO, PLAN_BASIC):
+        if plan and plan not in ordered:
+            ordered.append(plan)
+    for current in hwids:
+        for plan in ordered:
+            expected = issue_key_for_mobile_hwid(current, plan)
+            if keys_equivalent(license_key, expected):
+                return plan
+        if keys_equivalent(license_key, _legacy_mobile_key(current)):
+            return hint or PLAN_PRO
     return None
 
 
@@ -247,6 +317,32 @@ def mobile_hwid(device_id, platform=""):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest().upper()
 
 
+def candidate_mobile_hwids(device_id, platform=""):
+    device = "".join((device_id or "").split())
+    variants = []
+    if device:
+        variants.append(device)
+        compact = "".join(ch for ch in device if ch.isalnum())
+        if compact and compact != device:
+            variants.append(compact)
+    plats = []
+    raw_plat = (platform or "").strip().lower()
+    if raw_plat in ("iphone", "ipad", "apple"):
+        raw_plat = "ios"
+    if raw_plat in ("aos",):
+        raw_plat = "android"
+    for plat in (raw_plat, "android", "ios", ""):
+        if plat not in plats:
+            plats.append(plat)
+    seen = []
+    for dev in variants:
+        for plat in plats:
+            item = mobile_hwid(dev, plat)
+            if item not in seen:
+                seen.append(item)
+    return seen
+
+
 def issue_key_for_mobile_device(device_id, platform="", plan=PLAN_BASIC):
     return issue_key_for_mobile_hwid(mobile_hwid(device_id, platform), plan=plan)
 
@@ -257,7 +353,11 @@ def issue_key_for_this_pc():
 
 def _key_matches_hwid(key, hwid):
     expected = issue_key_for_hwid(hwid)
-    return hmac.compare_digest(normalize_key(key), expected)
+    return keys_equivalent(key, expected)
+
+
+def _fingerprint_key(key):
+    return hashlib.sha256(compact_license(key).encode("utf-8")).hexdigest()
 
 
 def _sign_payload(payload):
@@ -267,10 +367,6 @@ def _sign_payload(payload):
         ensure_ascii=True,
     )
     return hmac.new(_pepper(), body.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-def _fingerprint_key(key):
-    return hashlib.sha256(normalize_key(key).encode("utf-8")).hexdigest()
 
 
 def _read_registry():
@@ -502,6 +598,20 @@ def save_mobile_activation(key, hwid, plan=PLAN_BASIC):
     return payload
 
 
+def grant_master_pro(device_id="", platform=""):
+    features = plan_features(PLAN_PRO)
+    device = "".join((device_id or "").split())
+    if device:
+        hwid = mobile_hwid(device, platform)
+        save_device_plan(hwid, PLAN_PRO, MASTER_PRO_KEY)
+        features["hwid"] = hwid
+    else:
+        features["hwid"] = "MASTER"
+    features["free_remaining"] = 0
+    features["master"] = True
+    return True, "마스터 키로 프로 VIP가 활성화되었습니다.", features
+
+
 def verify_mobile_license(device_id, platform=""):
     # type: (str, str) -> Tuple[bool, str]
     device = "".join((device_id or "").split())
@@ -518,12 +628,15 @@ def verify_mobile_license(device_id, platform=""):
 
 def activate_mobile_license(license_key, device_id, platform=""):
     # type: (str, str, str) -> Tuple[bool, str]
+    if is_master_pro_key(license_key):
+        _ok, message, _features = grant_master_pro(device_id, platform)
+        return True, message
     device = "".join((device_id or "").split())
     if not device:
         return False, "기기 번호(Android ID / iOS Vendor ID)가 없습니다."
     current = mobile_hwid(device, platform)
-    normalized = normalize_key(license_key)
-    plan = detect_mobile_plan(normalized, current)
+    canonical = normalize_key(license_key)
+    plan = detect_mobile_plan(license_key, current, device_id=device, platform=platform)
     if not plan:
         return False, "잘못된 라이선스 키이거나 이 스마트폰용 키가 아닙니다."
 
@@ -531,12 +644,12 @@ def activate_mobile_license(license_key, device_id, platform=""):
     if payload:
         if str(payload.get("hwid") or "") != current:
             return False, "이 라이선스는 최초 등록된 1대의 스마트폰에서만 사용할 수 있습니다."
-        if str(payload.get("key_fp") or "") not in ("", _fingerprint_key(normalized)):
+        if str(payload.get("key_fp") or "") not in ("", _fingerprint_key(canonical)):
             return False, "이미 다른 라이선스 키로 이 기기가 등록되어 있습니다."
-        save_device_plan(current, plan, normalized)
+        save_device_plan(current, plan, canonical)
         return True, "이미 이 스마트폰에 라이선스가 등록되어 있습니다."
 
-    save_mobile_activation(normalized, current, plan=plan)
+    save_mobile_activation(canonical, current, plan=plan)
     return True, "{} 라이선스가 이 스마트폰에 등록되었습니다.".format(plan_label(plan))
 
 
@@ -544,8 +657,11 @@ def verify_or_activate_mobile(license_key, device_id, platform=""):
     key = (license_key or "").strip()
     if not key:
         return False, "라이선스 키가 없습니다."
+    if is_master_pro_key(key):
+        _ok, message, _features = grant_master_pro(device_id, platform)
+        return True, message
     current = mobile_hwid(device_id, platform)
-    plan = detect_mobile_plan(key, current)
+    plan = detect_mobile_plan(key, current, device_id=device_id, platform=platform)
     if not plan:
         return False, "잘못된 라이선스 키이거나 이 스마트폰용 키가 아닙니다."
     ok, message = verify_mobile_license(device_id, platform)
@@ -556,14 +672,16 @@ def verify_or_activate_mobile(license_key, device_id, platform=""):
 
 
 def resolve_mobile_entitlement(device_id, platform="", license_key=""):
+    key = (license_key or "").strip()
+    if is_master_pro_key(key):
+        return grant_master_pro(device_id, platform)
     device = "".join((device_id or "").split())
     if not device:
         return False, "기기 번호(Android ID / iOS Vendor ID)가 없습니다.", plan_features(PLAN_FREE)
     hwid = mobile_hwid(device, platform)
     plan = None
-    key = (license_key or "").strip()
     if key:
-        plan = detect_mobile_plan(key, hwid)
+        plan = detect_mobile_plan(key, hwid, device_id=device, platform=platform)
         if plan is None:
             return False, "잘못된 라이선스 키이거나 이 스마트폰용 키가 아닙니다.", plan_features(PLAN_FREE)
         save_device_plan(hwid, plan, key)

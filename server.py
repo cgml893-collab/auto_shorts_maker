@@ -27,11 +27,15 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from license_lock import (
+    MASTER_PRO_KEY,
     PAYMENT_MESSAGE,
     PAYMENT_REQUIRED,
     authorize_create_job,
+    compact_license,
     consume_entitlement,
+    is_master_pro_key,
     mobile_hwid,
+    normalize_key,
     resolve_mobile_entitlement,
     verify_or_activate_mobile,
 )
@@ -81,6 +85,13 @@ class LicenseStatusBody(BaseModel):
     device_id: str
     platform: str = ""
     license_key: str = ""
+
+
+def _canonical_license(raw):
+    text = (raw or "").strip()
+    if is_master_pro_key(text):
+        return MASTER_PRO_KEY
+    return normalize_key(text) or compact_license(text) or text
 
 
 def _safe_name(name):
@@ -280,16 +291,19 @@ def health():
 
 @app.post("/verify-license")
 def verify_license(body: VerifyLicenseBody):
-    ok, message = verify_or_activate_mobile(body.license_key, body.device_id, body.platform)
+    license_key = _canonical_license(body.license_key)
+    ok, message = verify_or_activate_mobile(license_key, body.device_id, body.platform)
     hwid = mobile_hwid(body.device_id, body.platform)
     short = "-".join(hwid[i : i + 4] for i in range(0, 16, 4))
-    if not ok:
+    if not ok and not is_master_pro_key(license_key):
         raise HTTPException(status_code=403, detail=message)
-    _ok, _msg, features = resolve_mobile_entitlement(body.device_id, body.platform, body.license_key)
+    if is_master_pro_key(license_key):
+        ok = True
+    _ok, _msg, features = resolve_mobile_entitlement(body.device_id, body.platform, license_key)
     return {
         "ok": True,
-        "message": message,
-        "device_bound": True,
+        "message": message if ok else "마스터 키로 프로 VIP가 활성화되었습니다.",
+        "device_bound": not bool(features.get("master")),
         "machine_code": short,
         "platform": (body.platform or "").strip().lower(),
         "plan": features.get("plan"),
@@ -301,7 +315,8 @@ def verify_license(body: VerifyLicenseBody):
 
 @app.post("/license-status")
 def license_status(body: LicenseStatusBody):
-    ok, message, features = resolve_mobile_entitlement(body.device_id, body.platform, body.license_key)
+    license_key = _canonical_license(body.license_key)
+    ok, message, features = resolve_mobile_entitlement(body.device_id, body.platform, license_key)
     return {
         "ok": ok or features.get("plan") in ("basic", "pro"),
         "message": message,
@@ -391,6 +406,7 @@ async def create_video(
     else:
         height = 720
 
+    license_key = _canonical_license(license_key)
     allowed, err_code, err_msg, features = authorize_create_job(
         device_id,
         platform,

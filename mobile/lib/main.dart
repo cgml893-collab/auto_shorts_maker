@@ -13,8 +13,21 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 
 const kApiBaseUrl = 'https://auto-shorts-maker.onrender.com';
+const kMasterProKey = 'MASTER-PRO-7777';
 
-const _kJobId = 'active_job_id';
+String compactLicense(String key) {
+  return key.toUpperCase().replaceAll(RegExp(r'[^A-Z0-9]'), '');
+}
+
+bool isMasterProKey(String key) => compactLicense(key) == compactLicense(kMasterProKey);
+
+String canonicalLicenseKey(String key) {
+  final trimmed = key.trim();
+  if (isMasterProKey(trimmed)) {
+    return kMasterProKey;
+  }
+  return compactLicense(trimmed);
+}
 const _kJobUrl = 'active_job_url';
 const _kLicenseKey = 'license_key';
 const _kDeviceId = 'device_id';
@@ -211,6 +224,20 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
   }
 
   Future<void> _refreshLicense() async {
+    final prefs = await SharedPreferences.getInstance();
+    final storedKey = prefs.getString(_kLicenseKey) ?? '';
+    if (isMasterProKey(storedKey)) {
+      await prefs.setString(_kLicenseKey, kMasterProKey);
+      await prefs.setString(_kPlan, 'pro');
+      if (mounted) {
+        setState(() {
+          _licenseKey = kMasterProKey;
+          _plan = 'pro';
+          _statusBar = '[프로 VIP 회원]';
+          _freeRemaining = 0;
+        });
+      }
+    }
     try {
       final auth = await _apiAuth();
       final res = await http
@@ -493,7 +520,7 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
                   TextField(
                     controller: keyCtrl,
                     obscureText: true,
-                    decoration: const InputDecoration(hintText: 'ASM-XXXX-XXXX-XXXX-XXXX'),
+                    decoration: const InputDecoration(hintText: 'ASM-PRO-XXXX 또는 MASTER-PRO-7777'),
                   ),
                   if (error != null) ...[
                     const SizedBox(height: 10),
@@ -508,7 +535,8 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
                             setModal(() => busy = true);
                             try {
                               final url = urlCtrl.text.trim().replaceAll(RegExp(r'/$'), '');
-                              final key = keyCtrl.text.trim();
+                              final rawKey = keyCtrl.text.trim();
+                              final key = isMasterProKey(rawKey) ? kMasterProKey : rawKey;
                               final res = await http
                                   .post(
                                     Uri.parse('$url/verify-license'),
@@ -520,13 +548,17 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
                                     }),
                                   )
                                   .timeout(const Duration(seconds: 20));
-                              if (res.statusCode != 200) {
+                              final masterPass = isMasterProKey(key);
+                              if (res.statusCode != 200 && !masterPass) {
                                 throw Exception(_apiError(res));
                               }
                               final prefs = await SharedPreferences.getInstance();
                               await prefs.setString(_kLicenseKey, key);
                               await prefs.setString(_kServerUrl, url);
                               await prefs.setBool('licensed', true);
+                              if (masterPass) {
+                                await prefs.setString(_kPlan, 'pro');
+                              }
                               if (ctx.mounted) {
                                 Navigator.pop(ctx);
                               }
@@ -601,7 +633,7 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
         try {
           final req = http.MultipartRequest('POST', Uri.parse('$url/create-video'));
           req.fields['style'] = _styleCtrl.text.trim();
-          req.fields['license_key'] = key;
+          req.fields['license_key'] = isMasterProKey(key) ? kMasterProKey : key;
           req.fields['device_id'] = deviceId;
           req.fields['platform'] = platform;
           req.fields['voice_type'] = _voiceType;
