@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Dict, List
 
 os.environ.setdefault("FFMPEG_TIMEOUT", "60")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -46,8 +48,8 @@ WORKER = ThreadPoolExecutor(max_workers=1)
 
 app = FastAPI(
     title="AI 숏폼 모바일 서버",
-    description="EXIF 회전 보정 + 15~20초 시네마틱 숏폼 / fal Image-to-Video",
-    version="3.1.0",
+    description="저메모리 SRT 하드서브 + fal Image-to-Video (512MB)",
+    version="3.2.0",
 )
 app.add_middleware(
     CORSMiddleware,

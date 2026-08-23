@@ -16,7 +16,7 @@ import sys
 import threading
 import uuid
 import wave
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -256,6 +256,9 @@ def find_korean_font():
         [
             Path(r"C:\Windows\Fonts\malgunbd.ttf"),
             Path(r"C:\Windows\Fonts\malgun.ttf"),
+            Path("/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf"),
+            Path("/usr/share/fonts/truetype/nanum/NanumGothic.ttf"),
+            Path("/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf"),
             Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc"),
             Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
             Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"),
@@ -782,6 +785,7 @@ def generate_voice(settings, script, output_path=None, voice_type=DEFAULT_VOICE_
     return dest
 
 
+FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "60"))
 FFMPEG_PRESET = [
     "-c:v",
     "libx264",
@@ -793,7 +797,10 @@ FFMPEG_PRESET = [
     "23",
     "-pix_fmt",
     "yuv420p",
+    "-threads",
+    "1",
 ]
+FFMPEG_LIGHT = ["-threads", "1"]
 
 SCALE_PAD_VF = (
     "scale={w}:{h}:force_original_aspect_ratio=decrease,"
@@ -953,55 +960,36 @@ def mux_voice(video_path, voice_path, duration, out_file):
     )
 
 
-def overlay_subtitles(video_path, sub_assets, out_file):
-    if not sub_assets:
+def overlay_subtitles(video_path, cues, font_path, out_file, work_dir):
+    if not cues:
         shutil.copy2(str(video_path), str(out_file))
-        return
-    args = ["-i", str(video_path)]
-    for png, _s, _e, _w, _h in sub_assets:
-        args += ["-i", str(png)]
-    filters = []
-    last = "0:v"
-    for i, (_png, start, end, _w, h) in enumerate(sub_assets):
-        out_v = "v{}".format(i)
-        y = max(0, TARGET_H - int(h) - SUB_BOTTOM_MARGIN)
-        filters.append(
-            "[{last}][{si}:v]overlay=x=(W-w)/2:y={y}:enable='between(t,{start:.3f},{end:.3f})'[{out}]".format(
-                last=last,
-                si=i + 1,
-                y=y,
-                start=start,
-                end=end,
-                out=out_v,
-            )
-        )
-        last = out_v
-    filters[-1] = filters[-1].rsplit("[", 1)[0] + "[vout]"
-    args += [
-        "-filter_complex",
-        ";".join(filters),
-        "-map",
-        "[vout]",
-        "-map",
-        "0:a:0",
-        "-t",
-        str(probe_duration(video_path)),
-    ]
-    args += FFMPEG_PRESET
-    args += ["-c:a", "copy", "-movflags", "+faststart", str(out_file)]
-    run_ffmpeg(args)
+        return out_file
+    srt = write_cues_srt(cues, Path(work_dir) / "subs.srt")
+    run_ffmpeg(
+        [
+            "-i",
+            str(video_path),
+            "-vf",
+            subtitles_vf(srt, font_path),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+        ]
+        + FFMPEG_LIGHT
+        + [str(out_file)],
+        timeout=min(50, FFMPEG_TIMEOUT),
+    )
+    return out_file
 
 
 def build_subtitle_assets(script, duration, font_path, work_dir):
-    cues = split_script_cues(script, duration)
-    assets = []
-    for i, (text, start, end) in enumerate(cues):
-        png_path = work_dir / ("sub_{:03d}.png".format(i))
-        render_subtitle_png(text, font_path, png_path)
-        with Image.open(png_path) as im:
-            w, h = im.size
-        assets.append((png_path, float(start), float(end), w, h))
-    return assets
+    return split_script_cues(script, duration)
 
 
 def _call(clip, names, *args, **kwargs):
@@ -1130,6 +1118,83 @@ def split_script_cues(script, total_duration):
         cues.append((text, start, end))
         t = end
     return cues
+
+
+def _srt_clock(seconds):
+    seconds = max(0.0, float(seconds))
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    whole = int(seconds % 60)
+    millis = int(round((seconds - math.floor(seconds)) * 1000.0))
+    if millis >= 1000:
+        whole += 1
+        millis = 0
+    if whole >= 60:
+        minutes += 1
+        whole = 0
+    return "{:02d}:{:02d}:{:02d},{:03d}".format(hours, minutes, whole, millis)
+
+
+def wrap_caption_lines(text, width=14):
+    text = sanitize_narration(text)
+    lines = []
+    current = ""
+    for ch in text:
+        current += ch
+        if len(current) >= width:
+            lines.append(current.strip())
+            current = ""
+            if len(lines) >= 4:
+                break
+    if current.strip() and len(lines) < 4:
+        lines.append(current.strip())
+    return "\n".join(lines) if lines else text
+
+
+def write_cues_srt(cues, dest):
+    blocks = []
+    index = 1
+    for text, start, end in cues:
+        body = wrap_caption_lines(text)
+        if not body:
+            continue
+        stop = max(float(start) + 0.2, float(end))
+        blocks.append(
+            "{}\n{} --> {}\n{}".format(
+                index, _srt_clock(start), _srt_clock(stop), body
+            )
+        )
+        index += 1
+    Path(dest).write_text("\ufeff" + "\n\n".join(blocks) + "\n", encoding="utf-8")
+    return Path(dest)
+
+
+def _ffmpeg_filter_path(path):
+    return Path(path).resolve().as_posix().replace("\\", "/").replace(":", "\\:").replace("'", r"\'")
+
+
+def subtitle_font_name(font_path):
+    name = Path(font_path).name.lower()
+    if "nanum" in name:
+        return "NanumGothic"
+    if "malgun" in name:
+        return "Malgun Gothic"
+    if "noto" in name:
+        return "Noto Sans CJK KR"
+    if "apple" in name or "gothicneo" in name:
+        return "Apple SD Gothic Neo"
+    return "NanumGothic"
+
+
+def subtitles_vf(srt_path, font_path):
+    srt = _ffmpeg_filter_path(srt_path)
+    fontsdir = _ffmpeg_filter_path(Path(font_path).resolve().parent)
+    style = (
+        "FontName={},FontSize=20,PrimaryColour=&H0000FFFF,"
+        "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2,MarginV=48"
+    ).format(subtitle_font_name(font_path))
+    style = style.replace(",", "\\,")
+    return "subtitles={}:fontsdir={}:force_style='{}'".format(srt, fontsdir, style)
 
 
 def _text_size(draw, text, font, stroke_width):
@@ -1621,54 +1686,21 @@ def arrange_media_for_cues(media_files, cues, photo_order):
 
 
 def compose_captioned_png(src, caption, font_path, dest_png, work_dir, direction=None):
-    suffix = Path(src).suffix.lower()
-    if suffix in IMAGE_EXTS:
-        with open_image_upright(src) as im:
-            canvas = fit_contain_on_blur(im, TARGET_W, TARGET_H).convert("RGBA")
-    else:
-        tmp = work_dir / (dest_png.stem + "_grab.jpg")
-        run_ffmpeg(
-            ["-ss", "0.12", "-i", str(src), "-frames:v", "1", "-q:v", "6", str(tmp)],
-            timeout=12,
-        )
-        with open_image_upright(tmp) as im:
-            canvas = fit_contain_on_blur(im, TARGET_W, TARGET_H).convert("RGBA")
-    text = sanitize_narration(caption)
-    if text:
-        cap_path = dest_png.with_name(dest_png.stem + "_cap.png")
-        render_subtitle_png(
-            text,
-            font_path,
-            cap_path,
-            fill=(direction.fill if direction else (255, 255, 255)),
-            stroke=(direction.stroke if direction else (0, 0, 0)),
-            font_scale=(direction.font_scale if direction else 1.0),
-        )
-        overlay = Image.open(cap_path).convert("RGBA")
-        x = max(0, (TARGET_W - overlay.width) // 2)
-        y = max(0, TARGET_H - overlay.height - 64)
-        canvas.paste(overlay, (x, y), overlay)
-    canvas.convert("RGB").save(dest_png, "PNG", compress_level=1)
+    dest_jpg = Path(dest_png).with_suffix(".jpg")
+    still_from_media(src, dest_jpg, work_dir, TARGET_W, TARGET_H)
+    if dest_jpg.resolve() != Path(dest_png).resolve():
+        shutil.copy2(str(dest_jpg), str(dest_png))
+    return Path(dest_png)
 
 
 def prepare_captioned_frames(media_files, pieces, photo_order, font_path, work_dir, direction=None):
     dummy_cues = [(text, 0.0, 1.0) for text in pieces]
     assigned = arrange_media_for_cues(media_files, dummy_cues, photo_order or [])
-    frames = [None] * len(pieces)
-
-    def _one(index):
-        framed = work_dir / ("frame_{:03d}.png".format(index))
-        compose_captioned_png(
-            assigned[index], pieces[index], font_path, framed, work_dir, direction=direction
-        )
-        return index, framed
-
-    workers = min(2, max(1, len(pieces)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_one, i) for i in range(len(pieces))]
-        for fut in as_completed(futures):
-            index, framed = fut.result()
-            frames[index] = framed
+    frames = []
+    for index, src in enumerate(assigned):
+        framed = work_dir / ("frame_{:03d}.jpg".format(index))
+        still_from_media(src, framed, work_dir, TARGET_W, TARGET_H)
+        frames.append(framed)
     return frames
 
 
@@ -1723,7 +1755,18 @@ def build_slideshow_entries(frames, durations, work_dir, speed=1.0, xfade_sec=XF
     return entries
 
 
-def ffmpeg_single_pass(frames, durations, voice_path, bgm_path, out_file, speed=1.0, work_dir=None, xfade_sec=XFADE_SEC):
+def ffmpeg_single_pass(
+    frames,
+    durations,
+    voice_path,
+    bgm_path,
+    out_file,
+    speed=1.0,
+    work_dir=None,
+    xfade_sec=XFADE_SEC,
+    cues=None,
+    font_path=None,
+):
     speed = normalize_speed(speed)
     if not frames:
         raise RuntimeError("렌더할 프레임이 없습니다.")
@@ -1767,6 +1810,12 @@ def ffmpeg_single_pass(frames, durations, voice_path, bgm_path, out_file, speed=
         ]
     else:
         args = ["-f", "concat", "-safe", "0", "-i", str(concat_path), "-i", str(voice_mp3)]
+
+    vf = None
+    if cues and font_path:
+        srt = write_cues_srt(cues, work_dir / "subs.srt")
+        vf = subtitles_vf(srt, font_path)
+
     audio_map = ["-map", "0:v:0", "-map", "1:a:0"]
     extra = []
     if bgm_mp3 is not None:
@@ -1777,10 +1826,20 @@ def ffmpeg_single_pass(frames, durations, voice_path, bgm_path, out_file, speed=
                 "[1:a]volume=1.05,{tempo}[va];[2:a]volume=0.16,{tempo}[ba];"
                 "[va][ba]amix=inputs=2:duration=first:dropout_transition=0[a]"
             ).format(tempo=atempo_chain(speed))
-        extra = ["-filter_complex", af]
-        audio_map = ["-map", "0:v:0", "-map", "[a]"]
+        if vf:
+            extra = ["-filter_complex", "[0:v]{}[v];{}".format(vf, af)]
+            audio_map = ["-map", "[v]", "-map", "[a]"]
+        else:
+            extra = ["-filter_complex", af]
+            audio_map = ["-map", "0:v:0", "-map", "[a]"]
     elif abs(speed - 1.0) > 0.001:
-        extra = ["-af", atempo_chain(speed)]
+        if vf:
+            extra = ["-filter_complex", "[0:v]{}[v];[1:a]{}[a]".format(vf, atempo_chain(speed))]
+            audio_map = ["-map", "[v]", "-map", "[a]"]
+        else:
+            extra = ["-af", atempo_chain(speed)]
+    elif vf:
+        extra = ["-vf", vf]
 
     args += extra
     args += audio_map
@@ -1804,8 +1863,7 @@ def ffmpeg_single_pass(frames, durations, voice_path, bgm_path, out_file, speed=
         "-shortest",
         "-movflags",
         "+faststart",
-        str(out_file),
-    ]
+    ] + FFMPEG_LIGHT + [str(out_file)]
     run_ffmpeg(args, timeout=min(60, FFMPEG_TIMEOUT))
 
 
@@ -1905,22 +1963,16 @@ def generate_runway_clips(media_files, style_prompt, camera_motion, work_dir, pr
     return clips
 
 
-def fit_runway_clip(src, dest, duration):
+def normalize_runway_clip(src, dest):
     run_ffmpeg(
         [
-            "-fflags",
-            "+genpts",
-            "-stream_loop",
-            "-1",
             "-i",
             str(src),
-            "-t",
-            "{:.3f}".format(max(1.0, float(duration))),
+            "-an",
             "-vf",
             "scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,fps={fps},format=yuv420p".format(
                 w=TARGET_W, h=TARGET_H, fps=FPS
             ),
-            "-an",
             "-c:v",
             "libx264",
             "-preset",
@@ -1929,68 +1981,98 @@ def fit_runway_clip(src, dest, duration):
             "23",
             "-pix_fmt",
             "yuv420p",
-            str(dest),
-        ],
-        timeout=40,
+            "-movflags",
+            "+faststart",
+        ]
+        + FFMPEG_LIGHT
+        + [str(dest)],
+        timeout=30,
     )
     return dest
 
 
-def overlay_cues_on_video(video_path, cues, font_path, direction, work_dir, dest):
-    args = ["-i", str(video_path)]
-    filters = []
-    last = "0:v"
-    valid = 0
-    for i, (text, start, end) in enumerate(cues):
-        png = work_dir / ("runway_sub_{:03d}.png".format(i))
-        render_subtitle_png(
-            text,
-            font_path,
-            png,
-            fill=(direction.fill if direction else (255, 255, 255)),
-            stroke=(direction.stroke if direction else (0, 0, 0)),
-            font_scale=(1.25 * (direction.font_scale if direction else 1.0)),
-        )
-        if not png.is_file():
-            continue
-        args += ["-loop", "1", "-i", str(png)]
-        inp = valid + 1
-        out = "ov{}".format(valid)
-        filters.append(
-            "[{src}][{inp}:v]overlay=(W-w)/2:H-h-64:enable='between(t,{start:.3f},{end:.3f})'[{out}]".format(
-                src=last,
-                inp=inp,
-                start=float(start),
-                end=float(end),
-                out=out,
+def concat_loop_copy(clips, dest, duration, work_dir):
+    duration = max(1.0, float(duration))
+    try:
+        if len(clips) == 1:
+            run_ffmpeg(
+                [
+                    "-fflags",
+                    "+genpts",
+                    "-stream_loop",
+                    "-1",
+                    "-i",
+                    str(clips[0]),
+                    "-t",
+                    "{:.3f}".format(duration),
+                    "-an",
+                    "-c",
+                    "copy",
+                    "-movflags",
+                    "+faststart",
+                    str(dest),
+                ],
+                timeout=20,
             )
+            return dest
+        durs = [max(0.4, probe_duration(path)) for path in clips]
+        list_path = work_dir / "rw_loop.txt"
+        lines = ["ffconcat version 1.0"]
+        elapsed = 0.0
+        index = 0
+        while elapsed < duration + 0.05 and index < 24:
+            path = clips[index % len(clips)]
+            lines.append(_concat_file_line(path))
+            elapsed += durs[index % len(clips)]
+            index += 1
+        list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        run_ffmpeg(
+            [
+                "-fflags",
+                "+genpts",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(list_path),
+                "-t",
+                "{:.3f}".format(duration),
+                "-an",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(dest),
+            ],
+            timeout=20,
         )
-        last = out
-        valid += 1
-    if not filters:
-        shutil.copy2(str(video_path), str(dest))
         return dest
-    duration = max(0.4, probe_duration(video_path))
-    args += [
-        "-filter_complex",
-        ";".join(filters),
-        "-map",
-        "[{}]".format(last),
-        "-an",
-        "-t",
-        "{:.3f}".format(duration),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-crf",
-        "23",
-        "-pix_fmt",
-        "yuv420p",
-        str(dest),
-    ]
-    run_ffmpeg(args, timeout=50)
-    return dest
+    except RuntimeError:
+        args = ["-stream_loop", "-1", "-i", str(clips[0]), "-t", "{:.3f}".format(duration), "-an"]
+        if len(clips) > 1:
+            args = ["-f", "concat", "-safe", "0", "-i", str(work_dir / "rw_loop.txt"), "-t", "{:.3f}".format(duration), "-an"]
+        run_ffmpeg(
+            args
+            + [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+            ]
+            + FFMPEG_LIGHT
+            + [str(dest)],
+            timeout=30,
+        )
+        return dest
+
+
+def overlay_cues_on_video(video_path, cues, font_path, direction, work_dir, dest):
+    return overlay_subtitles(video_path, cues, font_path, dest, work_dir)
 
 
 def ffmpeg_runway_pass(
@@ -1998,72 +2080,34 @@ def ffmpeg_runway_pass(
 ):
     if not clips:
         raise RuntimeError("런웨이 비디오 클립이 없습니다.")
-    target = max(15.0, float(audio_duration) + 0.35)
-    n = max(1, len(clips))
-    fitted = []
-    elapsed = 0.0
-    index = 0
-    while elapsed < target - 0.05 and index < 16:
-        remain = target - elapsed
-        piece = min(float(RUNWAY_CLIP_SEC), remain)
-        if remain > RUNWAY_CLIP_SEC and remain - RUNWAY_CLIP_SEC < 1.2:
-            piece = remain
-        dest = work_dir / ("runway_fit_{:03d}.mp4".format(index))
-        fit_runway_clip(clips[index % n], dest, piece)
-        fitted.append(dest)
-        elapsed += piece
-        index += 1
+    target = max(float(audio_duration), 1.0)
+    unique = []
+    cache = {}
+    for clip in clips:
+        key = str(Path(clip).resolve())
+        if key not in cache:
+            dest = work_dir / ("rw_n_{:02d}.mp4".format(len(cache)))
+            cache[key] = normalize_runway_clip(clip, dest)
+        unique.append(cache[key])
 
-    concat_path = work_dir / "runway_concat.txt"
-    lines = ["ffconcat version 1.0"]
-    last = fitted[-1]
-    for clip in fitted:
-        last = clip
-        dur = max(0.4, probe_duration(clip))
-        lines.append("file '{}'".format(Path(clip).resolve().as_posix().replace("'", r"'\''")))
-        lines.append("duration {:.3f}".format(dur))
-    lines.append("file '{}'".format(Path(last).resolve().as_posix().replace("'", r"'\''")))
-    concat_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    silent_video = work_dir / "runway_body.mp4"
-    run_ffmpeg(
-        [
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(concat_path),
-            "-t",
-            "{:.3f}".format(target),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-crf",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
-            "-an",
-            str(silent_video),
-        ],
-        timeout=50,
-    )
-    captioned = work_dir / "runway_captioned.mp4"
-    overlay_cues_on_video(silent_video, cues, font_path, direction, work_dir, captioned)
+    body = work_dir / "runway_body.mp4"
+    concat_loop_copy(unique, body, target, work_dir)
 
-    args = ["-i", str(captioned), "-i", str(voice_path)]
-    maps = ["-map", "0:v:0", "-map", "1:a:0"]
-    extra = []
+    srt = write_cues_srt(cues, work_dir / "subs.srt")
+    vf = subtitles_vf(srt, font_path)
+    args = ["-i", str(body), "-i", str(voice_path)]
+    maps = ["-map", "[v]", "-map", "1:a:0"]
+    extra = ["-filter_complex", "[0:v]{}[v]".format(vf)]
     if bgm_path:
         args += ["-i", str(bgm_path)]
         extra = [
             "-filter_complex",
-            "[1:a]volume=1.08[va];[2:a]volume=0.22,afade=t=in:st=0:d=0.4,afade=t=out:st={:.2f}:d=0.8[ba];"
+            "[0:v]{}[v];[1:a]volume=1.08[va];[2:a]volume=0.22,afade=t=in:st=0:d=0.4,afade=t=out:st={:.2f}:d=0.8[ba];"
             "[va][ba]amix=inputs=2:duration=first:dropout_transition=0[a]".format(
-                max(0.5, float(audio_duration) - 0.8)
+                vf, max(0.5, float(audio_duration) - 0.8)
             ),
         ]
-        maps = ["-map", "0:v:0", "-map", "[a]"]
+        maps = ["-map", "[v]", "-map", "[a]"]
     args += extra + maps + [
         "-c:v",
         "libx264",
@@ -2076,13 +2120,12 @@ def ffmpeg_runway_pass(
         "-c:a",
         "aac",
         "-b:a",
-        "192k",
+        "128k",
         "-t",
         "{:.3f}".format(float(audio_duration)),
         "-movflags",
         "+faststart",
-        str(out_file),
-    ]
+    ] + FFMPEG_LIGHT + [str(out_file)]
     run_ffmpeg(args, timeout=50)
 
 
@@ -2161,11 +2204,11 @@ def run_pipeline(
                     progress_cb=progress_cb,
                     lock=progress_lock,
                 )
-            _notify(progress_cb, 30, "이미지·자막 병렬 합성 중", progress_lock)
+            _notify(progress_cb, 30, "장면 프레임 준비 중", progress_lock)
             frames = prepare_captioned_frames(
                 media_files, pieces, photo_order, font_path, work_dir, direction=direction
             )
-            _notify(progress_cb, 52, "이미지·자막 합성 완료", progress_lock)
+            _notify(progress_cb, 52, "장면 프레임 준비 완료", progress_lock)
             return frames
 
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -2220,6 +2263,8 @@ def run_pipeline(
                 speed=speed,
                 work_dir=work_dir,
                 xfade_sec=direction.xfade,
+                cues=cues,
+                font_path=font_path,
             )
         _notify(progress_cb, 96, "출력 파일 정리 중", progress_lock)
     finally:
