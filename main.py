@@ -12,8 +12,10 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import uuid
 import wave
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -56,17 +58,15 @@ SFX_DIR = ROOT / "sfx"
 VOICE_PATH = OUTPUT_DIR / "voice.mp3"
 FINAL_PATH = OUTPUT_DIR / "final_shorts.mp4"
 
-TARGET_W = 720
-TARGET_H = 1280
+TARGET_W = 1080
+TARGET_H = 1920
 FPS = 24
-FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "300"))
+FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "180"))
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
 DEFAULT_VOICE_ID = "cgSgspJ2msm6clMCkdW9"
 ELEVENLABS_MODEL = "eleven_multilingual_v2"
-KENBURNS_W = 900
-KENBURNS_H = 1600
 ALLOWED_SPEEDS = (1.0, 1.2, 1.5)
 DEFAULT_VOICE_TYPE = "bright_female"
 DEFAULT_BGM_MOOD = "upbeat"
@@ -101,9 +101,9 @@ VOICE_PRESETS = {
 }
 BGM_MOODS = ("upbeat", "emotional", "tense", "none")
 
-SUB_MAX_WIDTH = 640
-SUB_FONT_SIZE = 48
-SUB_STROKE = 6
+SUB_MAX_WIDTH = 960
+SUB_FONT_SIZE = 64
+SUB_STROKE = 8
 SUB_LINE_GAP = 10
 SUB_PAD_X = 28
 SUB_PAD_Y = 20
@@ -372,7 +372,7 @@ def generate_script(settings, media_files, style_prompt=""):
             }
         )
         attached += 1
-        if attached >= 8:
+        if attached >= 4:
             break
 
     if attached == 0:
@@ -440,9 +440,7 @@ FFMPEG_PRESET = [
     "-preset",
     "ultrafast",
     "-crf",
-    "26",
-    "-threads",
-    "2",
+    "20",
     "-pix_fmt",
     "yuv420p",
 ]
@@ -748,21 +746,27 @@ def build_visuals(media_files, audio_duration):
     return _call(video, ("with_fps", "set_fps"), FPS), scene_starts
 
 
-def split_script_cues(script, total_duration):
-    # type: (str, float) -> List[Tuple[str, float, float]]
+def split_script_pieces(script):
+    # type: (str) -> List[str]
+    text = sanitize_narration(script)
     pieces = [
         p.strip()
-        for p in re.split(r"(?<=[.!?。…])\s+|(?<=요)\s+|(?<=다)\s+", script)
+        for p in re.split(r"(?<=[.!?。…])\s+|(?<=요)\s+|(?<=다)\s+", text)
         if p.strip()
     ]
     if not pieces:
-        pieces = [script]
+        pieces = [text]
     if len(pieces) == 1:
-        chunks = re.findall(r".{8,28}(?:\s+|$)|.{1,28}$", script)
+        chunks = re.findall(r".{8,32}(?:\s+|$)|.{1,32}$", text)
         chunks = [c.strip() for c in chunks if c.strip()]
         if chunks:
             pieces = chunks
+    return pieces or [text]
 
+
+def split_script_cues(script, total_duration):
+    # type: (str, float) -> List[Tuple[str, float, float]]
+    pieces = split_script_pieces(script)
     weights = [max(1, len(p)) for p in pieces]
     total_w = float(sum(weights))
     cues = []
@@ -1206,7 +1210,7 @@ def still_from_media(path, dest_jpg, work_dir, width=None, height=None):
     suffix = Path(path).suffix.lower()
     if suffix in IMAGE_EXTS:
         with Image.open(path) as im:
-            fit_cover_rgb(im, width, height).save(dest_jpg, "JPEG", quality=88)
+            fit_cover_rgb(im, width, height).save(dest_jpg, "JPEG", quality=90, optimize=True)
         return dest_jpg
     tmp = work_dir / (dest_jpg.stem + "_grab.jpg")
     run_ffmpeg(
@@ -1214,7 +1218,7 @@ def still_from_media(path, dest_jpg, work_dir, width=None, height=None):
         timeout=20,
     )
     with Image.open(tmp) as im:
-        fit_cover_rgb(im, width, height).save(dest_jpg, "JPEG", quality=88)
+        fit_cover_rgb(im, width, height).save(dest_jpg, "JPEG", quality=90, optimize=True)
     return dest_jpg
 
 
@@ -1229,57 +1233,81 @@ def arrange_media_for_cues(media_files, cues, photo_order):
     return [cycle[i % len(cycle)] for i in range(len(cues))]
 
 
-def kenburns_zoom_expr(index):
-    if index % 2 == 0:
-        return "min(1+0.00135*on,1.14)"
-    return "if(eq(on,0),1.14,max(1.14-0.00135*on,1.0))"
+def bake_caption_on_still(base_jpg, caption, font_path, dest_jpg):
+    canvas = Image.open(base_jpg).convert("RGBA")
+    text = sanitize_narration(caption)
+    if text:
+        cap_path = dest_jpg.with_name(dest_jpg.stem + "_cap.png")
+        render_subtitle_png(text, font_path, cap_path)
+        overlay = Image.open(cap_path).convert("RGBA")
+        x = max(0, (TARGET_W - overlay.width) // 2)
+        y = max(0, TARGET_H - overlay.height - 96)
+        canvas.paste(overlay, (x, y), overlay)
+    canvas.convert("RGB").save(dest_jpg, "JPEG", quality=90, optimize=True)
 
 
-def ffmpeg_motion_pass(scenes, voice_path, out_file, speed=1.0, bgm_path=None):
+def prepare_captioned_frames(media_files, pieces, photo_order, font_path, work_dir):
+    dummy_cues = [(text, 0.0, 1.0) for text in pieces]
+    assigned = arrange_media_for_cues(media_files, dummy_cues, photo_order or [])
+    frames = [None] * len(pieces)
+
+    def _one(index):
+        still = work_dir / ("base_{:03d}.jpg".format(index))
+        framed = work_dir / ("frame_{:03d}.jpg".format(index))
+        still_from_media(assigned[index], still, work_dir, TARGET_W, TARGET_H)
+        bake_caption_on_still(still, pieces[index], font_path, framed)
+        return index, framed
+
+    workers = min(4, max(1, len(pieces)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_one, i) for i in range(len(pieces))]
+        for fut in as_completed(futures):
+            index, framed = fut.result()
+            frames[index] = framed
+    return frames
+
+
+def ffmpeg_single_pass(frames, durations, voice_path, bgm_path, out_file, speed=1.0):
     speed = normalize_speed(speed)
+    if not frames:
+        raise RuntimeError("렌더할 프레임이 없습니다.")
     args = []
-    n = len(scenes)
-    for still, _cap, _dur in scenes:
-        args += ["-loop", "1", "-i", str(still)]
-    for _still, cap, _dur in scenes:
-        args += ["-loop", "1", "-i", str(cap)]
+    for jpg, dur in zip(frames, durations):
+        args += [
+            "-loop",
+            "1",
+            "-framerate",
+            str(FPS),
+            "-t",
+            "{:.3f}".format(max(0.2, float(dur))),
+            "-i",
+            str(jpg),
+        ]
     args += ["-i", str(voice_path)]
     if bgm_path:
         args += ["-i", str(bgm_path)]
 
+    n = len(frames)
+    voice_i = n
     filters = []
     labels = []
-    for i, (_still, _cap, dur) in enumerate(scenes):
-        frames = max(int(round(max(0.2, float(dur)) * FPS)), 10)
-        cap_i = n + i
-        filters.append(
-            "[{i}:v]scale={w}:{h}:force_original_aspect_ratio=increase,"
-            "crop={w}:{h},zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-            "d={d}:s={tw}x{th}:fps={fps},format=yuv420p[z{i}]".format(
-                i=i,
-                w=KENBURNS_W,
-                h=KENBURNS_H,
-                z=kenburns_zoom_expr(i),
-                d=frames,
-                tw=TARGET_W,
-                th=TARGET_H,
-                fps=FPS,
-            )
-        )
-        filters.append(
-            "[z{i}][{c}:v]overlay=(W-w)/2:H-h-64[v{i}]".format(i=i, c=cap_i)
-        )
+    for i in range(n):
+        filters.append("[{}:v]format=yuv420p,setsar=1[v{}]".format(i, i))
         labels.append("[v{}]".format(i))
-    filters.append("".join(labels) + "concat=n={}:v=1:a=0[vcat]".format(n))
+    if n == 1:
+        vcat = "[v0]"
+    else:
+        filters.append("".join(labels) + "concat=n={}:v=1:a=0[vcat]".format(n))
+        vcat = "[vcat]"
+
     if abs(speed - 1.0) > 0.001:
-        filters.append("[vcat]setpts=PTS/{:.4f},fps={},format=yuv420p[v]".format(speed, FPS))
+        filters.append("{}setpts=PTS/{:.4f}[v]".format(vcat, speed))
         audio_fx = atempo_chain(speed)
     else:
-        filters.append("[vcat]fps={},format=yuv420p,setsar=1[v]".format(FPS))
+        filters.append("{}format=yuv420p[v]".format(vcat))
         audio_fx = "anull"
 
-    voice_i = 2 * n
-    filters.append("[{}:a]{}[va]".format(voice_i, audio_fx))
+    filters.append("[{}:a]aformat=sample_fmts=fltp:channel_layouts=stereo,volume=1.05,{}[va]".format(voice_i, audio_fx))
     if bgm_path:
         bgm_i = voice_i + 1
         filters.append(
@@ -1299,74 +1327,51 @@ def ffmpeg_motion_pass(scenes, voice_path, out_file, speed=1.0, bgm_path=None):
         "[v]",
         "-map",
         a_map,
+        "-r",
+        str(FPS),
         "-c:v",
         "libx264",
         "-preset",
         "ultrafast",
         "-crf",
-        "24",
-        "-threads",
-        "2",
+        "20",
+        "-tune",
+        "stillimage",
         "-pix_fmt",
         "yuv420p",
         "-c:a",
         "aac",
         "-b:a",
-        "128k",
+        "192k",
         "-shortest",
         "-movflags",
         "+faststart",
         str(out_file),
     ]
-    run_ffmpeg(args)
+    run_ffmpeg(args, timeout=FFMPEG_TIMEOUT)
 
 
-def render_stillimage_reel(
-    media_files,
-    script,
-    voice_path,
-    duration,
-    font_path,
-    work_dir,
-    out_file,
-    photo_order=None,
-    speed_multiplier=1.0,
-    bgm_mood=DEFAULT_BGM_MOOD,
-):
-    cues = split_script_cues(sanitize_narration(script), duration)
-    if not cues:
-        cues = [(sanitize_narration(script), 0.0, duration)]
-    assigned = arrange_media_for_cues(media_files, cues, photo_order or [])
-    scenes = []
-    for i, ((text, start, end), src) in enumerate(zip(cues, assigned)):
-        still = work_dir / ("still_{:03d}.jpg".format(i))
-        still_from_media(src, still, work_dir, KENBURNS_W, KENBURNS_H)
-        cap = work_dir / ("cap_{:03d}.png".format(i))
-        render_subtitle_png(text, font_path, cap)
-        scenes.append((still, cap, max(0.2, float(end) - float(start))))
-
-    mood = normalize_bgm_mood(bgm_mood)
-    bgm_path = None
-    if mood != "none":
-        bgm_path = pick_bgm_for_mood(mood)
-        if bgm_path is None:
-            bgm_path = synthesize_bgm(mood, duration, work_dir / "bgm_mood.wav")
-            print("   합성 BGM: {}".format(mood))
-        else:
-            print("   BGM 파일: {}".format(bgm_path.name))
-
-    ffmpeg_motion_pass(
-        scenes,
-        voice_path,
-        out_file,
-        speed=speed_multiplier,
-        bgm_path=bgm_path,
-    )
+def resolve_bgm(mood, duration, dest):
+    mood = normalize_bgm_mood(mood)
+    if mood == "none":
+        return None
+    bgm_path = pick_bgm_for_mood(mood)
+    if bgm_path is not None:
+        print("   BGM 파일: {}".format(bgm_path.name))
+        return bgm_path
+    made = synthesize_bgm(mood, duration, dest)
+    print("   합성 BGM: {}".format(mood))
+    return made
 
 
-def _notify(progress_cb, percent, message):
+def _notify(progress_cb, percent, message, lock=None):
     print(message)
-    if progress_cb is not None:
+    if progress_cb is None:
+        return
+    if lock is not None:
+        with lock:
+            progress_cb(percent, message)
+    else:
         progress_cb(percent, message)
 
 
@@ -1396,49 +1401,76 @@ def run_pipeline(
     speed = normalize_speed(speed_multiplier)
     mood = normalize_bgm_mood(bgm_mood)
     voice_key, _voice_id, _preset = resolve_voice(voice_type)
+    progress_lock = threading.Lock()
 
     _notify(
         progress_cb,
-        5,
+        4,
         "미디어 {}개 준비: {}".format(
             len(media_files), ", ".join(p.name for p in media_files)
         ),
+        progress_lock,
     )
-    _notify(progress_cb, 12, "대본 작성 중")
+    _notify(progress_cb, 10, "대본 작성 중", progress_lock)
     script, photo_order = generate_script(settings, media_files, style_prompt=style_prompt)
     script = sanitize_narration(script)
-
-    _notify(progress_cb, 32, "음성 생성 중")
-    voice_file = out_file.parent / "voice.mp3"
-    generate_voice(settings, script, output_path=voice_file, voice_type=voice_key)
-
-    audio_duration = probe_duration(voice_file)
-    if audio_duration < 1:
-        raise RuntimeError("생성된 음성이 너무 짧습니다. 대본/TTS를 확인하세요.")
-    print("   음성 길이: {:.2f}초 / 배속 {}x / BGM {}".format(audio_duration, speed, mood))
+    pieces = split_script_pieces(script)
+    _notify(progress_cb, 22, "대본 완료 · 음성/이미지 병렬 처리 시작", progress_lock)
 
     work_dir = out_file.parent / ("_ffwork_{}".format(uuid.uuid4().hex[:8]))
     work_dir.mkdir(parents=True, exist_ok=True)
+    voice_file = out_file.parent / "voice.mp3"
+
     try:
-        _notify(progress_cb, 70, "영상 렌더링 중")
-        render_stillimage_reel(
-            media_files,
-            script,
-            voice_file,
-            audio_duration,
-            font_path,
-            work_dir,
+        def _voice_job():
+            _notify(progress_cb, 28, "음성 생성 중", progress_lock)
+            path = generate_voice(settings, script, output_path=voice_file, voice_type=voice_key)
+            _notify(progress_cb, 58, "음성 생성 완료", progress_lock)
+            return path
+
+        def _frame_job():
+            _notify(progress_cb, 30, "이미지·자막 병렬 합성 중", progress_lock)
+            frames = prepare_captioned_frames(
+                media_files, pieces, photo_order, font_path, work_dir
+            )
+            _notify(progress_cb, 52, "이미지·자막 합성 완료", progress_lock)
+            return frames
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            voice_fut = pool.submit(_voice_job)
+            frame_fut = pool.submit(_frame_job)
+            voice_path = voice_fut.result()
+            frames = frame_fut.result()
+
+        audio_duration = probe_duration(voice_path)
+        if audio_duration < 1:
+            raise RuntimeError("생성된 음성이 너무 짧습니다. 대본/TTS를 확인하세요.")
+        cues = split_script_cues(script, audio_duration)
+        durations = [max(0.2, float(end) - float(start)) for _text, start, end in cues]
+        if len(durations) != len(frames):
+            n = min(len(durations), len(frames))
+            frames = frames[:n]
+            durations = durations[:n]
+        print("   음성 길이: {:.2f}초 / 배속 {}x / BGM {}".format(audio_duration, speed, mood))
+
+        _notify(progress_cb, 68, "BGM 준비 중", progress_lock)
+        bgm_path = resolve_bgm(mood, audio_duration, work_dir / "bgm.wav")
+
+        _notify(progress_cb, 76, "영상 렌더링 중 (단일 패스)", progress_lock)
+        ffmpeg_single_pass(
+            frames,
+            durations,
+            voice_path,
+            bgm_path,
             out_file,
-            photo_order=photo_order,
-            speed_multiplier=speed,
-            bgm_mood=mood,
+            speed=speed,
         )
-        _notify(progress_cb, 95, "완료 처리 중")
+        _notify(progress_cb, 96, "출력 파일 정리 중", progress_lock)
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
     cleanup_temp_files()
-    _notify(progress_cb, 100, "완료: {}".format(out_file))
+    _notify(progress_cb, 100, "완료: {}".format(out_file), progress_lock)
     return out_file, script
 
 

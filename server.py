@@ -6,13 +6,14 @@ from __future__ import annotations
 import os
 import shutil
 import threading
+import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List
 
-os.environ.setdefault("FFMPEG_TIMEOUT", "300")
+os.environ.setdefault("FFMPEG_TIMEOUT", "180")
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -34,7 +35,7 @@ WORKER = ThreadPoolExecutor(max_workers=1)
 app = FastAPI(
     title="AI 숏폼 모바일 서버",
     description="비동기 작업 큐 + Pillow/FFmpeg 초고속 릴스 엔진",
-    version="2.0.0",
+    version="3.0.0",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -75,16 +76,19 @@ def _update_job(job_id, **fields):
 
 
 def _run_job(job_id, media_files, prompt, out_file, voice_type, speed_multiplier, bgm_mood):
+    started = time.time()
+
     def progress(percent, message):
         _update_job(
             job_id,
             status="processing",
             stage=message,
             percent=max(0, min(100, int(percent))),
+            elapsed_sec=round(time.time() - started, 1),
         )
 
     try:
-        _update_job(job_id, stage="대본 작성 중", percent=8)
+        _update_job(job_id, stage="대본 작성 중", percent=8, elapsed_sec=0)
         run_pipeline(
             media_files,
             style_prompt=prompt,
@@ -103,6 +107,7 @@ def _run_job(job_id, media_files, prompt, out_file, voice_type, speed_multiplier
             stage="완료",
             percent=100,
             error=None,
+            elapsed_sec=round(time.time() - started, 1),
         )
     except Exception as exc:
         traceback.print_exc()
@@ -111,6 +116,7 @@ def _run_job(job_id, media_files, prompt, out_file, voice_type, speed_multiplier
             status="failed",
             stage="실패",
             error=str(exc),
+            elapsed_sec=round(time.time() - started, 1),
         )
 
 
@@ -211,6 +217,7 @@ async def create_video(
             "stage": "대기 중",
             "percent": 1,
             "error": None,
+            "elapsed_sec": 0,
             "output": str(out_file),
         }
 
@@ -234,6 +241,7 @@ def job_status(job_id: str):
         "status": job["status"],
         "stage": job.get("stage") or "processing",
         "percent": int(job.get("percent") or 0),
+        "elapsed_sec": float(job.get("elapsed_sec") or 0),
         "error": job.get("error"),
     }
 
