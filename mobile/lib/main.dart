@@ -779,37 +779,29 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
       _busyText = '다운로드 중...';
       _progress = 0.98;
     });
-    final dl = await _retryGet(
-      Uri.parse('$url/download/$jobId'),
-      timeout: const Duration(seconds: 60),
-    );
-    if (dl.statusCode != 200) {
-      throw Exception(_apiError(dl));
-    }
-    final dir = await getTemporaryDirectory();
-    final out = File('${dir.path}/final_shorts_${DateTime.now().millisecondsSinceEpoch}.mp4');
-    await out.writeAsBytes(dl.bodyBytes, flush: true);
+    final localFile = await _downloadJobToDocuments(url, jobId);
+    try {
+      await Gal.putVideo(localFile.path);
+    } catch (_) {}
     await _player?.dispose();
-    final player = VideoPlayerController.file(out);
+    final player = VideoPlayerController.file(localFile);
     await player.initialize();
     await player.setLooping(true);
-    await player.play();
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_kJobId);
     await prefs.remove(_kJobUrl);
     HapticFeedback.heavyImpact();
     if (!mounted) {
+      await player.dispose();
       return;
     }
     setState(() {
-      _resultVideo = out;
+      _resultVideo = localFile;
       _player = player;
       _busy = false;
       _progress = 1;
     });
-    try {
-      await Gal.putVideo(out.path);
-    } catch (_) {}
+    await player.play();
     await _refreshLicense();
     if (!mounted) {
       return;
@@ -819,14 +811,62 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
       builder: (ctx) {
         return AlertDialog(
           backgroundColor: const Color(0xFF1A1028),
-          title: const Text('🔔 릴스 영상이 완성되었습니다!'),
-          content: const Text('바로 재생하며 갤러리에 저장했습니다.'),
+          title: const Text('🎉 릴스 영상이 완성되었습니다!'),
+          content: const Text('갤러리에 저장했고, 로컬 파일로 바로 재생합니다.'),
           actions: [
             FilledButton(onPressed: () => Navigator.pop(ctx), child: const Text('확인')),
           ],
         );
       },
     );
+  }
+
+  bool _isMp4Bytes(List<int> bytes) {
+    if (bytes.length < 12) {
+      return false;
+    }
+    return bytes[4] == 0x66 && bytes[5] == 0x74 && bytes[6] == 0x79 && bytes[7] == 0x70;
+  }
+
+  Future<File> _downloadJobToDocuments(String url, String jobId) async {
+    final uri = Uri.parse('$url/download/$jobId');
+    Object? last;
+    for (var i = 0; i < 10; i++) {
+      try {
+        final dl = await http.get(uri).timeout(const Duration(seconds: 90));
+        if (dl.statusCode == 502 || dl.statusCode == 503 || dl.statusCode == 429 || dl.statusCode >= 500) {
+          last = Exception(_apiError(dl));
+          if (mounted) {
+            setState(() => _busyText = '서버 재시도 중... (${i + 1}/10)');
+          }
+          await Future.delayed(const Duration(seconds: 3));
+          continue;
+        }
+        if (dl.statusCode != 200) {
+          throw Exception(_apiError(dl));
+        }
+        final bytes = dl.bodyBytes;
+        if (bytes.length < 32 || !_isMp4Bytes(bytes)) {
+          last = Exception('내려받은 파일이 재생 가능한 MP4가 아닙니다.');
+          await Future.delayed(const Duration(seconds: 3));
+          continue;
+        }
+        final dir = await getApplicationDocumentsDirectory();
+        final out = File('${dir.path}/final_shorts_${DateTime.now().millisecondsSinceEpoch}.mp4');
+        await out.writeAsBytes(bytes, flush: true);
+        return out;
+      } catch (e) {
+        last = e;
+        if (e is! Exception || e.toString().contains('찾을 수 없') || e.toString().contains('실패했습니다')) {
+          rethrow;
+        }
+        if (mounted) {
+          setState(() => _busyText = '네트워크 재시도 중... (${i + 1}/10)');
+        }
+        await Future.delayed(const Duration(seconds: 3));
+      }
+    }
+    throw last ?? Exception('영상 다운로드에 실패했습니다.');
   }
 
   Future<void> _save() async {

@@ -48,6 +48,7 @@ from main import (
     diet_image_file,
     fast_blur_slideshow,
     load_settings,
+    run_ffmpeg,
     normalize_bgm_mood,
     normalize_camera_motion,
     normalize_speed,
@@ -209,6 +210,28 @@ def _cleanup_after_download(job_dir):
     _release_memory()
 
 
+def _ensure_faststart(out_file):
+    src = Path(out_file)
+    tmp = src.with_name("{}_faststart{}".format(src.stem, src.suffix))
+    run_ffmpeg(
+        [
+            "-i",
+            str(src),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(tmp),
+        ],
+        timeout=20,
+    )
+    if not tmp.is_file() or tmp.stat().st_size < 32:
+        _purge_path(tmp)
+        raise RuntimeError("faststart MP4 재먹스에 실패했습니다.")
+    tmp.replace(src)
+    return src
+
+
 def _update_job(job_id, **fields):
     with JOBS_LOCK:
         if job_id in JOBS:
@@ -310,6 +333,10 @@ def _run_job(
             _force_blur()
         if not Path(out_file).is_file():
             raise RuntimeError("완성된 영상 파일을 찾지 못했습니다.")
+        try:
+            _ensure_faststart(out_file)
+        except Exception as exc:
+            print("[안내] faststart 재먹스 실패, 원본 MP4 유지: {}".format(exc))
         consume_entitlement(features)
         _update_job(
             job_id,
@@ -594,6 +621,7 @@ def download_job(job_id: str):
         path=str(out_file),
         media_type="video/mp4",
         filename="final_shorts.mp4",
+        headers={"Accept-Ranges": "bytes"},
         background=BackgroundTask(_cleanup_after_download, str(out_file.parent)),
     )
 
