@@ -48,7 +48,7 @@ from main import (
     diet_image_file,
     fast_blur_slideshow,
     load_settings,
-    run_ffmpeg,
+    mp4_file_ready,
     normalize_aspect_ratio,
     normalize_bgm_mood,
     normalize_camera_motion,
@@ -215,28 +215,6 @@ def _cleanup_after_download(job_dir):
     _release_memory()
 
 
-def _ensure_faststart(out_file):
-    src = Path(out_file)
-    tmp = src.with_name("{}_faststart{}".format(src.stem, src.suffix))
-    run_ffmpeg(
-        [
-            "-i",
-            str(src),
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
-            str(tmp),
-        ],
-        timeout=20,
-    )
-    if not tmp.is_file() or tmp.stat().st_size < 32:
-        _purge_path(tmp)
-        raise RuntimeError("faststart MP4 재먹스에 실패했습니다.")
-    tmp.replace(src)
-    return src
-
-
 def _update_job(job_id, **fields):
     with JOBS_LOCK:
         if job_id in JOBS:
@@ -302,15 +280,17 @@ def _run_job(
         )
 
     def _force_complete():
-        if Path(out_file).is_file():
+        if mp4_file_ready(out_file):
             return
         work = Path(out_file).parent / "_force_complete"
-        work.mkdir(parents=True, exist_ok=True)
+        os.makedirs(str(work), exist_ok=True)
         with write_lock:
-            if Path(out_file).is_file():
+            if mp4_file_ready(out_file):
                 return
             progress(92, "{}초 안전 완성 · 균등 슬라이드쇼".format(int(target_duration)))
             fast_blur_slideshow(media_files, out_file, work, duration=float(target_duration))
+            if not mp4_file_ready(out_file):
+                raise RuntimeError("안전 슬라이드쇼가 완성된 MP4를 만들지 못했습니다.")
 
     def _watchdog():
         if finished.wait(timeout=max(1.0, budget - 8.0)):
@@ -365,14 +345,10 @@ def _run_job(
                     print("[안내] 서버 안전장치 폴백 실패: {}".format(exc))
         finally:
             runner.shutdown(wait=False)
-        if not Path(out_file).is_file():
+        if not mp4_file_ready(out_file):
             _force_complete()
-        if not Path(out_file).is_file():
+        if not mp4_file_ready(out_file):
             raise RuntimeError("완성된 영상 파일을 찾지 못했습니다.")
-        try:
-            _ensure_faststart(out_file)
-        except Exception as exc:
-            print("[안내] faststart 재먹스 실패, 원본 MP4 유지: {}".format(exc))
         consume_entitlement(features)
         _update_job(
             job_id,
@@ -688,7 +664,7 @@ def download_job(job_id: str):
     if job["status"] != "completed":
         raise HTTPException(status_code=500, detail=job.get("error") or "영상 제작에 실패했습니다.")
     out_file = Path(job["output"])
-    if not out_file.is_file():
+    if not mp4_file_ready(out_file):
         raise HTTPException(status_code=404, detail="완성된 영상 파일을 찾지 못했습니다.")
     return FileResponse(
         path=str(out_file),

@@ -352,8 +352,10 @@ def diet_image_file(path, dest=None, max_w=None, max_h=None, max_bytes=None, qua
         rgb.close()
         if not payload:
             return path
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.makedirs(str(dest.parent), exist_ok=True)
         dest.write_bytes(payload)
+        if not os.path.exists(str(dest)) or os.path.getsize(str(dest)) < 32:
+            raise RuntimeError("이미지 저장 실패: {}".format(dest))
         if dest.resolve() != path.resolve():
             try:
                 path.unlink()
@@ -362,7 +364,16 @@ def diet_image_file(path, dest=None, max_w=None, max_h=None, max_bytes=None, qua
         gc.collect()
         return dest
     except Exception as exc:
-        print("[안내] 이미지 초경량 압축 실패, 원본 유지: {}".format(exc))
+        print("[안내] 이미지 초경량 압축 실패, 폴백 저장: {}".format(exc))
+        try:
+            os.makedirs(str(dest.parent), exist_ok=True)
+            with Image.open(path) as raw:
+                raw.convert("RGB").save(str(dest), "JPEG", quality=80)
+            if os.path.exists(str(dest)) and os.path.getsize(str(dest)) >= 32:
+                gc.collect()
+                return dest
+        except Exception:
+            pass
         gc.collect()
         return path
 
@@ -1076,6 +1087,8 @@ FFMPEG_PRESET = [
     "yuv420p",
     "-threads",
     "2",
+    "-movflags",
+    "+faststart",
 ]
 FFMPEG_LIGHT = ["-threads", "2"]
 
@@ -1101,10 +1114,101 @@ def ffmpeg_bin():
     raise RuntimeError("FFmpeg를 찾을 수 없습니다. 시스템에 ffmpeg를 설치해 주세요.")
 
 
+def mp4_file_ready(path):
+    path = Path(path)
+    if not path.is_file() or path.stat().st_size < 32:
+        return False
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(12)
+        return len(head) >= 12 and head[4:8] == b"ftyp"
+    except OSError:
+        return False
+
+
+def save_image_verified(image, dest, quality=85):
+    dest = Path(dest)
+    os.makedirs(str(dest.parent), exist_ok=True)
+    image.convert("RGB").save(str(dest), "JPEG", quality=int(quality))
+    if not os.path.exists(str(dest)) or os.path.getsize(str(dest)) < 32:
+        raise RuntimeError("이미지 저장 실패: {}".format(dest))
+    return dest
+
+
+def ensure_jpeg_on_disk(path, size=None, fill=(18, 10, 28)):
+    path = Path(path)
+    os.makedirs(str(path.parent), exist_ok=True)
+    width, height = size or (TARGET_W, TARGET_H)
+    width = max(2, int(width) - int(width) % 2)
+    height = max(2, int(height) - int(height) % 2)
+    if os.path.exists(str(path)) and os.path.getsize(str(path)) >= 32:
+        return path
+    Image.new("RGB", (width, height), fill).save(str(path), "JPEG", quality=80)
+    if not os.path.exists(str(path)) or os.path.getsize(str(path)) < 32:
+        raise RuntimeError("폴백 이미지 저장 실패: {}".format(path))
+    return path
+
+
+def require_image_for_ffmpeg(path):
+    path = Path(path)
+    if not os.path.exists(str(path)) or os.path.getsize(str(path)) < 32:
+        raise RuntimeError("FFmpeg 입력 이미지가 없습니다: {}".format(path))
+    return path
+
+
+def _atomic_mp4_args(args):
+    if not args:
+        return None, None, list(args)
+    last = Path(str(args[-1]))
+    if last.suffix.lower() != ".mp4":
+        return None, None, [str(a) for a in args]
+    os.makedirs(str(last.parent), exist_ok=True)
+    if last.name == "final_shorts.mp4":
+        temp = last.parent / "temp_render.mp4"
+    else:
+        temp = last.parent / "temp_render_{}.mp4".format(last.stem)
+    if temp.resolve() == last.resolve():
+        temp = last.parent / "temp_render_{}.mp4".format(uuid.uuid4().hex[:8])
+    return temp, last, [str(a) for a in args[:-1]] + [str(temp)]
+
+
+def _discard_temp_mp4(temp):
+    if temp is None:
+        return
+    try:
+        Path(temp).unlink(missing_ok=True)
+    except TypeError:
+        try:
+            if Path(temp).exists():
+                Path(temp).unlink()
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+def _publish_temp_mp4(temp, dest):
+    temp = Path(temp)
+    dest = Path(dest)
+    if not temp.is_file() or temp.stat().st_size < 32:
+        _discard_temp_mp4(temp)
+        raise RuntimeError("FFmpeg가 빈 MP4를 남겼습니다: {}".format(temp))
+    if not mp4_file_ready(temp):
+        _discard_temp_mp4(temp)
+        raise RuntimeError("MP4 ftyp 검증 실패 (미완성 moov 차단): {}".format(temp))
+    os.replace(str(temp), str(dest))
+    if not mp4_file_ready(dest):
+        raise RuntimeError("최종 MP4 게시 실패: {}".format(dest))
+    return dest
+
+
 def run_ffmpeg(args, timeout=None):
     if timeout is None:
         timeout = FFMPEG_TIMEOUT
-    cmd = [ffmpeg_bin(), "-hide_banner", "-y"] + [str(a) for a in args]
+    temp, dest, argv = _atomic_mp4_args(args)
+    if temp is not None and temp.exists():
+        _discard_temp_mp4(temp)
+    cmd = [ffmpeg_bin(), "-hide_banner", "-y"] + argv
     print("[ffmpeg cmd] {}".format(" ".join(cmd)), flush=True)
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     try:
@@ -1115,12 +1219,14 @@ def run_ffmpeg(args, timeout=None):
             creationflags=flags,
         )
     except subprocess.TimeoutExpired as exc:
+        _discard_temp_mp4(temp)
         err = (exc.stderr or b"").decode("utf-8", errors="replace")
         print("[ffmpeg timeout stderr]\n{}".format(err), flush=True)
         raise RuntimeError("FFmpeg 시간 초과 ({}s): {}".format(timeout, err[-1500:]))
     stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
     stdout = (proc.stdout or b"").decode("utf-8", errors="replace")
     if proc.returncode != 0:
+        _discard_temp_mp4(temp)
         print("[ffmpeg exit {}]".format(proc.returncode), flush=True)
         print("[ffmpeg stderr]\n{}".format(stderr), flush=True)
         if stdout.strip():
@@ -1130,6 +1236,8 @@ def run_ffmpeg(args, timeout=None):
                 proc.returncode, (stderr or stdout or "stderr 비어 있음")[-2500:]
             )
         )
+    if temp is not None and dest is not None:
+        _publish_temp_mp4(temp, dest)
     if stderr.strip():
         print("[ffmpeg log]\n{}".format(stderr[-800:]), flush=True)
     return proc
@@ -1162,6 +1270,8 @@ def _safe_src_copy(src, work_dir, index):
 def make_scene_clip(src, dest, duration):
     duration = max(0.2, float(duration))
     suffix = Path(src).suffix.lower()
+    if suffix in IMAGE_EXTS:
+        require_image_for_ffmpeg(src)
     args = []
     if suffix in IMAGE_EXTS:
         args += [
@@ -1229,8 +1339,6 @@ def mux_voice(video_path, voice_path, duration, out_file):
             "-b:a",
             "128k",
             "-shortest",
-            "-movflags",
-            "+faststart",
             str(out_file),
         ],
         timeout=FFMPEG_TIMEOUT,
@@ -1257,6 +1365,8 @@ def overlay_subtitles(video_path, cues, font_path, out_file, work_dir, caption_s
             "23",
             "-pix_fmt",
             "yuv420p",
+            "-movflags",
+            "+faststart",
         ]
         + FFMPEG_LIGHT
         + [str(out_file)],
@@ -1932,20 +2042,27 @@ def fit_contain_on_blur(im, width, height):
 def still_from_media(path, dest_jpg, work_dir, width=None, height=None):
     width = int(width or TARGET_W)
     height = int(height or TARGET_H)
+    dest_jpg = Path(dest_jpg)
+    work_dir = Path(work_dir)
+    os.makedirs(str(work_dir), exist_ok=True)
+    os.makedirs(str(dest_jpg.parent), exist_ok=True)
     suffix = Path(path).suffix.lower()
-    if suffix in IMAGE_EXTS:
-        with open_image_upright(path) as im:
-            fit_contain_on_blur(im, width, height).save(dest_jpg, "JPEG", quality=85)
-        diet_image_file(dest_jpg, dest=dest_jpg)
-        return dest_jpg
-    tmp = work_dir / (dest_jpg.stem + "_grab.jpg")
-    run_ffmpeg(
-        ["-ss", "0.15", "-i", str(path), "-frames:v", "1", "-q:v", "4", str(tmp)],
-        timeout=20,
-    )
-    with open_image_upright(tmp) as im:
-        fit_contain_on_blur(im, width, height).save(dest_jpg, "JPEG", quality=85)
-    return dest_jpg
+    try:
+        if suffix in IMAGE_EXTS:
+            with open_image_upright(path) as im:
+                save_image_verified(fit_contain_on_blur(im, width, height), dest_jpg, quality=85)
+            diet_image_file(dest_jpg, dest=dest_jpg)
+        else:
+            tmp = work_dir / (dest_jpg.stem + "_grab.jpg")
+            run_ffmpeg(
+                ["-ss", "0.15", "-i", str(path), "-frames:v", "1", "-q:v", "4", str(tmp)],
+                timeout=20,
+            )
+            with open_image_upright(tmp) as im:
+                save_image_verified(fit_contain_on_blur(im, width, height), dest_jpg, quality=85)
+    except Exception as exc:
+        print("[안내] 스틸 추출 실패, 단색 폴백: {}".format(exc))
+    return ensure_jpeg_on_disk(dest_jpg, (width, height))
 
 
 def arrange_media_for_cues(media_files, cues, photo_order):
@@ -1989,7 +2106,7 @@ def prepare_captioned_frames(
     def _one(item):
         src, dest = item
         still_from_media(src, dest, work_dir, width, height)
-        return dest
+        return ensure_jpeg_on_disk(dest, (width, height))
 
     workers = min(4, max(1, len(jobs)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -2003,12 +2120,17 @@ def _concat_file_line(path):
 
 def write_concat_list(entries, list_path):
     lines = ["ffconcat version 1.0"]
-    last = entries[-1][0]
+    last = None
     for png, dur in entries:
+        if not os.path.exists(str(png)) or os.path.getsize(str(png)) < 32:
+            continue
         last = png
         lines.append(_concat_file_line(png))
         lines.append("duration {:.4f}".format(max(0.04, float(dur))))
+    if last is None:
+        raise RuntimeError("concat에 사용할 이미지가 없습니다.")
     lines.append(_concat_file_line(last))
+    os.makedirs(str(Path(list_path).parent), exist_ok=True)
     list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return list_path
 
@@ -2040,7 +2162,7 @@ def build_slideshow_entries(frames, durations, work_dir, speed=1.0, xfade_sec=XF
                 alpha = (k + 1) / float(count)
                 mix = Image.blend(src_a, src_b, alpha)
                 out = work_dir / "xfade_{:03d}_{:02d}.jpg".format(i, k)
-                mix.save(out, "JPEG", quality=82)
+                save_image_verified(mix, out, quality=82)
                 entries.append((out, step))
     finally:
         for img in opened:
@@ -2072,6 +2194,7 @@ def ffmpeg_single_pass(
     work_dir = Path(work_dir or Path(frames[0]).parent)
     width = int(width or TARGET_W)
     height = int(height or TARGET_H)
+    frames = [ensure_jpeg_on_disk(path, (width, height)) for path in frames]
     entries = build_slideshow_entries(
         frames, durations, work_dir, speed=speed, xfade_sec=xfade_sec
     )
@@ -2679,7 +2802,7 @@ def normalize_spark_clip(src, dest, width=None, height=None):
             ),
         ]
         + FFMPEG_PRESET
-        + ["-movflags", "+faststart", str(dest)],
+        + [str(dest)],
         timeout=30,
     )
     return dest
@@ -2706,8 +2829,6 @@ def concat_loop_copy(clips, dest, duration, work_dir):
                     "-an",
                     "-c",
                     "copy",
-                    "-movflags",
-                    "+faststart",
                     str(dest),
                 ],
                 timeout=20,
@@ -2739,8 +2860,6 @@ def concat_loop_copy(clips, dest, duration, work_dir):
                 "-an",
                 "-c",
                 "copy",
-                "-movflags",
-                "+faststart",
                 str(dest),
             ],
             timeout=20,
@@ -2761,6 +2880,8 @@ def concat_loop_copy(clips, dest, duration, work_dir):
                 "23",
                 "-pix_fmt",
                 "yuv420p",
+                "-movflags",
+                "+faststart",
             ]
             + FFMPEG_LIGHT
             + [str(dest)],
@@ -2891,9 +3012,9 @@ def ensure_voice_track(settings, script, dest, voice_key, duration=18.0):
 def fast_blur_slideshow(media_files, out_file, work_dir, voice_path=None, duration=None):
     duration = float(duration or FAST_BLUR_SEC)
     work_dir = Path(work_dir)
-    work_dir.mkdir(parents=True, exist_ok=True)
+    os.makedirs(str(work_dir), exist_ok=True)
     out_file = Path(out_file)
-    out_file.parent.mkdir(parents=True, exist_ok=True)
+    os.makedirs(str(out_file.parent), exist_ok=True)
     src = Path(media_files[0]) if media_files else None
     frame = work_dir / "fast_blur.jpg"
     try:
@@ -2903,8 +3024,11 @@ def fast_blur_slideshow(media_files, out_file, work_dir, voice_path=None, durati
             still_from_media(src, frame, work_dir, TARGET_W, TARGET_H)
         else:
             raise RuntimeError("no media")
-    except Exception:
-        Image.new("RGB", (TARGET_W, TARGET_H), (18, 10, 28)).save(frame, "JPEG", quality=80)
+    except Exception as exc:
+        print("[안내] fast_blur.jpg 준비 실패, 단색 폴백: {}".format(exc))
+        Image.new("RGB", (TARGET_W, TARGET_H), (18, 10, 28)).save(str(frame), "JPEG", quality=80)
+    ensure_jpeg_on_disk(frame, (TARGET_W, TARGET_H))
+    require_image_for_ffmpeg(frame)
     args = [
         "-loop",
         "1",
@@ -2934,7 +3058,7 @@ def fast_blur_slideshow(media_files, out_file, work_dir, voice_path=None, durati
         "-t",
         "{:.3f}".format(duration),
     ] + FFMPEG_ENCODE + [str(out_file)]
-    run_ffmpeg(args, timeout=5)
+    run_ffmpeg(args, timeout=max(25, min(int(duration * 5 + 20), 240)))
     gc.collect()
     return out_file
 
@@ -3111,7 +3235,7 @@ def run_pipeline(
             for index, src in enumerate(ordered):
                 dest = work_dir / "hold_{:03d}.jpg".format(index)
                 still_from_media(src, dest, work_dir, width, height)
-                stills.append(dest)
+                stills.append(ensure_jpeg_on_disk(dest, (width, height)))
             return stills or prepare_captioned_frames(
                 media_files, pieces or [script], photo_order, font_path, work_dir,
                 direction=direction, width=width, height=height,
@@ -3282,8 +3406,8 @@ def run_pipeline(
                     scene_starts,
                     work_dir,
                 )
-                if Path(mixed).is_file() and Path(mixed).stat().st_size > 1000:
-                    shutil.copy2(str(mixed), str(out_file))
+                if mp4_file_ready(mixed):
+                    os.replace(str(mixed), str(out_file))
             except Exception as exc:
                 print("[안내] VIP 마스터링 생략: {}".format(exc))
         _notify(
