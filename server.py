@@ -49,10 +49,15 @@ from main import (
     fast_blur_slideshow,
     load_settings,
     run_ffmpeg,
+    normalize_aspect_ratio,
     normalize_bgm_mood,
     normalize_camera_motion,
+    normalize_caption_style,
     normalize_speed,
+    normalize_target_duration,
+    normalize_visual_fx,
     parse_flag,
+    pipeline_time_budget,
     resolve_voice,
     run_pipeline,
 )
@@ -258,9 +263,16 @@ def _run_job(
     camera_motion,
     output_height,
     features,
+    target_duration=15,
+    caption_style="hormozi",
+    visual_fx="ken_burns",
+    aspect_ratio="9:16",
+    audio_ducking=True,
 ):
     started = time.time()
-    deadline = started + PIPELINE_HARD_LIMIT
+    target_duration = normalize_target_duration(target_duration)
+    budget = pipeline_time_budget(target_duration)
+    deadline = started + budget
     finished = threading.Event()
     write_lock = threading.Lock()
 
@@ -274,22 +286,22 @@ def _run_job(
             elapsed_sec=round(time.time() - started, 1),
         )
 
-    def _force_blur():
+    def _force_complete():
         if Path(out_file).is_file():
             return
-        work = Path(out_file).parent / "_force_blur"
+        work = Path(out_file).parent / "_force_complete"
         work.mkdir(parents=True, exist_ok=True)
         with write_lock:
             if Path(out_file).is_file():
                 return
-            progress(92, "30초 강제 완성 · 초고속 3초 블러 슬라이드쇼")
-            fast_blur_slideshow(media_files, out_file, work, duration=3.0)
+            progress(92, "{}초 안전 완성 · 균등 슬라이드쇼".format(int(target_duration)))
+            fast_blur_slideshow(media_files, out_file, work, duration=float(target_duration))
 
     def _watchdog():
-        if finished.wait(timeout=max(1.0, PIPELINE_HARD_LIMIT - 5.0)):
+        if finished.wait(timeout=max(1.0, budget - 8.0)):
             return
         try:
-            _force_blur()
+            _force_complete()
         except Exception as exc:
             print("[안내] 강제 완성 워치독 실패: {}".format(exc))
 
@@ -316,21 +328,26 @@ def _run_job(
                 output_height=output_height,
                 fast_mode=not spark_cinema,
                 deadline_ts=deadline,
+                target_duration=target_duration,
+                caption_style=caption_style,
+                visual_fx=visual_fx,
+                aspect_ratio=aspect_ratio,
+                audio_ducking=audio_ducking,
             )
             try:
-                fut.result(timeout=max(4.0, PIPELINE_HARD_LIMIT - 4.0))
+                fut.result(timeout=max(8.0, budget - 6.0))
             except Exception as exc:
                 if not isinstance(exc, TimeoutError):
                     traceback.print_exc()
-                progress(80, "외부 API 대기열 · 초고속 3초 블러 슬라이드쇼로 전환")
+                progress(80, "외부 API 대기열 · {}초 안전 슬라이드쇼로 전환".format(int(target_duration)))
                 try:
-                    _force_blur()
+                    _force_complete()
                 except Exception:
                     print("[안내] 서버 안전장치 폴백 실패: {}".format(exc))
         finally:
             runner.shutdown(wait=False)
         if not Path(out_file).is_file():
-            _force_blur()
+            _force_complete()
         if not Path(out_file).is_file():
             raise RuntimeError("완성된 영상 파일을 찾지 못했습니다.")
         try:
@@ -485,6 +502,11 @@ async def create_video(
     is_spark_cinema: str = Form("false", description="✨ 스파크 시네마 AI"),
     camera_motion: str = Form("zoom_in", description="zoom_in/drone/pan"),
     output_height: str = Form("720", description="720 또는 1080 (프로)"),
+    target_duration: str = Form("15", description="15 / 30 / 60초"),
+    caption_style: str = Form("hormozi", description="hormozi / neon / minimal / variety"),
+    visual_fx: str = Form("ken_burns", description="ken_burns / zoom_punch / cinematic"),
+    aspect_ratio: str = Form("9:16", description="9:16 / 16:9 / 1:1"),
+    audio_ducking: str = Form("true", description="보이스 구간에 BGM 20% 더킹"),
 ):
     prompt = (style or style_prompt or "").strip()
     if not files:
@@ -495,6 +517,11 @@ async def create_video(
     mood = normalize_bgm_mood(bgm_type or bgm_mood)
     spark = parse_flag(is_spark_cinema) or parse_flag(is_runway_mode)
     motion = normalize_camera_motion(camera_motion)
+    duration = normalize_target_duration(target_duration)
+    captions = normalize_caption_style(caption_style)
+    fx = normalize_visual_fx(visual_fx or motion)
+    ratio = normalize_aspect_ratio(aspect_ratio)
+    ducking = parse_flag(audio_ducking) if str(audio_ducking or "").strip() else True
     try:
         height = int(float(output_height or 720))
     except (TypeError, ValueError):
@@ -571,6 +598,11 @@ async def create_video(
         motion,
         height,
         features,
+        duration,
+        captions,
+        fx,
+        ratio,
+        ducking,
     )
     return {
         "job_id": job_id,
@@ -583,6 +615,11 @@ async def create_video(
         "is_runway_mode": spark,
         "camera_motion": motion,
         "output_height": height,
+        "target_duration": duration,
+        "caption_style": captions,
+        "visual_fx": fx,
+        "aspect_ratio": ratio,
+        "audio_ducking": ducking,
         "plan": features.get("plan"),
         "error_code": err_code,
     }

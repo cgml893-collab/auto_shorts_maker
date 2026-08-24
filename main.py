@@ -70,10 +70,15 @@ BLUR_DIM = 0.38
 FAL_I2V_PRIMARY = os.getenv("FAL_I2V_MODEL", "fal-ai/minimax/video-01/image-to-video")
 FAL_I2V_FALLBACK = "fal-ai/kling-video/v1/standard/image-to-video"
 FAL_WAIT_TIMEOUT = 25.0
-PIPELINE_HARD_LIMIT = 30.0
+PIPELINE_HARD_LIMIT = 90.0
 FAST_BLUR_SEC = 3.0
 HD_W = 1080
 HD_H = 1920
+DURATION_TARGETS = {
+    15: {"min_chars": 130, "max_chars": 160, "label": "15초 쇼츠"},
+    30: {"min_chars": 260, "max_chars": 300, "label": "30초 스토리텔링"},
+    60: {"min_chars": 500, "max_chars": 580, "label": "60초 롱쇼츠"},
+}
 CAMERA_MOTIONS = {
     "zoom_in": "[Zoom in] Cinematic slow push-in, natural subtle motion, keep the subject centered, photorealistic.",
     "drone": "[Pedestal up, Tracking shot] Smooth drone-style rise and gentle forward glide over the scene.",
@@ -502,6 +507,187 @@ def normalize_bgm_mood(value):
     return aliases.get(mood, DEFAULT_BGM_MOOD)
 
 
+def normalize_target_duration(value):
+    try:
+        seconds = int(round(float(value)))
+    except (TypeError, ValueError):
+        seconds = 15
+    if seconds >= 50:
+        return 60
+    if seconds >= 22:
+        return 30
+    return 15
+
+
+def pipeline_time_budget(duration):
+    return {15: 90.0, 30: 140.0, 60: 200.0}.get(int(duration), 90.0)
+
+
+def normalize_caption_style(value):
+    key = (value or "hormozi").strip().lower().replace("-", "_").replace(" ", "")
+    aliases = {
+        "hormozi": "hormozi",
+        "호모지": "hormozi",
+        "호르모지": "hormozi",
+        "neon": "neon",
+        "neonpop": "neon",
+        "네온": "neon",
+        "네온팝": "neon",
+        "minimal": "minimal",
+        "미니멀": "minimal",
+        "variety": "variety",
+        "예능": "variety",
+        "예능볼드": "variety",
+    }
+    return aliases.get(key, "hormozi")
+
+
+def normalize_visual_fx(value):
+    key = (value or "ken_burns").strip().lower().replace("-", "_").replace(" ", "")
+    aliases = {
+        "ken_burns": "ken_burns",
+        "kenburns": "ken_burns",
+        "켄번스": "ken_burns",
+        "켄번스무빙": "ken_burns",
+        "zoom_in": "ken_burns",
+        "zoom_punch": "zoom_punch",
+        "zoompunch": "zoom_punch",
+        "다이내믹줌": "zoom_punch",
+        "dynamiczoom": "zoom_punch",
+        "cinematic": "cinematic",
+        "시네마틱": "cinematic",
+        "drone": "cinematic",
+        "pan": "cinematic",
+    }
+    return aliases.get(key, "ken_burns")
+
+
+def normalize_aspect_ratio(value):
+    key = (value or "9:16").strip().lower().replace(" ", "")
+    aliases = {
+        "9:16": "9:16",
+        "9x16": "9:16",
+        "vertical": "9:16",
+        "portrait": "9:16",
+        "세로": "9:16",
+        "16:9": "16:9",
+        "16x9": "16:9",
+        "horizontal": "16:9",
+        "landscape": "16:9",
+        "가로": "16:9",
+        "1:1": "1:1",
+        "1x1": "1:1",
+        "square": "1:1",
+        "정사각": "1:1",
+    }
+    return aliases.get(key, "9:16")
+
+
+def canvas_size(aspect_ratio, output_height=720):
+    aspect = normalize_aspect_ratio(aspect_ratio)
+    hd = int(output_height or 720) >= 1080
+    if aspect == "16:9":
+        return (1920, 1080) if hd else (1280, 720)
+    if aspect == "1:1":
+        return (1080, 1080) if hd else (720, 720)
+    return (1080, 1920) if hd else (720, 1280)
+
+
+def even_scene_durations(count, total):
+    n = max(1, int(count or 1))
+    total = max(1.0, float(total))
+    each = total / float(n)
+    durations = [each] * n
+    durations[-1] = max(0.2, total - sum(durations[:-1]))
+    return durations
+
+
+def visual_fx_filter(style, width, height, fps):
+    w, h, f = int(width), int(height), int(fps or FPS)
+    style = normalize_visual_fx(style)
+    if style == "zoom_punch":
+        zoom = "1.07+0.11*abs(sin(2*PI*on/9))"
+        scale_w, scale_h = w * 2, h * 2
+    elif style == "cinematic":
+        zoom = "min(1.04+on*0.00042,1.13)"
+        scale_w, scale_h = int(w * 1.28), int(h * 1.28)
+    else:
+        zoom = "min(zoom+0.00115,1.16)"
+        scale_w, scale_h = int(w * 1.24), int(h * 1.24)
+    pan_x = "iw/2-(iw/zoom/2)+on*0.16" if style == "cinematic" else "iw/2-(iw/zoom/2)"
+    grade = ",eq=contrast=1.05:saturation=0.93:gamma=0.97" if style == "cinematic" else ""
+    return (
+        "scale={sw}:{sh}:force_original_aspect_ratio=increase,crop={sw}:{sh},"
+        "zoompan=z='{z}':x='{x}':y='ih/2-(ih/zoom/2)':d=1:s={w}x{h}:fps={f}"
+        "{grade},setsar=1,format=yuv420p"
+    ).format(sw=scale_w, sh=scale_h, z=zoom, x=pan_x, w=w, h=h, f=f, grade=grade)
+
+
+def caption_force_style(style, font_path):
+    name = subtitle_font_name(font_path)
+    style = normalize_caption_style(style)
+    if style == "neon":
+        raw = (
+            "FontName={},FontSize=26,Bold=1,PrimaryColour=&H00FF66FF,"
+            "OutlineColour=&H00FF0099,BackColour=&H80000000,BorderStyle=1,"
+            "Outline=3,Shadow=2,Alignment=2,MarginV=56"
+        ).format(name)
+    elif style == "minimal":
+        raw = (
+            "FontName={},FontSize=22,Bold=0,PrimaryColour=&H00FFFFFF,"
+            "OutlineColour=&H00000000,BackColour=&H90000000,BorderStyle=4,"
+            "Outline=0,Shadow=0,Alignment=2,MarginV=52,MarginL=40,MarginR=40"
+        ).format(name)
+    elif style == "variety":
+        raw = (
+            "FontName={},FontSize=30,Bold=1,PrimaryColour=&H00F0F0FF,"
+            "OutlineColour=&H00000000,BackColour=&H00000000,BorderStyle=1,"
+            "Outline=5,Shadow=1,Alignment=2,MarginV=50"
+        ).format(name)
+    else:
+        raw = (
+            "FontName={},FontSize=28,Bold=1,PrimaryColour=&H0000EAFF,"
+            "OutlineColour=&H00000000,BackColour=&H00000000,BorderStyle=1,"
+            "Outline=4,Shadow=0,Alignment=2,MarginV=54"
+        ).format(name)
+    return raw.replace(",", "\\,")
+
+
+def ducking_audio_filter(speed=1.0):
+    tempo = ""
+    if abs(float(speed) - 1.0) > 0.001:
+        tempo = "," + atempo_chain(speed)
+    return (
+        "[1:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo{tempo},asplit=2[voice][sc];"
+        "[2:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo{tempo},volume=0.55[bgm];"
+        "[bgm][sc]sidechaincompress=threshold=0.045:ratio=12:attack=20:release=260:makeup=1:knee=8[dk];"
+        "[voice]volume=1.08[va];"
+        "[va][dk]amix=inputs=2:duration=first:dropout_transition=0[a]"
+    ).format(tempo=tempo)
+
+
+def conform_audio_duration(src, dest, seconds):
+    seconds = max(1.0, float(seconds))
+    dest = Path(dest)
+    run_ffmpeg(
+        [
+            "-i",
+            str(src),
+            "-af",
+            "aresample=44100,apad=pad_dur=240,atrim=0:{:.3f},asetpts=PTS-STARTPTS".format(seconds),
+            "-t",
+            "{:.3f}".format(seconds),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            str(dest),
+        ],
+        timeout=40,
+    )
+    return dest
+
+
 def atempo_chain(speed):
     remaining = float(speed)
     parts = []
@@ -726,10 +912,13 @@ def _peak_window_start(path, duration, window=25.0):
             pass
 
 
-def generate_script(settings, media_files, style_prompt="", direction=None):
+def generate_script(settings, media_files, style_prompt="", direction=None, target_duration=15):
     # type: (Settings, List[Path], str) -> Tuple[str, List[int]]
     print("1) OpenAI(gpt-4o-mini)로 숏폼 나레이션 대본 작성 중...")
     style = (style_prompt or "").strip() or "시선을 사로잡는 빠른 템포의 숏폼"
+    target_duration = normalize_target_duration(target_duration)
+    spec = DURATION_TARGETS[target_duration]
+    min_chars, max_chars = spec["min_chars"], spec["max_chars"]
     guide = ""
     if direction is not None:
         guide = "\n연출 지시: {} / {}".format(direction.tone, direction.script_guide)
@@ -741,10 +930,11 @@ def generate_script(settings, media_files, style_prompt="", direction=None):
         "한국어 나레이션 대본만 작성하세요.\n"
         "영상 스타일/분위기: {}{}\n"
         "이미지 번호: {}\n"
-        "사진이 1장이어도 반드시 15~20초짜리 완성형 스토리로 작성하세요.\n"
+        "목표 길이: {}초 ({})\n"
+        "사진이 1~2장뿐이어도 선택한 길이에 맞는 완성형 3단 스토리텔링으로 작성하세요.\n"
         "규칙:\n"
-        "- 말할 때 15~20초 (공백 제외 150~200자. 짧으면 실패)\n"
-        "- 구성: (1) 첫 3초를 잡는 훅 (2) 감성 분위기·장면 묘사 (3) 여운 있는 마무리\n"
+        "- 말할 때 약 {}초 (공백 제외 {}~{}자. 짧으면 실패)\n"
+        "- 구성: (1) 첫 3초를 잡는 훅 (2) 장면·감정·디테일을 펼치는 본문 (3) 여운 있는 마무리\n"
         "- 지정한 스타일에 맞게 톤과 템포를 맞출 것\n"
         "- 구어체, 짧은 문장을 이어 붙여 호흡 있게\n"
         "- 장면 지시, 이모지, 해시태그, #기호, 영어 태그, 따옴표, 제목 금지\n"
@@ -752,7 +942,7 @@ def generate_script(settings, media_files, style_prompt="", direction=None):
         "- 대본 본문만 먼저 쓰고, 마지막 줄에 사진 배치를 이렇게 적으세요:\n"
         "PHOTO_ORDER: 1,3,2\n"
         "- PHOTO_ORDER는 대본 흐름에 맞게 이미지 번호(1부터)를 의미 있는 순서로 나열. 반복 가능"
-    ).format(style, guide, numbered)
+    ).format(style, guide, numbered, target_duration, spec["label"], target_duration, min_chars, max_chars)
     content = [{"type": "text", "text": prompt}]
 
     attached = 0
@@ -784,7 +974,7 @@ def generate_script(settings, media_files, style_prompt="", direction=None):
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": body}],
             temperature=0.85,
-            max_tokens=700,
+            max_tokens=900 if target_duration <= 15 else (1400 if target_duration <= 30 else 1800),
         )
         raw_text = (response.choices[0].message.content or "").strip()
         raw_text = re.sub(r"^대본\s*[:：]\s*", "", raw_text)
@@ -793,14 +983,18 @@ def generate_script(settings, media_files, style_prompt="", direction=None):
 
     script, order = _ask()
     compact = re.sub(r"\s+", "", script)
-    if len(compact) < 150:
+    if len(compact) < min_chars:
         script, order = _ask(
-            "\n이전 대본이 너무 짧습니다. 공백 제외 150~200자로 훅-묘사-마무리를 다시 쓰세요."
+            "\n이전 대본이 너무 짧습니다. 공백 제외 {}~{}자로 훅-본문-마무리를 다시 쓰세요.".format(
+                min_chars, max_chars
+            )
         )
         compact = re.sub(r"\s+", "", script)
-    if len(compact) < 150:
+    if len(compact) < min_chars:
         script, order = _ask(
-            "\n150자 미만입니다. 첫 3초 훅, 분위기 묘사, 여운 있는 마무리를 넣어 공백 제외 160자 전후로 다시 쓰세요."
+            "\n{}자 미만입니다. 3단 스토리로 공백 제외 {}자 전후의 완성형 대본을 다시 쓰세요.".format(
+                min_chars, (min_chars + max_chars) // 2
+            )
         )
         compact = re.sub(r"\s+", "", script)
     if not script or len(compact) < 80:
@@ -864,7 +1058,6 @@ FFMPEG_ENCODE = [
     "128k",
     "-threads",
     "2",
-    "-shortest",
     "-movflags",
     "+faststart",
 ]
@@ -1042,7 +1235,7 @@ def mux_voice(video_path, voice_path, duration, out_file):
     )
 
 
-def overlay_subtitles(video_path, cues, font_path, out_file, work_dir):
+def overlay_subtitles(video_path, cues, font_path, out_file, work_dir, caption_style="hormozi"):
     if not cues:
         shutil.copy2(str(video_path), str(out_file))
         return out_file
@@ -1052,7 +1245,7 @@ def overlay_subtitles(video_path, cues, font_path, out_file, work_dir):
             "-i",
             str(video_path),
             "-vf",
-            subtitles_vf(srt, font_path),
+            subtitles_vf(srt, font_path, caption_style),
             "-an",
             "-c:v",
             "libx264",
@@ -1268,14 +1461,10 @@ def subtitle_font_name(font_path):
     return "NanumGothic"
 
 
-def subtitles_vf(srt_path, font_path):
+def subtitles_vf(srt_path, font_path, caption_style="hormozi"):
     srt = _ffmpeg_filter_path(srt_path)
     fontsdir = _ffmpeg_filter_path(Path(font_path).resolve().parent)
-    style = (
-        "FontName={},FontSize=20,PrimaryColour=&H0000FFFF,"
-        "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2,MarginV=48"
-    ).format(subtitle_font_name(font_path))
-    style = style.replace(",", "\\,")
+    style = caption_force_style(caption_style, font_path)
     return "subtitles={}:fontsdir={}:force_style='{}'".format(srt, fontsdir, style)
 
 
@@ -1868,23 +2057,34 @@ def ffmpeg_single_pass(
     xfade_sec=XFADE_SEC,
     cues=None,
     font_path=None,
+    width=None,
+    height=None,
+    visual_fx="ken_burns",
+    caption_style="hormozi",
+    audio_ducking=True,
+    target_duration=None,
 ):
     speed = normalize_speed(speed)
     if not frames:
         raise RuntimeError("렌더할 프레임이 없습니다.")
     work_dir = Path(work_dir or Path(frames[0]).parent)
+    width = int(width or TARGET_W)
+    height = int(height or TARGET_H)
     entries = build_slideshow_entries(
         frames, durations, work_dir, speed=speed, xfade_sec=xfade_sec
     )
     concat_path = work_dir / "slides.txt"
     write_concat_list(entries, concat_path)
     total = sum(dur for _png, dur in entries)
+    hold = max(float(target_duration or total), float(total), 1.0)
 
     voice_mp3 = work_dir / "voice.mp3"
     if Path(voice_path).resolve() != voice_mp3.resolve():
         shutil.copy2(str(voice_path), str(voice_mp3))
     else:
         voice_mp3 = Path(voice_path)
+    voice_fit = work_dir / "voice_fit.m4a"
+    conform_audio_duration(voice_mp3, voice_fit, hold)
 
     bgm_mp3 = None
     if bgm_path:
@@ -1904,49 +2104,44 @@ def ffmpeg_single_pass(
             "-framerate",
             str(FPS),
             "-t",
-            "{:.3f}".format(total),
+            "{:.3f}".format(hold),
             "-i",
             str(entries[0][0]),
             "-i",
-            str(voice_mp3),
+            str(voice_fit),
         ]
     else:
-        args = ["-f", "concat", "-safe", "0", "-i", str(concat_path), "-i", str(voice_mp3)]
+        args = ["-f", "concat", "-safe", "0", "-i", str(concat_path), "-i", str(voice_fit)]
 
-    vf = None
+    vf = visual_fx_filter(visual_fx, width, height, FPS)
     if cues and font_path:
         srt = write_cues_srt(cues, work_dir / "subs.srt")
-        vf = subtitles_vf(srt, font_path)
+        vf = "{},{}".format(vf, subtitles_vf(srt, font_path, caption_style))
 
     audio_map = ["-map", "0:v:0", "-map", "1:a:0"]
-    extra = []
+    extra = ["-filter_complex", "[0:v]{}[v]".format(vf)]
+    audio_map = ["-map", "[v]", "-map", "1:a:0"]
     if bgm_mp3 is not None:
         args += ["-i", str(bgm_mp3)]
-        af = "[1:a]volume=1.05[va];[2:a]volume=0.16[ba];[va][ba]amix=inputs=2:duration=first:dropout_transition=0[a]"
-        if abs(speed - 1.0) > 0.001:
-            af = (
-                "[1:a]volume=1.05,{tempo}[va];[2:a]volume=0.16,{tempo}[ba];"
-                "[va][ba]amix=inputs=2:duration=first:dropout_transition=0[a]"
-            ).format(tempo=atempo_chain(speed))
-        if vf:
-            extra = ["-filter_complex", "[0:v]{}[v];{}".format(vf, af)]
-            audio_map = ["-map", "[v]", "-map", "[a]"]
+        if audio_ducking:
+            af = ducking_audio_filter(speed)
         else:
-            extra = ["-filter_complex", af]
-            audio_map = ["-map", "0:v:0", "-map", "[a]"]
+            af = "[1:a]volume=1.05[va];[2:a]volume=0.16[ba];[va][ba]amix=inputs=2:duration=first:dropout_transition=0[a]"
+            if abs(speed - 1.0) > 0.001:
+                af = (
+                    "[1:a]volume=1.05,{tempo}[va];[2:a]volume=0.16,{tempo}[ba];"
+                    "[va][ba]amix=inputs=2:duration=first:dropout_transition=0[a]"
+                ).format(tempo=atempo_chain(speed))
+        extra = ["-filter_complex", "[0:v]{}[v];{}".format(vf, af)]
+        audio_map = ["-map", "[v]", "-map", "[a]"]
     elif abs(speed - 1.0) > 0.001:
-        if vf:
-            extra = ["-filter_complex", "[0:v]{}[v];[1:a]{}[a]".format(vf, atempo_chain(speed))]
-            audio_map = ["-map", "[v]", "-map", "[a]"]
-        else:
-            extra = ["-af", atempo_chain(speed)]
-    elif vf:
-        extra = ["-vf", vf]
+        extra = ["-filter_complex", "[0:v]{}[v];[1:a]{}[a]".format(vf, atempo_chain(speed))]
+        audio_map = ["-map", "[v]", "-map", "[a]"]
 
     args += extra
     args += audio_map
-    args += ["-r", str(FPS)] + FFMPEG_ENCODE + [str(out_file)]
-    run_ffmpeg(args, timeout=min(60, FFMPEG_TIMEOUT))
+    args += ["-t", "{:.3f}".format(hold), "-r", str(FPS)] + FFMPEG_ENCODE + [str(out_file)]
+    run_ffmpeg(args, timeout=max(90, min(int(hold * 5 + 40), 240)))
 
 
 def resolve_bgm(mood, duration, dest):
@@ -2254,7 +2449,7 @@ def ffmpeg_spark_pass(
     srt = write_cues_srt(cues, work_dir / "subs.srt")
     vf = (
         "scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,fps={fps},format=yuv420p,{subs}"
-    ).format(w=width, h=height, fps=FPS, subs=subtitles_vf(srt, font_path))
+    ).format(w=width, h=height, fps=FPS, subs=subtitles_vf(srt, font_path, "hormozi"))
     args = ["-f", "concat", "-safe", "0", "-i", str(list_path), "-i", str(voice_path)]
     maps = ["-map", "[v]", "-map", "1:a:0"]
     extra = ["-filter_complex", "[0:v]{}[v]".format(vf)]
@@ -2262,10 +2457,7 @@ def ffmpeg_spark_pass(
         args += ["-i", str(bgm_path)]
         extra = [
             "-filter_complex",
-            "[0:v]{}[v];[1:a]volume=1.08[va];[2:a]volume=0.22,afade=t=in:st=0:d=0.4,afade=t=out:st={:.2f}:d=0.8[ba];"
-            "[va][ba]amix=inputs=2:duration=first:dropout_transition=0[a]".format(
-                vf, max(0.5, float(audio_duration) - 0.8)
-            ),
+            "[0:v]{}[v];{}".format(vf, ducking_audio_filter(1.0)),
         ]
         maps = ["-map", "[v]", "-map", "[a]"]
     args += extra + maps + FFMPEG_ENCODE + ["-t", "{:.3f}".format(float(audio_duration)), str(out_file)]
@@ -2276,13 +2468,35 @@ def ffmpeg_runway_pass(*args, **kwargs):
     return ffmpeg_spark_pass(*args, **kwargs)
 
 
-def fallback_script(style_prompt=""):
+def fallback_script(style_prompt="", target_duration=15):
     style = sanitize_narration(style_prompt) or "이 장면"
-    text = (
-        "지금 이 장면을 그냥 넘기지 마세요. {}의 공기와 빛이 한순간에 마음을 붙잡습니다. "
-        "가까이 다가갈수록 디테일이 살아나고, 잠깐의 숨이 길게 남아요. "
-        "오늘은 이 순간을 기록하고, 내일의 나에게 따뜻한 여운으로 건넵니다."
-    ).format(style[:24])
+    target_duration = normalize_target_duration(target_duration)
+    hook = "지금 이 장면, 그냥 스치듯 넘기지 마세요. {}의 빛과 공기가 한꺼번에 마음을 붙잡습니다.".format(style[:20])
+    body15 = (
+        "가까이 다가갈수록 디테일이 살아나고 짧은 숨이 길게 남아요. "
+        "오늘은 이 순간을 기록하고 내일의 나에게 따뜻한 여운으로 건넵니다."
+    )
+    body30 = (
+        "가까이 다가갈수록 색과 결이 또렷해지고, 잠깐의 침묵이 이야기를 밀어 올립니다. "
+        "시선이 머무는 자리마다 작은 감정이 쌓이고, 그 감정이 다음 장면을 자연스럽게 엽니다. "
+        "우리는 이 하루를 서둘러 소비하지 않고, 한 컷 한 컷에 이름을 붙여 기억합니다. "
+        "오늘은 이 순간을 기록하고, 내일의 나에게 따뜻한 여운과 선명한 잔상으로 건넵니다."
+    )
+    body60 = (
+        "가까이 다가갈수록 색과 결이 또렷해지고, 작은 흔들림조차 이야기의 호흡이 됩니다. "
+        "시선이 머무는 자리마다 감정이 쌓이고, 그 감정이 다음 장면을 조용히 엽니다. "
+        "서둘러 넘겨 버리기엔 너무 선명한 하루라서, 우리는 한 컷 한 컷에 이름을 붙입니다. "
+        "빛은 잠깐 머물고, 그림자는 더 오래 남고, 그 사이 공간이 사람의 마음을 담습니다. "
+        "멀리서 보면 풍경이고 가까이서 보면 온기입니다. 그 온기가 오늘의 이유를 설명합니다. "
+        "그래서 이 영상은 자랑이 아니라 기록입니다. 지나간 시간을 붙잡는 짧은 편지입니다. "
+        "마지막 컷이 닫혀도 여운은 남습니다. 내일의 나에게, 오늘의 온기를 그대로 전합니다."
+    )
+    if target_duration >= 60:
+        text = hook + " " + body60
+    elif target_duration >= 30:
+        text = hook + " " + body30
+    else:
+        text = hook + " " + body15
     return sanitize_narration(text), []
 
 
@@ -2413,6 +2627,11 @@ def run_pipeline(
     output_height=720,
     fast_mode=True,
     deadline_ts=None,
+    target_duration=15,
+    caption_style="hormozi",
+    visual_fx="ken_burns",
+    aspect_ratio="9:16",
+    audio_ducking=True,
 ):
     if check_license:
         ok, message = verify_saved_license()
@@ -2430,15 +2649,18 @@ def run_pipeline(
     mood = normalize_bgm_mood(bgm_mood)
     spark = bool(is_spark_cinema) if is_spark_cinema is not None else bool(is_runway_mode)
     motion = normalize_camera_motion(camera_motion)
-    height = HD_H if int(output_height or 720) >= 1080 else TARGET_H
-    width = HD_W if height == HD_H else TARGET_W
+    target_duration = normalize_target_duration(target_duration)
+    caption_style = normalize_caption_style(caption_style)
+    visual_fx = normalize_visual_fx(visual_fx or motion)
+    aspect_ratio = normalize_aspect_ratio(aspect_ratio)
+    width, height = canvas_size(aspect_ratio, output_height)
     if spark and mood == "none":
         mood = "lofi"
     voice_key, _voice_id, _preset = resolve_voice(voice_type)
     progress_lock = threading.Lock()
     used_fallback = False
     if deadline_ts is None:
-        deadline_ts = time.time() + PIPELINE_HARD_LIMIT
+        deadline_ts = time.time() + pipeline_time_budget(target_duration)
 
     def _left():
         return float(deadline_ts) - time.time()
@@ -2487,19 +2709,39 @@ def run_pipeline(
             if _left() < 14:
                 raise RuntimeError("잔여시간 부족")
             script, photo_order = generate_script(
-                settings, media_files, style_prompt=style_prompt, direction=direction
+                settings,
+                media_files,
+                style_prompt=style_prompt,
+                direction=direction,
+                target_duration=target_duration,
             )
         except Exception as exc:
             print("[안내] 대본 API 실패, 로컬 스토리로 폴백: {}".format(exc))
-            script, photo_order = fallback_script(style_prompt)
+            script, photo_order = fallback_script(style_prompt, target_duration=target_duration)
             used_fallback = True
         script = sanitize_narration(script)
         pieces = split_script_pieces(script)
         _notify(progress_cb, 24, "대본 완료 · 음성 합성과 사진 보정을 동시에 시작", progress_lock)
 
+        def _hold_frames():
+            ordered = list(media_files)
+            if photo_order:
+                cycle = [media_files[i] for i in photo_order if 0 <= i < len(media_files)]
+                if cycle:
+                    ordered = cycle
+            stills = []
+            for index, src in enumerate(ordered):
+                dest = work_dir / "hold_{:03d}.jpg".format(index)
+                still_from_media(src, dest, work_dir, width, height)
+                stills.append(dest)
+            return stills or prepare_captioned_frames(
+                media_files, pieces or [script], photo_order, font_path, work_dir,
+                direction=direction, width=width, height=height,
+            )
+
         def _voice_job():
             _notify(progress_cb, 28, "ElevenLabs 음성 합성 중", progress_lock)
-            path = ensure_voice_track(settings, script, voice_file, voice_key)
+            path = ensure_voice_track(settings, script, voice_file, voice_key, duration=float(target_duration))
             _notify(progress_cb, 56, "음성 생성 완료", progress_lock)
             return path
 
@@ -2517,22 +2759,10 @@ def run_pipeline(
                         height=height,
                     )
                 except Exception as exc:
-                    print("[안내] 스파크 시네마 실패, 블러 렌더로 전환: {}".format(exc))
+                    print("[안내] 스파크 시네마 실패, 사진 홀드 렌더로 전환: {}".format(exc))
                     return None
-            if spark:
-                print("[안내] 잔여시간 부족 · fal.ai 생략, 초고속 블러 전환")
-                return None
-            _notify(progress_cb, 30, "EXIF 회전 보정 및 720x1280 리사이즈 병렬 처리 중", progress_lock)
-            frames = prepare_captioned_frames(
-                media_files,
-                pieces,
-                photo_order,
-                font_path,
-                work_dir,
-                direction=direction,
-                width=width,
-                height=height,
-            )
+            _notify(progress_cb, 30, "사진 노출 균등 배분 및 리사이즈 중", progress_lock)
+            frames = _hold_frames()
             _notify(progress_cb, 52, "장면 프레임 준비 완료", progress_lock)
             return frames
 
@@ -2540,84 +2770,89 @@ def run_pipeline(
             voice_fut = pool.submit(_voice_job)
             frame_fut = pool.submit(_frame_job)
             try:
-                voice_path = voice_fut.result(timeout=max(4.0, min(18.0, _left() - 7)))
+                voice_path = voice_fut.result(timeout=max(8.0, min(40.0, _left() - 8)))
             except Exception as exc:
                 print("[안내] 음성 대기 중단: {}".format(exc))
-                voice_path = ensure_voice_track(settings, script, voice_file, voice_key, duration=FAST_BLUR_SEC)
+                voice_path = ensure_voice_track(
+                    settings, script, voice_file, voice_key, duration=float(target_duration)
+                )
             try:
-                generated = frame_fut.result(timeout=max(3.0, min(FAL_WAIT_TIMEOUT + 1, _left() - 6)))
+                generated = frame_fut.result(timeout=max(6.0, min(FAL_WAIT_TIMEOUT + 1, _left() - 6)))
             except Exception as exc:
                 print("[안내] 영상 생성 대기 중단: {}".format(exc))
                 generated = None
 
-        if _left() < 7 or not generated:
-            _notify(progress_cb, 85, "초고속 3초 블러 슬라이드쇼 엔진", progress_lock)
-            fast_blur_slideshow(media_files, out_file, work_dir, voice_path=voice_path, duration=FAST_BLUR_SEC)
-            used_fallback = True
+        if not generated:
+            generated = _hold_frames()
+        voice_fit = work_dir / "voice_target.m4a"
+        try:
+            voice_path = conform_audio_duration(voice_path or voice_file, voice_fit, target_duration)
+        except Exception as exc:
+            print("[안내] 음성 길이 보정 실패: {}".format(exc))
+        audio_duration = float(target_duration)
+        cues = split_script_cues(script, audio_duration)
+        hold_frames = generated if generated else _hold_frames()
+        if spark and generated and str(generated[0]).lower().endswith((".mp4", ".mov", ".webm", ".m4v")):
+            durations = even_scene_durations(len(generated), audio_duration)
         else:
-            try:
-                audio_duration = probe_duration(voice_path)
-            except Exception:
-                audio_duration = FAST_BLUR_SEC
-            if audio_duration < 1:
-                audio_duration = FAST_BLUR_SEC
-            cues = split_script_cues(script, audio_duration)
-            durations = [max(0.2, float(end) - float(start)) for _text, start, end in cues]
-            _notify(progress_cb, 68, "BGM 준비 중", progress_lock)
-            try:
-                bgm_path = resolve_bgm(mood, audio_duration, work_dir / "bgm.wav")
-            except Exception:
-                bgm_path = None
+            hold_frames = _hold_frames()
+            durations = even_scene_durations(len(hold_frames), audio_duration)
+        _notify(progress_cb, 68, "BGM 준비 중", progress_lock)
+        try:
+            bgm_path = resolve_bgm(mood, audio_duration, work_dir / "bgm.wav")
+        except Exception:
+            bgm_path = None
 
-            spark_clips = generated if spark and generated else None
-            try:
-                if spark_clips and _left() >= 8:
-                    if mood == "none":
-                        bgm_path = resolve_bgm("lofi", audio_duration, work_dir / "bgm.wav")
-                    _notify(progress_cb, 78, "✨ 스파크 시네마 · 음성·BGM·자막 단일 패스 합성", progress_lock)
-                    ffmpeg_spark_pass(
-                        spark_clips,
-                        durations,
-                        cues,
-                        font_path,
-                        direction,
-                        voice_path,
-                        bgm_path,
-                        out_file,
-                        work_dir,
-                        audio_duration,
-                        width=width,
-                        height=height,
-                    )
-                else:
-                    frames = generated
-                    if not frames or _left() < 8:
-                        raise RuntimeError("프레임 준비 실패 또는 시간 부족")
-                    if len(durations) != len(frames):
-                        n = min(len(durations), len(frames))
-                        frames = frames[:n]
-                        durations = durations[:n]
-                    print("   음성 길이: {:.2f}초 / 배속 {}x / BGM {} / xfade {:.2f}".format(
-                        audio_duration, speed, mood, direction.xfade
-                    ))
-                    _notify(progress_cb, 76, "단일 패스 초고속 렌더링 중", progress_lock)
-                    ffmpeg_single_pass(
-                        frames,
-                        durations,
-                        voice_path,
-                        bgm_path,
-                        out_file,
-                        speed=speed,
-                        work_dir=work_dir,
-                        xfade_sec=0.12 if fast_mode and not spark else direction.xfade,
-                        cues=cues,
-                        font_path=font_path,
-                    )
-            except Exception as exc:
-                print("[안내] 렌더 실패, 초고속 블러 폴백: {}".format(exc))
-                used_fallback = True
-                _notify(progress_cb, 80, "외부 API 지연 · 초고속 3초 블러 슬라이드쇼", progress_lock)
-                fast_blur_slideshow(media_files, out_file, work_dir, voice_path=voice_path, duration=FAST_BLUR_SEC)
+        spark_clips = generated if spark and generated and str(generated[0]).lower().endswith(".mp4") else None
+        try:
+            if spark_clips and _left() >= 8:
+                if mood == "none":
+                    bgm_path = resolve_bgm("lofi", audio_duration, work_dir / "bgm.wav")
+                _notify(progress_cb, 78, "✨ 스파크 시네마 · 음성·BGM·자막 단일 패스 합성", progress_lock)
+                ffmpeg_spark_pass(
+                    spark_clips,
+                    durations,
+                    cues,
+                    font_path,
+                    direction,
+                    voice_path,
+                    bgm_path,
+                    out_file,
+                    work_dir,
+                    audio_duration,
+                    width=width,
+                    height=height,
+                )
+            else:
+                print("   목표 길이: {:.2f}초 / 사진 {}장 균등 배분 / 배속 {}x / BGM {}".format(
+                    audio_duration, len(hold_frames), speed, mood
+                ))
+                _notify(progress_cb, 76, "{}초 전문 편집 렌더링 중".format(int(target_duration)), progress_lock)
+                ffmpeg_single_pass(
+                    hold_frames,
+                    durations,
+                    voice_path,
+                    bgm_path,
+                    out_file,
+                    speed=speed,
+                    work_dir=work_dir,
+                    xfade_sec=0.12 if fast_mode and not spark else direction.xfade,
+                    cues=cues,
+                    font_path=font_path,
+                    width=width,
+                    height=height,
+                    visual_fx=visual_fx,
+                    caption_style=caption_style,
+                    audio_ducking=bool(audio_ducking),
+                    target_duration=audio_duration,
+                )
+        except Exception as exc:
+            print("[안내] 렌더 실패, 목표 길이 슬라이드 폴백: {}".format(exc))
+            used_fallback = True
+            _notify(progress_cb, 80, "{}초 안전 슬라이드쇼로 전환".format(int(target_duration)), progress_lock)
+            fast_blur_slideshow(
+                media_files, out_file, work_dir, voice_path=voice_path, duration=float(target_duration)
+            )
 
         if not Path(out_file).is_file():
             raise RuntimeError("완성된 영상 파일을 찾지 못했습니다.")
@@ -2631,10 +2866,10 @@ def run_pipeline(
         print("[안내] 파이프라인 예외, 최종 블러 폴백(프로세스 유지): {}".format(exc))
         used_fallback = True
         if not script:
-            script, _order = fallback_script(style_prompt)
+            script, _order = fallback_script(style_prompt, target_duration=target_duration)
             script = sanitize_narration(script)
         try:
-            fast_blur_slideshow(media_files, out_file, work_dir, voice_path=voice_path, duration=FAST_BLUR_SEC)
+            fast_blur_slideshow(media_files, out_file, work_dir, voice_path=voice_path, duration=float(target_duration))
         except Exception as inner:
             print("[안내] 최종 폴백 실패: {}".format(inner))
             raise

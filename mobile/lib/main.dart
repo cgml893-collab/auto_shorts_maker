@@ -109,6 +109,10 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
   bool _analyzing = false;
   bool _sparkCinema = false;
   String _cameraMotion = 'zoom_in';
+  int _targetDuration = 15;
+  String _aspectRatio = '9:16';
+  String _captionStyle = 'hormozi';
+  String _visualFx = 'ken_burns';
   File? _resultVideo;
   VideoPlayerController? _player;
   String _plan = 'free';
@@ -672,6 +676,11 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
           req.fields['is_runway_mode'] = _sparkCinema ? 'true' : 'false';
           req.fields['camera_motion'] = _cameraMotion;
           req.fields['output_height'] = _plan == 'pro' ? '1080' : '720';
+          req.fields['target_duration'] = '$_targetDuration';
+          req.fields['caption_style'] = _captionStyle;
+          req.fields['visual_fx'] = _visualFx;
+          req.fields['aspect_ratio'] = _aspectRatio;
+          req.fields['audio_ducking'] = 'true';
           for (final file in _media) {
             req.files.add(
               await http.MultipartFile.fromPath(
@@ -946,7 +955,7 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
                   const _Hero(
                     badge: 'YouTube Shorts · Instagram Reels',
                     title: 'ClipSpark AI',
-                    subtitle: '사진만 올려도 15~20초 완성형 스토리와 세로 릴스를 만듭니다.',
+                    subtitle: '사진만 올려도 15·30·60초 완성형 스토리와 전문 편집 릴스를 만듭니다.',
                   ),
                   const SizedBox(height: 16),
                   _MembershipBar(
@@ -1073,6 +1082,51 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
                     ),
                   ),
                   const SizedBox(height: 18),
+                  _EditorCard(
+                    title: '영상 길이',
+                    options: const [
+                      _Option('15', '15초 (쇼츠 기본)'),
+                      _Option('30', '30초 (스토리텔링)'),
+                      _Option('60', '60초 (롱쇼츠)'),
+                    ],
+                    value: '$_targetDuration',
+                    onChanged: (v) => setState(() => _targetDuration = int.parse(v)),
+                  ),
+                  const SizedBox(height: 12),
+                  _EditorCard(
+                    title: '화면 비율',
+                    options: const [
+                      _Option('9:16', '📱 9:16 세로'),
+                      _Option('16:9', '🖥️ 16:9 가로'),
+                      _Option('1:1', '⏹️ 1:1 정사각'),
+                    ],
+                    value: _aspectRatio,
+                    onChanged: (v) => setState(() => _aspectRatio = v),
+                  ),
+                  const SizedBox(height: 12),
+                  _EditorCard(
+                    title: '자막 스타일',
+                    options: const [
+                      _Option('hormozi', '🔥 호르모지'),
+                      _Option('neon', '✨ 네온 팝'),
+                      _Option('minimal', '🤍 미니멀'),
+                      _Option('variety', '🎭 예능'),
+                    ],
+                    value: _captionStyle,
+                    onChanged: (v) => setState(() => _captionStyle = v),
+                  ),
+                  const SizedBox(height: 12),
+                  _EditorCard(
+                    title: '화면 연출',
+                    options: const [
+                      _Option('ken_burns', '🎬 켄 번스 무빙'),
+                      _Option('zoom_punch', '⚡ 다이내믹 줌'),
+                      _Option('cinematic', '🎞️ 시네마틱'),
+                    ],
+                    value: _visualFx,
+                    onChanged: (v) => setState(() => _visualFx = v),
+                  ),
+                  const SizedBox(height: 18),
                   _DropdownField(
                     label: '3. 목소리',
                     value: _voiceType,
@@ -1110,7 +1164,11 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
                     ClipRRect(
                       borderRadius: BorderRadius.circular(18),
                       child: AspectRatio(
-                        aspectRatio: 9 / 16,
+                        aspectRatio: _aspectRatio == '16:9'
+                            ? 16 / 9
+                            : _aspectRatio == '1:1'
+                                ? 1
+                                : 9 / 16,
                         child: Stack(
                           alignment: Alignment.center,
                           children: [
@@ -1330,6 +1388,41 @@ class _OptionWrap extends StatelessWidget {
           showCheckmark: false,
         );
       }).toList(),
+    );
+  }
+}
+
+class _EditorCard extends StatelessWidget {
+  const _EditorCard({
+    required this.title,
+    required this.options,
+    required this.value,
+    required this.onChanged,
+  });
+
+  final String title;
+  final List<_Option> options;
+  final String value;
+  final ValueChanged<String> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+      decoration: BoxDecoration(
+        color: const Color(0x331A1028),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(title, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
+          const SizedBox(height: 10),
+          _OptionWrap(options: options, value: value, onChanged: onChanged),
+        ],
+      ),
     );
   }
 }
