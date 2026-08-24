@@ -2768,6 +2768,41 @@ def _fal_data_uri(image_path):
     return "data:image/jpeg;base64,{}".format(base64.b64encode(raw).decode("ascii"))
 
 
+_FAL_BILLING_LOCK = threading.Lock()
+_FAL_BILLING_DEAD = False
+
+
+def reset_fal_billing_flag():
+    global _FAL_BILLING_DEAD
+    with _FAL_BILLING_LOCK:
+        _FAL_BILLING_DEAD = False
+
+
+def _fal_billing_dead():
+    with _FAL_BILLING_LOCK:
+        return _FAL_BILLING_DEAD
+
+
+def _mark_fal_billing_dead():
+    global _FAL_BILLING_DEAD
+    with _FAL_BILLING_LOCK:
+        _FAL_BILLING_DEAD = True
+
+
+def _fal_is_billing_error(exc):
+    text = str(exc or "").lower()
+    return any(
+        token in text
+        for token in (
+            "exhausted balance",
+            "user is locked",
+            "top up your balance",
+            "payment required",
+            "insufficient credits",
+        )
+    )
+
+
 def _fal_queue_subscribe(model, payload, timeout=90):
     key = (os.getenv("FAL_KEY") or "").strip()
     if not key:
@@ -2808,6 +2843,8 @@ def fal_image_to_video(image_path, prompt, dest_mp4, timeout=None, models=None, 
     motion_intensity = normalize_motion_intensity(motion_intensity)
     models = tuple(models or (FAL_I2V_PRIMARY, FAL_I2V_FALLBACK, FAL_I2V_FAST))
     deadline = time.time() + timeout
+    if _fal_billing_dead():
+        raise RuntimeError("fal 잔액 부족 · 켄 번스 폴백")
     try:
         try:
             import fal_client
@@ -2856,12 +2893,15 @@ def fal_image_to_video(image_path, prompt, dest_mp4, timeout=None, models=None, 
                     payload["prompt"] = prompt
                 else:
                     payload["prompt_optimizer"] = True
-                result = None
-                if fal_client is not None and left > 8:
+                    result = None
+                if fal_client is not None and left > 8 and not _fal_billing_dead():
                     try:
                         result = fal_client.subscribe(model, arguments=payload, with_logs=False)
                     except Exception as exc:
                         print("[안내] fal subscribe 실패, queue API 재시도: {}".format(exc), flush=True)
+                        if _fal_is_billing_error(exc):
+                            _mark_fal_billing_dead()
+                            raise RuntimeError("fal 잔액 부족: {}".format(exc))
                 if result is None:
                     result = _fal_queue_subscribe(model, payload, timeout=max(4.0, left - 2.0))
                 url = _fal_video_url(result)
@@ -2873,6 +2913,9 @@ def fal_image_to_video(image_path, prompt, dest_mp4, timeout=None, models=None, 
             except Exception as exc:
                 last_error = exc
                 print("[안내] {} 실패: {}".format(model, exc), flush=True)
+                if _fal_is_billing_error(exc):
+                    _mark_fal_billing_dead()
+                    raise RuntimeError("fal 잔액 부족: {}".format(exc))
         raise RuntimeError("Image-to-Video 생성 실패: {}".format(last_error))
     except Exception as exc:
         print("[안내] fal.ai 전체 실패(프로세스 유지): {}".format(exc))
@@ -3259,54 +3302,72 @@ def burn_kinetic_captions(video_path, script, duration, font_path, out_file, wor
         return Path(out_file)
 
 
-def pillow_ken_burns_sequence(src_jpg, work_dir, count=3, duration=5.0, width=None, height=None, intensity=7):
+def salvage_motion_clips(work_dir):
+    work_dir = Path(work_dir)
+    found = []
+    for pattern in ("i2v_*.mp4", "kb_*.mp4", "temp_render_kb_*.mp4", "temp_render_i2v_*.mp4"):
+        found.extend(sorted(work_dir.glob(pattern)))
+    clips = []
+    seen = set()
+    for path in found:
+        if "temp_render_final" in path.name:
+            continue
+        if not path.is_file() or path.stat().st_size < 1000:
+            continue
+        key = path.resolve()
+        if key in seen:
+            continue
+        if not _is_motion_clip(path):
+            continue
+        seen.add(key)
+        clips.append(path)
+    return clips
+
+
+def ffmpeg_ken_burns_sequence(src_jpg, work_dir, count=3, duration=5.0, width=None, height=None, intensity=7):
+    """정지 컷을 한 번의 FFmpeg crop 이동으로 움직이게 만든다. JPEG 시퀀스는 쓰지 않는다."""
     width = int(width or TARGET_W)
     height = int(height or TARGET_H)
+    width -= width % 2
+    height -= height % 2
     intensity = normalize_motion_intensity(intensity)
     count = max(1, int(count or 1))
+    duration = max(2.0, float(duration))
     fps = STILL_FPS
-    n_frames = max(8, int(round(float(duration) * fps)))
-    src = Image.open(src_jpg).convert("RGB")
-    if src.size != (width, height):
-        src = src.resize((width, height), _lanczos())
-    paths = (
-        (0.50, 0.42, 0.50, 0.36, 1.00, 1.16),
-        (0.42, 0.50, 0.58, 0.46, 1.06, 1.20),
-        (0.52, 0.40, 0.48, 0.48, 1.08, 1.18),
+    frames = max(24, int(round(duration * fps)))
+    zoom = 1.12 + 0.04 * (intensity - 6)
+    sw = int(round(width * zoom))
+    sh = int(round(height * zoom))
+    sw += sw % 2
+    sh += sh % 2
+    crops = (
+        "(iw-ow)*on/{n}:(ih-oh)*on/{n}*0.45",
+        "(iw-ow)*(1-on/{n}):(ih-oh)*0.42",
+        "(iw-ow)*0.5:(ih-oh)*(1-on/{n})",
     )
     clips = []
-    zoom_span = 0.08 * (intensity / 7.0)
+    src = Path(src_jpg)
     for index in range(count):
-        x0, y0, x1, y1, z0, z1 = paths[index % len(paths)]
-        z1 = z0 + (z1 - z0) + zoom_span
-        frame_dir = Path(work_dir) / ("kb_{:02d}".format(index + 1))
-        frame_dir.mkdir(parents=True, exist_ok=True)
-        for f in range(n_frames):
-            t = f / float(max(1, n_frames - 1))
-            zoom = z0 + (z1 - z0) * t
-            cx = x0 + (x1 - x0) * t
-            cy = y0 + (y1 - y0) * t
-            zw = max(2, int(round(width / zoom)))
-            zh = max(2, int(round(height / zoom)))
-            zw -= zw % 2
-            zh -= zh % 2
-            x = int(max(0, min(width - zw, round(cx * (width - zw)))))
-            y = int(max(0, min(height - zh, round(cy * (height - zh)))))
-            crop = src.crop((x, y, x + zw, y + zh)).resize((width, height), _lanczos())
-            crop.save(str(frame_dir / "f{:04d}.jpg".format(f)), "JPEG", quality=82, subsampling=2)
-            crop.close()
         dest = Path(work_dir) / ("kb_{:02d}.mp4".format(index + 1))
+        xy = crops[index % len(crops)].format(n=max(1, frames - 1))
+        vf = (
+            "scale={sw}:{sh}:flags=fast_bilinear,"
+            "crop={w}:{h}:{xy},"
+            "setsar=1,fps={fps},format=yuv420p"
+        ).format(sw=sw, sh=sh, w=width, h=height, xy=xy, fps=fps)
         run_ffmpeg(
             [
+                "-loop",
+                "1",
                 "-framerate",
                 str(fps),
+                "-t",
+                "{:.3f}".format(duration),
                 "-i",
-                str(frame_dir / "f%04d.jpg"),
+                str(src),
                 "-an",
                 "-vf",
-                "scale={w}:{h}:flags=fast_bilinear,setsar=1,fps={fps},format=yuv420p".format(
-                    w=width, h=height, fps=fps
-                ),
+                vf,
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -3319,12 +3380,23 @@ def pillow_ken_burns_sequence(src_jpg, work_dir, count=3, duration=5.0, width=No
                 "+faststart",
                 str(dest),
             ],
-            timeout=40,
+            timeout=25,
         )
         if dest.is_file() and dest.stat().st_size > 1000:
             clips.append(dest)
-    src.close()
     return clips
+
+
+def pillow_ken_burns_sequence(src_jpg, work_dir, count=3, duration=5.0, width=None, height=None, intensity=7):
+    return ffmpeg_ken_burns_sequence(
+        src_jpg,
+        work_dir,
+        count=count,
+        duration=duration,
+        width=width,
+        height=height,
+        intensity=intensity,
+    )
 
 
 def generate_spark_cinema_clips(
@@ -3345,6 +3417,7 @@ def generate_spark_cinema_clips(
     width = int(width or TARGET_W)
     height = int(height or TARGET_H)
     motion_intensity = normalize_motion_intensity(motion_intensity)
+    reset_fal_billing_flag()
     job_dir = Path(job_dir) if job_dir else Path(work_dir).parent
     hero = i2v_hero_source(media_files, job_dir)
     if hero is None:
@@ -3936,12 +4009,35 @@ def run_pipeline(
                     settings, script, voice_file, voice_key, duration=float(target_duration)
                 )
             try:
-                i2v_wait = 55.0 if (vip or spark) else 20.0
-                generated = frame_fut.result(timeout=max(12.0, min(i2v_wait, max(12.0, _left() - 8))))
+                i2v_wait = 70.0 if (vip or spark) else 20.0
+                generated = frame_fut.result(timeout=max(12.0, min(i2v_wait, max(12.0, _left() - 5))))
             except Exception as exc:
-                print("[안내] 영상 생성 대기 중단: {}".format(exc))
-                generated = None
+                print("[안내] 영상 생성 대기 중단: {}".format(exc), flush=True)
+                generated = salvage_motion_clips(work_dir)
 
+        if spark:
+            motion_ready = []
+            if generated and _is_motion_clip(generated[0]):
+                motion_ready = [Path(p) for p in generated if _is_motion_clip(p)]
+            if not motion_ready:
+                motion_ready = salvage_motion_clips(work_dir)
+            if not motion_ready:
+                src = out_file.parent / "i2v_source.jpg"
+                if not src.is_file():
+                    frames = _hold_frames()
+                    src = frames[0] if frames else None
+                if src is not None:
+                    print("[안내] 스파크 모션 클립 복구 · FFmpeg 켄 번스", flush=True)
+                    motion_ready = ffmpeg_ken_burns_sequence(
+                        src,
+                        work_dir,
+                        count=3 if int(target_duration) >= 15 else 1,
+                        duration=SPARK_CLIP_SEC,
+                        width=width,
+                        height=height,
+                        intensity=motion_intensity,
+                    )
+            generated = motion_ready or generated
         if not generated:
             generated = _hold_frames()
         voice_fit = work_dir / "voice_target.m4a"
@@ -3967,7 +4063,7 @@ def run_pipeline(
 
         spark_clips = spark_clips if spark else None
         try:
-            if spark_clips and _left() >= 8:
+            if spark_clips:
                 if mood == "none":
                     bgm_path = resolve_bgm("lofi", audio_duration, work_dir / "bgm.wav")
                 _notify(progress_cb, 78, "✨ 스파크 시네마 · 음성·BGM 단일 패스 합성", progress_lock)
