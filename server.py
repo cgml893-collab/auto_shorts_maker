@@ -569,8 +569,10 @@ async def create_video(
     action_motion_enabled: str = Form("false", description="다이내믹 액션 모션"),
     action_style: str = Form("", description="액션 직접 입력"),
     action_preset: str = Form("", description="bike_stunt/dance/dynamic/sprint"),
+    subject_motion: str = Form("", description="피사체 동작 지정"),
 ):
     prompt = (style or style_prompt or "").strip()
+    action_style = (action_style or subject_motion or "").strip()
     if not files:
         raise HTTPException(status_code=400, detail="사진 또는 동영상을 한 개 이상 업로드해 주세요.")
 
@@ -585,7 +587,7 @@ async def create_video(
     ratio = normalize_aspect_ratio(aspect_ratio)
     ducking = parse_flag(audio_ducking) if str(audio_ducking or "").strip() else True
     vip = parse_flag(is_vip_mode)
-    action_on = parse_flag(action_motion_enabled) or bool((action_style or action_preset or "").strip())
+    action_on = parse_flag(action_motion_enabled)
     try:
         height = int(float(output_height or 720))
     except (TypeError, ValueError):

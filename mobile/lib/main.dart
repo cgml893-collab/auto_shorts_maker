@@ -113,8 +113,8 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
   String _aspectRatio = '9:16';
   String _captionStyle = 'hormozi';
   String _visualFx = 'ken_burns';
-  bool _actionMotion = true;
-  String _actionPreset = 'bike_stunt';
+  bool _actionMotion = false;
+  String _actionPreset = 'natural';
   final _actionCtrl = TextEditingController();
   File? _resultVideo;
   VideoPlayerController? _player;
@@ -680,10 +680,11 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
           req.fields['bgm_mood'] = _bgmMood;
           req.fields['is_spark_cinema'] = _sparkCinema ? 'true' : 'false';
           req.fields['is_runway_mode'] = _sparkCinema ? 'true' : 'false';
-          req.fields['is_vip_mode'] = _sparkCinema ? 'true' : 'false';
+          req.fields['is_vip_mode'] = (_sparkCinema && _actionMotion) ? 'true' : 'false';
           req.fields['action_motion_enabled'] = (_sparkCinema && _actionMotion) ? 'true' : 'false';
-          req.fields['action_preset'] = _sparkCinema ? _actionPreset : '';
+          req.fields['action_preset'] = (_sparkCinema && _actionPreset != 'natural') ? _actionPreset : '';
           req.fields['action_style'] = _sparkCinema ? _actionCtrl.text.trim() : '';
+          req.fields['subject_motion'] = _sparkCinema ? _actionCtrl.text.trim() : '';
           req.fields['camera_motion'] = _cameraMotion;
           req.fields['output_height'] = _plan == 'pro' ? '1080' : '720';
           req.fields['target_duration'] = '$_targetDuration';
@@ -1017,22 +1018,38 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           const Text(
-                            'VIP 시네마 스튜디오',
+                            '✨ 스파크 시네마 AI',
                             style: TextStyle(color: Color(0xFFE8C872), fontWeight: FontWeight.w800, fontSize: 15),
                           ),
-                          const SizedBox(height: 8),
+                          const SizedBox(height: 6),
+                          const Text(
+                            '사진을 분석해 피사체가 실제로 움직이는 5초 Image-to-Video를 만들고, 나레이션·BGM과 한 번에 합성합니다.',
+                            style: TextStyle(color: Color(0xCCFFFFFF), fontSize: 12.5, height: 1.35),
+                          ),
+                          const SizedBox(height: 12),
+                          const _Label('🎯 피사체 동작 지정'),
+                          TextField(
+                            controller: _actionCtrl,
+                            minLines: 1,
+                            maxLines: 2,
+                            decoration: const InputDecoration(
+                              hintText: '예: 앞으로 질주하기, 손 흔들기, 카메라 바라보기',
+                            ),
+                          ),
+                          const SizedBox(height: 12),
                           SwitchListTile.adaptive(
                             contentPadding: EdgeInsets.zero,
-                            title: const Text('🔥 다이내믹 액션 모션'),
-                            subtitle: const Text('사진 속 피사체가 액션을 수행하는 I2V'),
+                            title: const Text('🔥 다이내믹 액션 SFX'),
+                            subtitle: const Text('엔진·임팩트 효과음 (선택)'),
                             value: _actionMotion,
                             activeThumbColor: const Color(0xFFD4AF37),
                             onChanged: (v) => setState(() => _actionMotion = v),
                           ),
                           const SizedBox(height: 6),
-                          const _Label('액션 프리셋'),
+                          const _Label('액션 프리셋 (선택)'),
                           _OptionWrap(
                             options: const [
+                              _Option('natural', '🎯 자동 (사진 분석)'),
                               _Option('bike_stunt', '🏍️ 바이크 묘기/질주'),
                               _Option('dance', '💃 댄스/모션'),
                               _Option('dynamic', '⚡ 다이내믹 액션'),
@@ -1040,15 +1057,6 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
                             ],
                             value: _actionPreset,
                             onChanged: (v) => setState(() => _actionPreset = v),
-                          ),
-                          const SizedBox(height: 12),
-                          TextField(
-                            controller: _actionCtrl,
-                            minLines: 1,
-                            maxLines: 2,
-                            decoration: const InputDecoration(
-                              hintText: '액션 직접 입력 (예: 오토바이 앞바퀴 들고 묘기)',
-                            ),
                           ),
                           const SizedBox(height: 12),
                           const _Label('카메라 모션'),
