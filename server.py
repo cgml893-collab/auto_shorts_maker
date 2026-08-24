@@ -48,7 +48,6 @@ from main import (
     diet_image_file,
     fast_blur_slideshow,
     load_settings,
-    mp4_file_ready,
     normalize_aspect_ratio,
     normalize_bgm_mood,
     normalize_camera_motion,
@@ -215,10 +214,37 @@ def _cleanup_after_download(job_dir):
     _release_memory()
 
 
+def _output_valid(path):
+    try:
+        target = Path(path)
+        return target.is_file() and target.stat().st_size >= 32
+    except OSError:
+        return False
+
+
+def _job_mp4_path(job):
+    candidates = []
+    raw = (job or {}).get("output")
+    if raw:
+        candidates.append(Path(raw))
+    job_id = (job or {}).get("job_id")
+    if job_id:
+        candidates.append(JOBS_DIR / str(job_id) / "final_shorts.mp4")
+    for path in candidates:
+        if _output_valid(path):
+            return path
+    return candidates[0] if candidates else None
+
+
 def _update_job(job_id, **fields):
     with JOBS_LOCK:
-        if job_id in JOBS:
-            JOBS[job_id].update(fields)
+        job = JOBS.get(job_id)
+        if job is None:
+            JOBS[job_id] = {"job_id": job_id}
+            job = JOBS[job_id]
+        if job.get("status") == "completed" and fields.get("status") == "processing":
+            return
+        job.update(fields)
     _persist_job(job_id)
 
 
@@ -269,27 +295,48 @@ def _run_job(
     finished = threading.Event()
     write_lock = threading.Lock()
 
+    def _mark_completed(final_output_path=None):
+        final_output_path = Path(final_output_path or out_file)
+        if not _output_valid(final_output_path):
+            return False
+        _update_job(
+            job_id,
+            status="completed",
+            percent=100,
+            progress=100,
+            stage="completed",
+            output=str(final_output_path),
+            error=None,
+            elapsed_sec=round(time.time() - started, 1),
+        )
+        return True
+
     def progress(percent, message):
+        pct = max(0, min(100, int(percent)))
+        msg = str(message or "")
+        if pct >= 96 or msg.startswith("완료") or msg == "completed":
+            if _mark_completed(out_file):
+                return
         _update_job(
             job_id,
             status="processing",
             stage=message,
-            percent=max(0, min(100, int(percent))),
-            progress=max(0, min(100, int(percent))),
+            percent=pct,
+            progress=pct,
             elapsed_sec=round(time.time() - started, 1),
         )
 
     def _force_complete():
-        if mp4_file_ready(out_file):
+        if _mark_completed(out_file):
             return
         work = Path(out_file).parent / "_force_complete"
         os.makedirs(str(work), exist_ok=True)
         with write_lock:
-            if mp4_file_ready(out_file):
+            if _mark_completed(out_file):
                 return
             progress(92, "{}초 안전 완성 · 균등 슬라이드쇼".format(int(target_duration)))
             fast_blur_slideshow(media_files, out_file, work, duration=float(target_duration))
-            if not mp4_file_ready(out_file):
+            if not _mark_completed(out_file):
                 raise RuntimeError("안전 슬라이드쇼가 완성된 MP4를 만들지 못했습니다.")
 
     def _watchdog():
@@ -345,29 +392,26 @@ def _run_job(
                     print("[안내] 서버 안전장치 폴백 실패: {}".format(exc))
         finally:
             runner.shutdown(wait=False)
-        if not mp4_file_ready(out_file):
+        if not _output_valid(out_file):
             _force_complete()
-        if not mp4_file_ready(out_file):
+        if not _mark_completed(out_file):
             raise RuntimeError("완성된 영상 파일을 찾지 못했습니다.")
-        consume_entitlement(features)
-        _update_job(
-            job_id,
-            status="completed",
-            stage="완료",
-            percent=100,
-            progress=100,
-            error=None,
-            elapsed_sec=round(time.time() - started, 1),
-        )
+        try:
+            consume_entitlement(features)
+        except Exception as exc:
+            print("[안내] 이용권 차감 실패, 완성 파일은 유지: {}".format(exc))
     except Exception as exc:
         traceback.print_exc()
-        _update_job(
-            job_id,
-            status="failed",
-            stage="실패",
-            error=str(exc),
-            elapsed_sec=round(time.time() - started, 1),
-        )
+        if _mark_completed(out_file):
+            print("[안내] 예외 후에도 완성 MP4가 있어 completed 유지: {}".format(exc))
+        else:
+            _update_job(
+                job_id,
+                status="failed",
+                stage="실패",
+                error=str(exc),
+                elapsed_sec=round(time.time() - started, 1),
+            )
     finally:
         finished.set()
         job_dir = Path(out_file).parent
@@ -642,11 +686,32 @@ def job_status(job_id: str):
     job = _job_snapshot(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+    out_file = _job_mp4_path(job)
+    stage = str(job.get("stage") or "")
     percent = int(job.get("percent") or job.get("progress") or 0)
+    if out_file is not None and _output_valid(out_file) and (
+        job.get("status") == "completed"
+        or percent >= 96
+        or stage.startswith("완료")
+        or stage == "completed"
+        or "출력 정리" in stage
+    ):
+        _update_job(
+            job_id,
+            status="completed",
+            percent=100,
+            progress=100,
+            stage="completed",
+            output=str(out_file),
+            error=None,
+        )
+        job = _job_snapshot(job_id) or job
+        percent = 100
+        stage = "completed"
     return {
         "job_id": job["job_id"],
-        "status": job["status"],
-        "stage": job.get("stage") or "processing",
+        "status": job.get("status") or "processing",
+        "stage": stage or job.get("stage") or "processing",
         "percent": percent,
         "progress": percent,
         "elapsed_sec": float(job.get("elapsed_sec") or 0),
@@ -659,20 +724,27 @@ def download_job(job_id: str):
     job = _job_snapshot(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
-    if job["status"] == "processing":
+    out_file = _job_mp4_path(job)
+    if out_file is not None and _output_valid(out_file):
+        _update_job(
+            job_id,
+            status="completed",
+            percent=100,
+            progress=100,
+            stage="completed",
+            output=str(out_file),
+            error=None,
+        )
+        return FileResponse(
+            path=str(out_file),
+            media_type="video/mp4",
+            filename="final_shorts.mp4",
+            headers={"Accept-Ranges": "bytes"},
+            background=BackgroundTask(_cleanup_after_download, str(out_file.parent)),
+        )
+    if job.get("status") == "processing":
         raise HTTPException(status_code=409, detail="아직 영상이 준비되지 않았습니다.")
-    if job["status"] != "completed":
-        raise HTTPException(status_code=500, detail=job.get("error") or "영상 제작에 실패했습니다.")
-    out_file = Path(job["output"])
-    if not mp4_file_ready(out_file):
-        raise HTTPException(status_code=404, detail="완성된 영상 파일을 찾지 못했습니다.")
-    return FileResponse(
-        path=str(out_file),
-        media_type="video/mp4",
-        filename="final_shorts.mp4",
-        headers={"Accept-Ranges": "bytes"},
-        background=BackgroundTask(_cleanup_after_download, str(out_file.parent)),
-    )
+    raise HTTPException(status_code=404, detail="완성된 영상 파일을 찾지 못했습니다.")
 
 
 if __name__ == "__main__":
