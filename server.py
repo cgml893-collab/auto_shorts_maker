@@ -189,7 +189,7 @@ def _purge_job_temps(job_dir, keep_file=None):
     if not job_dir.exists():
         return
     keep = None
-    keep_names = {"status.json", "final_shorts.mp4", "voice.mp3", "bgm.wav", "subs.srt"}
+    keep_names = {"status.json", "final_shorts.mp4", "voice.mp3", "bgm.wav", "subs.srt", "i2v_source.jpg"}
     if keep_file:
         try:
             keep = Path(keep_file).resolve()
@@ -428,6 +428,21 @@ def _run_job(
             _finish_job_cleanup(job_dir, keep_file=keep)
 
 
+@app.get("/i2v-image/{job_id}")
+def i2v_image(job_id: str):
+    job_dir = JOBS_DIR / job_id
+    for name in ("i2v_source.jpg", "frame_0.jpg"):
+        path = job_dir / name
+        if path.is_file() and path.stat().st_size >= 32:
+            return FileResponse(path=str(path), media_type="image/jpeg")
+    media_dir = job_dir / "media"
+    if media_dir.is_dir():
+        for child in sorted(media_dir.iterdir()):
+            if child.suffix.lower() in IMAGE_EXTS and child.stat().st_size >= 32:
+                return FileResponse(path=str(child), media_type="image/jpeg")
+    raise HTTPException(status_code=404, detail="I2V 소스 이미지를 찾지 못했습니다.")
+
+
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {
@@ -441,6 +456,7 @@ def root():
             "/create-video",
             "/job-status/{job_id}",
             "/download/{job_id}",
+            "/i2v-image/{job_id}",
         ],
     }
 
@@ -568,7 +584,7 @@ async def create_video(
     fx = normalize_visual_fx(visual_fx or motion)
     ratio = normalize_aspect_ratio(aspect_ratio)
     ducking = parse_flag(audio_ducking) if str(audio_ducking or "").strip() else True
-    vip = parse_flag(is_vip_mode) or spark
+    vip = parse_flag(is_vip_mode)
     action_on = parse_flag(action_motion_enabled) or bool((action_style or action_preset or "").strip())
     try:
         height = int(float(output_height or 720))

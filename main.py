@@ -69,9 +69,16 @@ STILL_FPS = 12
 XFADE_SEC = 0.4
 BLUR_RADIUS = 26
 BLUR_DIM = 0.38
-FAL_I2V_PRIMARY = os.getenv("FAL_I2V_MODEL", "fal-ai/minimax/video-01/image-to-video")
-FAL_I2V_FALLBACK = "fal-ai/kling-video/v1/standard/image-to-video"
-FAL_WAIT_TIMEOUT = 25.0
+FAL_I2V_PRIMARY = os.getenv("FAL_I2V_MODEL", "fal-ai/kling-video/v1/standard/image-to-video")
+FAL_I2V_FALLBACK = "fal-ai/minimax/video-01/image-to-video"
+FAL_WAIT_TIMEOUT = 90.0
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "https://auto-shorts-maker.onrender.com").rstrip("/")
+NATURAL_I2V_PROMPT = (
+    "The cute puppy in the photo moves naturally, blinking, wagging tail, breathing softly, "
+    "lifting head and looking around, realistic fur movement, 4k 60fps. "
+    "Keep the exact identity, face, fur color, and body of the subject in the input photo. "
+    "Photorealistic, no morphing, no extra limbs, no slideshow."
+)
 SPARK_MAX_CLIPS = 3
 SPARK_CLIP_SEC = 5.0
 PIPELINE_HARD_LIMIT = 90.0
@@ -235,6 +242,8 @@ def load_settings():
         )
 
     os.environ["FAL_KEY"] = fal_key
+    if fal_key:
+        os.environ.setdefault("FAL_KEY_ID", fal_key.split(":")[0] if ":" in fal_key else fal_key)
     return Settings(
         openai_api_key=openai_key,
         elevenlabs_api_key=eleven_key,
@@ -648,9 +657,9 @@ def caption_force_style(style, font_path):
         ).format(name)
     else:
         raw = (
-            "FontName={},FontSize=28,Bold=1,PrimaryColour=&H0000EAFF,"
+            "FontName={},FontSize=24,Bold=1,PrimaryColour=&H00FFFFFF,"
             "OutlineColour=&H00000000,BackColour=&H00000000,BorderStyle=1,"
-            "Outline=4,Shadow=0,Alignment=2,MarginV=54"
+            "Outline=3,Shadow=0,Alignment=2,MarginV=72,MarginL=48,MarginR=48"
         ).format(name)
     return raw.replace(",", "\\,")
 
@@ -1517,20 +1526,18 @@ def _srt_clock(seconds):
     return "{:02d}:{:02d}:{:02d},{:03d}".format(hours, minutes, whole, millis)
 
 
-def wrap_caption_lines(text, width=14):
-    text = sanitize_narration(text)
-    lines = []
-    current = ""
-    for ch in text:
-        current += ch
-        if len(current) >= width:
-            lines.append(current.strip())
-            current = ""
-            if len(lines) >= 4:
-                break
-    if current.strip() and len(lines) < 4:
-        lines.append(current.strip())
-    return "\n".join(lines) if lines else text
+def wrap_caption_lines(text, width=16):
+    text = sanitize_narration(text).replace("\n", " ").strip()
+    if not text:
+        return ""
+    width = max(8, int(width or 16))
+    if len(text) <= width:
+        return text
+    cut = text[:width]
+    space = cut.rfind(" ")
+    if space >= 8:
+        cut = cut[:space]
+    return cut.strip()
 
 
 def write_cues_srt(cues, dest):
@@ -2118,29 +2125,24 @@ def burn_caption_on_jpeg(frame_path, text, dest_path, font_path, width, height):
     if im.size != (width, height):
         im = im.resize((width, height), _lanczos())
     draw = ImageDraw.Draw(im)
-    font = _load_font(font_path, max(36, int(round(height * 0.034))))
-    body = wrap_caption_lines(text, width=12)
-    lines = [ln for ln in str(body).split("\n") if ln.strip()] or [sanitize_narration(text)]
-    stroke = max(3, int(round(height * 0.004)))
-    sizes = []
-    total_h = 0
-    for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font, stroke_width=stroke)
-        lw, lh = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        sizes.append((line, lw, lh, bbox))
-        total_h += lh + 8
-    y = height - max(80, int(height * 0.16)) - total_h
-    for line, lw, lh, bbox in sizes:
-        x = max(12, (width - lw) // 2 - bbox[0])
-        draw.text(
-            (x, y - bbox[1]),
-            line,
-            font=font,
-            fill=(255, 255, 255),
-            stroke_width=stroke,
-            stroke_fill=(0, 0, 0),
-        )
-        y += lh + 8
+    font = _load_font(font_path, max(40, int(round(height * 0.036))))
+    line = wrap_caption_lines(text, width=16)
+    if not line:
+        shutil.copy2(str(frame_path), str(dest_path))
+        return dest_path
+    stroke = max(4, int(round(height * 0.0045)))
+    bbox = draw.textbbox((0, 0), line, font=font, stroke_width=stroke)
+    lw, lh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    x = max(16, (width - lw) // 2 - bbox[0])
+    y = height - max(110, int(height * 0.14)) - lh - bbox[1]
+    draw.text(
+        (x, y),
+        line,
+        font=font,
+        fill=(255, 255, 255),
+        stroke_width=stroke,
+        stroke_fill=(0, 0, 0),
+    )
     im.save(str(dest_path), "JPEG", quality=88, subsampling=2)
     im.close()
     if not os.path.exists(str(dest_path)) or os.path.getsize(str(dest_path)) < 32:
@@ -2510,35 +2512,135 @@ def _fal_video_url(result):
     return None
 
 
+def natural_i2v_prompt(style_prompt=""):
+    extra = sanitize_narration(style_prompt or "")
+    if extra:
+        return "{} Cinematic mood: {}.".format(NATURAL_I2V_PROMPT, extra[:80])
+    return NATURAL_I2V_PROMPT
+
+
+def _job_dir_for_media(path):
+    path = Path(path).resolve()
+    for parent in path.parents:
+        if parent.parent.name == "mobile_jobs":
+            return parent
+    return path.parent
+
+
+def _public_i2v_image_url(image_path):
+    job_dir = _job_dir_for_media(image_path)
+    dest = job_dir / "i2v_source.jpg"
+    src = Path(image_path)
+    if src.suffix.lower() in IMAGE_EXTS and src.is_file():
+        shutil.copy2(str(src), str(dest))
+    elif dest.is_file():
+        pass
+    else:
+        raise RuntimeError("I2V 소스 이미지가 없습니다.")
+    return "{}/i2v-image/{}".format(PUBLIC_BASE_URL, job_dir.name)
+
+
+def _fal_data_uri(image_path):
+    raw = Path(image_path).read_bytes()
+    if len(raw) > 3_000_000:
+        slim = diet_image_file(image_path, dest=Path(image_path).with_name(Path(image_path).stem + "_uri.jpg"))
+        raw = Path(slim).read_bytes()
+    return "data:image/jpeg;base64,{}".format(base64.b64encode(raw).decode("ascii"))
+
+
+def _fal_queue_subscribe(model, payload, timeout=90):
+    key = (os.getenv("FAL_KEY") or "").strip()
+    if not key:
+        raise RuntimeError("FAL_KEY가 없습니다.")
+    headers = {"Authorization": "Key {}".format(key), "Content-Type": "application/json"}
+    submit = requests.post(
+        "https://queue.fal.run/{}".format(model),
+        headers=headers,
+        json=payload,
+        timeout=45,
+    )
+    if submit.status_code >= 400:
+        raise RuntimeError("fal queue {} HTTP {}: {}".format(model, submit.status_code, submit.text[:400]))
+    data = submit.json()
+    status_url = data.get("status_url")
+    response_url = data.get("response_url")
+    request_id = data.get("request_id")
+    if not status_url and request_id:
+        status_url = "https://queue.fal.run/{}/requests/{}/status".format(model, request_id)
+        response_url = "https://queue.fal.run/{}/requests/{}".format(model, request_id)
+    deadline = time.time() + float(timeout)
+    while time.time() < deadline:
+        st = requests.get(status_url, headers=headers, timeout=20)
+        js = st.json() if st.content else {}
+        status = str(js.get("status") or "").upper()
+        if status in ("COMPLETED", "OK"):
+            resp = requests.get(response_url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+        if status in ("FAILED", "ERROR"):
+            raise RuntimeError("fal 작업 실패: {}".format(str(js)[:400]))
+        time.sleep(2.0)
+    raise RuntimeError("fal queue 대기 시간 초과 ({}s)".format(int(timeout)))
+
+
 def fal_image_to_video(image_path, prompt, dest_mp4):
     try:
         try:
             import fal_client
         except ImportError:
-            raise RuntimeError("fal-client가 없습니다. pip install fal-client 후 다시 시도해 주세요.")
+            fal_client = None
+        key = (os.getenv("FAL_KEY") or "").strip()
+        if key:
+            os.environ["FAL_KEY"] = key
         try:
             slim = diet_image_file(image_path, dest=Path(image_path).with_name(Path(image_path).stem + "_fal.jpg"))
         except Exception:
             slim = image_path
-        image_url = fal_client.upload_file(str(slim))
-        arguments = {"prompt": prompt, "image_url": image_url, "prompt_optimizer": True}
-        last_error = None
-        for model in (FAL_I2V_PRIMARY, FAL_I2V_FALLBACK):
+        prompt = (prompt or NATURAL_I2V_PROMPT).strip()
+        image_urls = []
+        try:
+            image_urls.append(_public_i2v_image_url(slim))
+        except Exception as exc:
+            print("[안내] 공개 I2V URL 생성 실패: {}".format(exc), flush=True)
+        if fal_client is not None:
             try:
-                print("   fal I2V: {} ← {}".format(model, Path(slim).name))
-                payload = dict(arguments)
-                if "kling" in model:
-                    payload["duration"] = "5"
-                result = fal_client.subscribe(model, arguments=payload, with_logs=False)
-                url = _fal_video_url(result)
-                if not url:
-                    raise RuntimeError("fal 응답에 video url이 없습니다: {}".format(str(result)[:400]))
-                download_http_file(url, dest_mp4, timeout=20)
-                if Path(dest_mp4).is_file() and Path(dest_mp4).stat().st_size > 1000:
-                    return Path(dest_mp4)
+                image_urls.append(fal_client.upload_file(str(slim)))
             except Exception as exc:
-                last_error = exc
-                print("[안내] {} 실패: {}".format(model, exc))
+                print("[안내] fal CDN 업로드 생략: {}".format(exc), flush=True)
+        try:
+            image_urls.append(_fal_data_uri(slim))
+        except Exception:
+            pass
+        if not image_urls:
+            raise RuntimeError("I2V에 넘길 이미지 URL이 없습니다.")
+        models = (FAL_I2V_PRIMARY, FAL_I2V_FALLBACK, "fal-ai/minimax/video-01")
+        last_error = None
+        for model in models:
+            for image_url in image_urls:
+                try:
+                    print("   fal I2V: {} ← {}".format(model, str(image_url)[:88]), flush=True)
+                    payload = {"prompt": prompt, "image_url": image_url}
+                    if "kling" in model:
+                        payload["duration"] = "5"
+                    else:
+                        payload["prompt_optimizer"] = True
+                    result = None
+                    if fal_client is not None:
+                        try:
+                            result = fal_client.subscribe(model, arguments=payload, with_logs=False)
+                        except Exception as exc:
+                            print("[안내] fal subscribe 실패, queue API 재시도: {}".format(exc), flush=True)
+                    if result is None:
+                        result = _fal_queue_subscribe(model, payload, timeout=FAL_WAIT_TIMEOUT)
+                    url = _fal_video_url(result)
+                    if not url:
+                        raise RuntimeError("fal 응답에 video url이 없습니다: {}".format(str(result)[:400]))
+                    download_http_file(url, dest_mp4, timeout=40)
+                    if Path(dest_mp4).is_file() and Path(dest_mp4).stat().st_size > 1000:
+                        return Path(dest_mp4)
+                except Exception as exc:
+                    last_error = exc
+                    print("[안내] {} 실패: {}".format(model, exc), flush=True)
         raise RuntimeError("Image-to-Video 생성 실패: {}".format(last_error))
     except Exception as exc:
         print("[안내] fal.ai 전체 실패(프로세스 유지): {}".format(exc))
@@ -2556,7 +2658,7 @@ async def fal_image_to_video_timed(image_path, prompt, dest_mp4, timeout=FAL_WAI
         raise RuntimeError("fal.ai 대기열 타임아웃 ({}s)".format(timeout))
 
 
-VIP_I2V_TIMEOUT = 32.0
+VIP_I2V_TIMEOUT = 90.0
 ACTION_PRESETS = {
     "bike_stunt": "오토바이 앞바퀴를 들고 묘기 부리며 질주하는 장면, 엔진 배기음과 타이어 연기",
     "dance": "비트에 맞춘 역동적인 댄스, 강한 제스처와 카메라 펀치 인",
@@ -2601,9 +2703,9 @@ def resolve_action_style(preset="", custom=""):
 
 def expand_action_i2v_prompt(settings, action_style, angle_prompt, style_prompt=""):
     fallback = (
-        "Photorealistic image-to-video. Keep the exact person, face, clothing, and body proportions. "
-        "{angle}. Action: {action}. Physically plausible motion, cinematic camera move, 24fps, "
-        "high detail, no morphing, no extra limbs. Style: {style}."
+        "Keep the exact subject from the input photo, including face, fur, clothing, and proportions. "
+        "{angle}. Natural motion first: blinking, breathing, slight head turn, tail or hair movement. "
+        "Then action: {action}. Photorealistic, no morphing, no extra limbs. Style: {style}."
     ).format(
         angle=angle_prompt,
         action=action_style or "dynamic cinematic motion",
@@ -2814,7 +2916,7 @@ def generate_vip_action_clips(
     async def _gather():
         return await asyncio.wait_for(
             asyncio.gather(*[_one(i, src) for i, src in enumerate(sources)], return_exceptions=True),
-            timeout=VIP_I2V_TIMEOUT + 4,
+            timeout=VIP_I2V_TIMEOUT + 20,
         )
 
     try:
@@ -2927,9 +3029,8 @@ def generate_spark_cinema_clips(
     width=None,
     height=None,
 ):
-    motion = normalize_camera_motion(camera_motion)
-    motion_prompt = CAMERA_MOTIONS[motion]
-    prompt = "{} {}".format((style_prompt or "cinematic vertical short").strip(), motion_prompt)
+    prompt = natural_i2v_prompt(style_prompt)
+    print("   I2V 프롬프트: {}".format(prompt[:180]), flush=True)
     sources = list(media_files)[:SPARK_MAX_CLIPS]
     width = int(width or TARGET_W)
     height = int(height or TARGET_H)
@@ -2940,7 +3041,6 @@ def generate_spark_cinema_clips(
         try:
             frame = work_dir / ("i2v_src_{:02d}.jpg".format(index + 1))
             await asyncio.to_thread(still_from_media, src, frame, work_dir, width, height)
-            await asyncio.to_thread(diet_image_file, frame, frame)
             clip = work_dir / ("i2v_{:02d}.mp4".format(index + 1))
             await fal_image_to_video_timed(frame, prompt, clip, timeout=FAL_WAIT_TIMEOUT)
             return clip
@@ -2952,13 +3052,13 @@ def generate_spark_cinema_clips(
         tasks = [_one(index, src) for index, src in enumerate(sources)]
         return await asyncio.wait_for(
             asyncio.gather(*tasks, return_exceptions=True),
-            timeout=FAL_WAIT_TIMEOUT,
+            timeout=FAL_WAIT_TIMEOUT + 30,
         )
 
     try:
         results = asyncio.run(_gather())
     except asyncio.TimeoutError:
-        print("[안내] 스파크 시네마 25초 대기열 초과 → 초고속 블러 전환")
+        print("[안내] 스파크 시네마 I2V 대기 초과")
         return []
     except Exception as exc:
         print("[안내] 스파크 시네마 병렬 호출 실패: {}".format(exc))
@@ -3493,7 +3593,8 @@ def run_pipeline(
                     settings, script, voice_file, voice_key, duration=float(target_duration)
                 )
             try:
-                generated = frame_fut.result(timeout=max(6.0, min(FAL_WAIT_TIMEOUT + 1, _left() - 6)))
+                i2v_wait = 110.0 if (vip or spark) else 20.0
+                generated = frame_fut.result(timeout=max(12.0, min(i2v_wait, max(12.0, _left() - 8))))
             except Exception as exc:
                 print("[안내] 영상 생성 대기 중단: {}".format(exc))
                 generated = None
@@ -3574,19 +3675,7 @@ def run_pipeline(
             raise RuntimeError("완성된 영상 파일을 찾지 못했습니다.")
         if vip and Path(out_file).is_file():
             try:
-                _notify(progress_cb, 88, "👑 키네틱 자막 · 스튜디오 오디오 마스터링", progress_lock)
-                captioned = work_dir / "vip_kinetic.mp4"
-                burn_kinetic_captions(
-                    out_file,
-                    script,
-                    audio_duration,
-                    font_path,
-                    captioned,
-                    work_dir,
-                    width,
-                    height,
-                    caption_style,
-                )
+                _notify(progress_cb, 88, "스튜디오 오디오 마스터링", progress_lock)
                 mixed = work_dir / "vip_master.mp4"
                 scene_starts = []
                 acc = 0.0
@@ -3594,7 +3683,7 @@ def run_pipeline(
                     scene_starts.append(acc)
                     acc += float(dur)
                 mix_vip_sfx(
-                    captioned if Path(captioned).is_file() else out_file,
+                    out_file,
                     mixed,
                     audio_duration,
                     action_style,
