@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import wave
 from concurrent.futures import ThreadPoolExecutor
@@ -64,6 +65,7 @@ FINAL_PATH = OUTPUT_DIR / "final_shorts.mp4"
 TARGET_W = 720
 TARGET_H = 1280
 FPS = 24
+STILL_FPS = 12
 XFADE_SEC = 0.4
 BLUR_RADIUS = 26
 BLUR_DIM = 0.38
@@ -533,7 +535,7 @@ def normalize_target_duration(value):
 
 
 def pipeline_time_budget(duration):
-    return {15: 90.0, 30: 140.0, 60: 200.0}.get(int(duration), 90.0)
+    return {15: 240.0, 30: 320.0, 60: 420.0}.get(int(duration), 240.0)
 
 
 def normalize_caption_style(value):
@@ -1040,7 +1042,8 @@ def generate_voice(settings, script, output_path=None, voice_type=DEFAULT_VOICE_
     return dest
 
 
-FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "60"))
+FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "180"))
+FFMPEG_RUN_LOCK = threading.Lock()
 FFMPEG_ENCODE = [
     "-c:v",
     "libx264",
@@ -1057,7 +1060,7 @@ FFMPEG_ENCODE = [
     "-b:a",
     "128k",
     "-threads",
-    "2",
+    "0",
     "-movflags",
     "+faststart",
 ]
@@ -1073,7 +1076,7 @@ FFMPEG_PRESET = [
     "-pix_fmt",
     "yuv420p",
     "-threads",
-    "2",
+    "0",
     "-movflags",
     "+faststart",
 ]
@@ -1192,6 +1195,11 @@ def _publish_temp_mp4(temp, dest):
 def run_ffmpeg(args, timeout=None):
     if timeout is None:
         timeout = FFMPEG_TIMEOUT
+    with FFMPEG_RUN_LOCK:
+        return _run_ffmpeg_locked(args, timeout)
+
+
+def _run_ffmpeg_locked(args, timeout):
     temp, dest, argv = _atomic_mp4_args(args)
     if temp is not None and temp.exists():
         _discard_temp_mp4(temp)
@@ -2052,7 +2060,7 @@ def compose_blur_fill_frame(src_path, dest_path, width=None, height=None):
         src = grab
     with Image.open(src) as raw:
         composed = fit_contain_on_blur(raw, width, height)
-    composed.save(str(dest_path), "JPEG", quality=92, subsampling=0)
+    composed.save(str(dest_path), "JPEG", quality=88, subsampling=2)
     composed.close()
     if grab is not None:
         try:
@@ -2101,6 +2109,43 @@ def still_from_media(path, dest_jpg, work_dir, width=None, height=None):
     except Exception as exc:
         print("[안내] 스틸 추출 실패, 단색 폴백: {}".format(exc))
     return ensure_jpeg_on_disk(dest_jpg, (width, height))
+
+
+def burn_caption_on_jpeg(frame_path, text, dest_path, font_path, width, height):
+    dest_path = Path(dest_path)
+    os.makedirs(str(dest_path.parent), exist_ok=True)
+    im = Image.open(frame_path).convert("RGB")
+    if im.size != (width, height):
+        im = im.resize((width, height), _lanczos())
+    draw = ImageDraw.Draw(im)
+    font = _load_font(font_path, max(36, int(round(height * 0.034))))
+    body = wrap_caption_lines(text, width=12)
+    lines = [ln for ln in str(body).split("\n") if ln.strip()] or [sanitize_narration(text)]
+    stroke = max(3, int(round(height * 0.004)))
+    sizes = []
+    total_h = 0
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font, stroke_width=stroke)
+        lw, lh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        sizes.append((line, lw, lh, bbox))
+        total_h += lh + 8
+    y = height - max(80, int(height * 0.16)) - total_h
+    for line, lw, lh, bbox in sizes:
+        x = max(12, (width - lw) // 2 - bbox[0])
+        draw.text(
+            (x, y - bbox[1]),
+            line,
+            font=font,
+            fill=(255, 255, 255),
+            stroke_width=stroke,
+            stroke_fill=(0, 0, 0),
+        )
+        y += lh + 8
+    im.save(str(dest_path), "JPEG", quality=88, subsampling=2)
+    im.close()
+    if not os.path.exists(str(dest_path)) or os.path.getsize(str(dest_path)) < 32:
+        raise RuntimeError("자막 프레임 저장 실패: {}".format(dest_path))
+    return dest_path
 
 
 def arrange_media_for_cues(media_files, cues, photo_order):
@@ -2226,7 +2271,7 @@ def ffmpeg_single_pass(
     audio_ducking=True,
     target_duration=None,
 ):
-    del xfade_sec, visual_fx
+    del xfade_sec, visual_fx, caption_style, audio_ducking
     speed = normalize_speed(speed)
     out_file = Path(out_file)
     job_dir = out_file.parent
@@ -2269,65 +2314,80 @@ def ffmpeg_single_pass(
         scaled = even_scene_durations(n, hold)
     scaled[-1] = max(0.2, hold - sum(scaled[:-1]))
 
+    if cues and font_path:
+        captioned = []
+        cue_durs = []
+        for i, (text, start, end) in enumerate(cues):
+            src = disk_frames[i % len(disk_frames)]
+            dest = job_dir / "caption_{}.jpg".format(i)
+            try:
+                burn_caption_on_jpeg(src, text, dest, font_path, width, height)
+            except Exception as exc:
+                print("[안내] 자막 JPEG 합성 실패, 원본 프레임 사용: {}".format(exc), flush=True)
+                dest = src
+            captioned.append(dest)
+            cue_durs.append(max(0.35, float(end) - float(start)))
+        if captioned:
+            disk_frames = captioned
+            total = sum(cue_durs)
+            if total > 0.2:
+                scaled = [hold * (d / total) for d in cue_durs]
+                scaled[-1] = max(0.2, hold - sum(scaled[:-1]))
+            n = len(disk_frames)
+
     voice_mp3 = job_dir / "voice.mp3"
     src_voice = Path(voice_path)
-    if src_voice.resolve() != voice_mp3.resolve():
-        if src_voice.suffix.lower() == ".mp3":
-            shutil.copy2(str(src_voice), str(voice_mp3))
-        else:
-            try:
-                run_ffmpeg(
-                    ["-i", str(src_voice), "-vn", "-ac", "2", "-ar", "44100", "-b:a", "128k", str(voice_mp3)],
-                    timeout=20,
-                )
-            except Exception:
-                shutil.copy2(str(src_voice), str(voice_mp3))
-    if not os.path.exists(str(voice_mp3)):
+    audio_in = src_voice if src_voice.is_file() else voice_mp3
+    if not audio_in.is_file():
         raise RuntimeError("voice.mp3가 없습니다.")
+    if audio_in.resolve() != voice_mp3.resolve() and src_voice.suffix.lower() == ".mp3":
+        if not voice_mp3.is_file():
+            shutil.copy2(str(src_voice), str(voice_mp3))
 
     bgm_wav = None
     if bgm_path and Path(bgm_path).is_file():
+        src_bgm = Path(bgm_path)
         bgm_wav = job_dir / "bgm.wav"
-        try:
-            run_ffmpeg(
-                [
-                    "-stream_loop",
-                    "-1",
-                    "-i",
-                    str(bgm_path),
-                    "-t",
-                    "{:.3f}".format(hold),
-                    "-ac",
-                    "2",
-                    "-ar",
-                    "44100",
-                    str(bgm_wav),
-                ],
-                timeout=25,
-            )
-        except Exception as exc:
-            print("[안내] bgm.wav 변환 실패: {}".format(exc), flush=True)
-            bgm_wav = None
+        if src_bgm.resolve() == bgm_wav.resolve():
+            pass
+        else:
+            try:
+                run_ffmpeg(
+                    [
+                        "-stream_loop",
+                        "-1",
+                        "-i",
+                        str(src_bgm),
+                        "-t",
+                        "{:.3f}".format(hold),
+                        "-ac",
+                        "2",
+                        "-ar",
+                        "44100",
+                        str(bgm_wav),
+                    ],
+                    timeout=25,
+                )
+            except Exception as exc:
+                print("[안내] bgm.wav 변환 실패: {}".format(exc), flush=True)
+                bgm_wav = src_bgm if src_bgm.suffix.lower() == ".wav" else None
         if bgm_wav is not None and (not os.path.exists(str(bgm_wav)) or os.path.getsize(str(bgm_wav)) < 32):
             bgm_wav = None
 
-    srt = None
-    if cues and font_path:
-        srt = write_cues_srt(cues, job_dir / "subs.srt")
-
     args = []
     for frame, dur in zip(disk_frames, scaled):
+        require_image_for_ffmpeg(frame)
         args += [
             "-loop",
             "1",
             "-framerate",
-            str(FPS),
+            str(STILL_FPS),
             "-t",
             "{:.3f}".format(max(0.2, float(dur))),
             "-i",
             str(frame),
         ]
-    args += ["-i", str(voice_mp3)]
+    args += ["-i", str(audio_in)]
     voice_idx = n
     bgm_idx = None
     if bgm_wav is not None:
@@ -2337,10 +2397,7 @@ def ffmpeg_single_pass(
     vf_parts = []
     for i in range(n):
         vf_parts.append(
-            "[{i}:v]scale={w}:{h}:force_original_aspect_ratio=disable,"
-            "setsar=1,fps={fps},format=yuv420p[v{i}]".format(
-                i=i, w=width, h=height, fps=FPS
-            )
+            "[{i}:v]fps={fps},format=yuv420p,setsar=1[v{i}]".format(i=i, fps=STILL_FPS)
         )
     if n == 1:
         vstream = "v0"
@@ -2351,38 +2408,24 @@ def ffmpeg_single_pass(
             )
         )
         vstream = "vcat"
-    if srt is not None:
-        vf_parts.append("[{}]{}[vout]".format(vstream, subtitles_vf(srt, font_path, caption_style)))
-        vstream = "vout"
 
     trim = "{:.3f}".format(hold)
-    audio_filters = []
     if bgm_idx is not None:
-        if audio_ducking:
-            mixed = ducking_audio_filter(speed, voice_idx=voice_idx, bgm_idx=bgm_idx)
-            if mixed.endswith("[a]"):
-                mixed = mixed[:-3] + "[amix]"
-            audio_filters.append(mixed)
-            audio_filters.append(
-                "[amix]apad,atrim=0:{t},asetpts=PTS-STARTPTS[a]".format(t=trim)
+        audio_filters = [
+            "[{v}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume=1.08,apad,atrim=0:{t}[va];"
+            "[{b}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume=0.18,atrim=0:{t}[ba];"
+            "[va][ba]amix=inputs=2:duration=first:dropout_transition=0[a]".format(
+                v=voice_idx, b=bgm_idx, t=trim
             )
-        else:
-            audio_filters.append(
-                "[{v}:a]volume=1.05,apad,atrim=0:{t}[va];[{b}:a]volume=0.16,aloop=-1:size=2e+09,atrim=0:{t}[ba];"
-                "[va][ba]amix=inputs=2:duration=first:dropout_transition=0[a]".format(
-                    v=voice_idx, b=bgm_idx, t=trim
-                )
-            )
-        a_map = "[a]"
+        ]
     else:
-        audio_filters.append(
+        audio_filters = [
             "[{v}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,"
             "volume=1.05,apad,atrim=0:{t},asetpts=PTS-STARTPTS[a]".format(
                 v=voice_idx, t=trim
             )
-        )
-        a_map = "[a]"
-
+        ]
+    a_map = "[a]"
     fc = ";".join(vf_parts + audio_filters)
     encode = [
         "-c:v",
@@ -2395,6 +2438,8 @@ def ffmpeg_single_pass(
         "23",
         "-pix_fmt",
         "yuv420p",
+        "-threads",
+        "0",
         "-c:a",
         "aac",
         "-b:a",
@@ -2413,30 +2458,9 @@ def ffmpeg_single_pass(
         "-t",
         trim,
         "-r",
-        str(FPS),
+        str(STILL_FPS),
     ] + encode + [str(out_file)]
-    try:
-        run_ffmpeg(cmd, timeout=max(90, min(int(hold * 5 + 40), 240)))
-    except Exception as exc:
-        if srt is None:
-            raise
-        print("[안내] 자막 합성 실패, 자막 없이 재렌더: {}".format(exc), flush=True)
-        vf_parts = [p for p in vf_parts if "[vout]" not in p]
-        vstream = "v0" if n == 1 else "vcat"
-        fc = ";".join(vf_parts + audio_filters)
-        cmd = args + [
-            "-filter_complex",
-            fc,
-            "-map",
-            "[{}]".format(vstream),
-            "-map",
-            a_map,
-            "-t",
-            trim,
-            "-r",
-            str(FPS),
-        ] + encode + [str(out_file)]
-        run_ffmpeg(cmd, timeout=max(90, min(int(hold * 5 + 40), 240)))
+    run_ffmpeg(cmd, timeout=max(180, min(int(hold * 12 + 60), 300)))
 
 
 def resolve_bgm(mood, duration, dest):
@@ -3204,7 +3228,7 @@ def fast_blur_slideshow(media_files, out_file, work_dir, voice_path=None, durati
         "-loop",
         "1",
         "-framerate",
-        str(FPS),
+        str(STILL_FPS),
         "-t",
         "{:.3f}".format(duration),
         "-i",
@@ -3228,8 +3252,12 @@ def fast_blur_slideshow(media_files, out_file, work_dir, voice_path=None, durati
         "1:a:0",
         "-t",
         "{:.3f}".format(duration),
+        "-r",
+        str(STILL_FPS),
+        "-vf",
+        "fps={},format=yuv420p".format(STILL_FPS),
     ] + FFMPEG_ENCODE + [str(out_file)]
-    run_ffmpeg(args, timeout=max(25, min(int(duration * 5 + 20), 240)))
+    run_ffmpeg(args, timeout=max(180, min(int(duration * 12 + 60), 300)))
     gc.collect()
     return out_file
 

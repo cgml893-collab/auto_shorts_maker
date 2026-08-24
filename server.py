@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List
 
-os.environ.setdefault("FFMPEG_TIMEOUT", "60")
+os.environ.setdefault("FFMPEG_TIMEOUT", "180")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
@@ -342,7 +342,7 @@ def _run_job(
                 raise RuntimeError("안전 슬라이드쇼가 완성된 MP4를 만들지 못했습니다.")
 
     def _watchdog():
-        if finished.wait(timeout=max(1.0, budget - 8.0)):
+        if finished.wait(timeout=max(30.0, budget + 45.0)):
             return
         try:
             _force_complete()
@@ -383,17 +383,18 @@ def _run_job(
                 action_preset=action_preset,
             )
             try:
-                fut.result(timeout=max(8.0, budget - 6.0))
+                fut.result(timeout=max(90.0, budget))
+            except TimeoutError:
+                print("[안내] 파이프라인 대기 시간 초과, 완성 파일 확인", flush=True)
             except Exception as exc:
-                if not isinstance(exc, TimeoutError):
-                    traceback.print_exc()
+                traceback.print_exc()
                 progress(80, "외부 API 대기열 · {}초 안전 슬라이드쇼로 전환".format(int(target_duration)))
                 try:
                     _force_complete()
                 except Exception:
                     print("[안내] 서버 안전장치 폴백 실패: {}".format(exc))
         finally:
-            runner.shutdown(wait=False)
+            runner.shutdown(wait=True)
         if not _output_valid(out_file):
             _force_complete()
         if not _mark_completed(out_file):
@@ -427,7 +428,7 @@ def _run_job(
             _finish_job_cleanup(job_dir, keep_file=keep)
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {
         "ok": True,
@@ -444,7 +445,7 @@ def root():
     }
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"ok": True}
 
