@@ -617,23 +617,10 @@ def even_scene_durations(count, total):
 
 def visual_fx_filter(style, width, height, fps):
     w, h, f = int(width), int(height), int(fps or FPS)
-    style = normalize_visual_fx(style)
-    if style == "zoom_punch":
-        zoom = "1.07+0.11*abs(sin(2*PI*on/9))"
-        scale_w, scale_h = w * 2, h * 2
-    elif style == "cinematic":
-        zoom = "min(1.04+on*0.00042,1.13)"
-        scale_w, scale_h = int(w * 1.28), int(h * 1.28)
-    else:
-        zoom = "min(zoom+0.00115,1.16)"
-        scale_w, scale_h = int(w * 1.24), int(h * 1.24)
-    pan_x = "iw/2-(iw/zoom/2)+on*0.16" if style == "cinematic" else "iw/2-(iw/zoom/2)"
-    grade = ",eq=contrast=1.05:saturation=0.93:gamma=0.97" if style == "cinematic" else ""
+    del style
     return (
-        "scale={sw}:{sh}:force_original_aspect_ratio=increase,crop={sw}:{sh},"
-        "zoompan=z='{z}':x='{x}':y='ih/2-(ih/zoom/2)':d=1:s={w}x{h}:fps={f}"
-        "{grade},setsar=1,format=yuv420p"
-    ).format(sw=scale_w, sh=scale_h, z=zoom, x=pan_x, w=w, h=h, f=f, grade=grade)
+        "scale={w}:{h}:force_original_aspect_ratio=disable,setsar=1,fps={f},format=yuv420p"
+    ).format(w=w, h=h, f=f)
 
 
 def caption_force_style(style, font_path):
@@ -666,17 +653,17 @@ def caption_force_style(style, font_path):
     return raw.replace(",", "\\,")
 
 
-def ducking_audio_filter(speed=1.0):
+def ducking_audio_filter(speed=1.0, voice_idx=1, bgm_idx=2):
     tempo = ""
     if abs(float(speed) - 1.0) > 0.001:
         tempo = "," + atempo_chain(speed)
     return (
-        "[1:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo{tempo},asplit=2[voice][sc];"
-        "[2:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo{tempo},volume=0.55[bgm];"
+        "[{v}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo{tempo},asplit=2[voice][sc];"
+        "[{b}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo{tempo},volume=0.55[bgm];"
         "[bgm][sc]sidechaincompress=threshold=0.045:ratio=12:attack=20:release=260:makeup=1:knee=8[dk];"
         "[voice]volume=1.08[va];"
         "[va][dk]amix=inputs=2:duration=first:dropout_transition=0[a]"
-    ).format(tempo=tempo)
+    ).format(v=int(voice_idx), b=int(bgm_idx), tempo=tempo)
 
 
 def conform_audio_duration(src, dest, seconds):
@@ -2016,6 +2003,11 @@ def fit_cover_rgb(im, width, height, fast=True):
     return img.crop((left, top, left + width, top + height))
 
 
+def _lanczos():
+    resampling = getattr(Image, "Resampling", Image)
+    return getattr(resampling, "LANCZOS", getattr(Image, "LANCZOS", Image.BICUBIC))
+
+
 def fit_contain_on_blur(im, width, height):
     try:
         fixed = ImageOps.exif_transpose(im)
@@ -2024,42 +2016,88 @@ def fit_contain_on_blur(im, width, height):
     except Exception:
         pass
     src = im.convert("RGB")
-    resampling = getattr(Image, "Resampling", Image)
-    bg = fit_cover_rgb(src, width, height, fast=True)
-    bg = bg.filter(ImageFilter.GaussianBlur(radius=BLUR_RADIUS))
-    bg = Image.blend(bg, Image.new("RGB", (width, height), (0, 0, 0)), BLUR_DIM)
-    scale = min(width / float(src.width), height / float(src.height))
-    nw = max(2, int(round(src.width * scale)))
-    nh = max(2, int(round(src.height * scale)))
-    nw -= nw % 2
-    nh -= nh % 2
-    fg = src.resize((nw, nh), resampling.BILINEAR)
-    canvas = bg.copy()
-    canvas.paste(fg, ((width - nw) // 2, (height - nh) // 2))
+    lanczos = _lanczos()
+    width = max(2, int(width) - int(width) % 2)
+    height = max(2, int(height) - int(height) % 2)
+    bg = ImageOps.fit(src, (width, height), method=lanczos, centering=(0.5, 0.5))
+    bg = bg.filter(ImageFilter.GaussianBlur(radius=25))
+    if hasattr(ImageOps, "contain"):
+        fg = ImageOps.contain(src, (width, height), method=lanczos)
+    else:
+        scale = min(width / float(src.width), height / float(src.height))
+        nw = max(1, int(round(src.width * scale)))
+        nh = max(1, int(round(src.height * scale)))
+        fg = src.resize((nw, nh), lanczos)
+    canvas = Image.new("RGB", (width, height))
+    canvas.paste(bg, (0, 0))
+    canvas.paste(fg, ((width - fg.size[0]) // 2, (height - fg.size[1]) // 2))
     return canvas
+
+
+def compose_blur_fill_frame(src_path, dest_path, width=None, height=None):
+    width = int(width or TARGET_W)
+    height = int(height or TARGET_H)
+    width = max(2, width - width % 2)
+    height = max(2, height - height % 2)
+    dest_path = Path(dest_path)
+    os.makedirs(str(dest_path.parent), exist_ok=True)
+    src = Path(src_path)
+    grab = None
+    if src.suffix.lower() in VIDEO_EXTS:
+        grab = dest_path.with_name(dest_path.stem + "_grab.jpg")
+        run_ffmpeg(
+            ["-ss", "0.15", "-i", str(src), "-frames:v", "1", "-q:v", "2", str(grab)],
+            timeout=20,
+        )
+        src = grab
+    with Image.open(src) as raw:
+        composed = fit_contain_on_blur(raw, width, height)
+    composed.save(str(dest_path), "JPEG", quality=92, subsampling=0)
+    composed.close()
+    if grab is not None:
+        try:
+            grab.unlink()
+        except OSError:
+            pass
+    if not os.path.exists(str(dest_path)) or os.path.getsize(str(dest_path)) < 32:
+        raise RuntimeError("9:16 프레임 저장 실패: {}".format(dest_path))
+    print("   9:16 프레임 저장: {}".format(dest_path), flush=True)
+    return dest_path
+
+
+def prepare_job_frames(media_files, job_dir, width=None, height=None):
+    width = int(width or TARGET_W)
+    height = int(height or TARGET_H)
+    job_dir = Path(job_dir)
+    os.makedirs(str(job_dir), exist_ok=True)
+    frames = []
+    sources = list(media_files or [])
+    if not sources:
+        dest = job_dir / "frame_0.jpg"
+        Image.new("RGB", (width, height), (32, 28, 36)).save(str(dest), "JPEG", quality=85)
+        return [dest]
+    for index, src in enumerate(sources):
+        dest = job_dir / "frame_{}.jpg".format(index)
+        try:
+            compose_blur_fill_frame(src, dest, width, height)
+        except Exception as exc:
+            print("[안내] frame_{}.jpg 합성 실패, 재시도: {}".format(index, exc), flush=True)
+            still_from_media(src, dest, job_dir, width, height)
+        if os.path.exists(str(dest)) and os.path.getsize(str(dest)) >= 32:
+            frames.append(dest)
+    if not frames:
+        raise RuntimeError("9:16 프레임을 만들지 못했습니다.")
+    return frames
 
 
 def still_from_media(path, dest_jpg, work_dir, width=None, height=None):
     width = int(width or TARGET_W)
     height = int(height or TARGET_H)
     dest_jpg = Path(dest_jpg)
-    work_dir = Path(work_dir)
-    os.makedirs(str(work_dir), exist_ok=True)
+    os.makedirs(str(Path(work_dir)), exist_ok=True)
     os.makedirs(str(dest_jpg.parent), exist_ok=True)
-    suffix = Path(path).suffix.lower()
     try:
-        if suffix in IMAGE_EXTS:
-            with open_image_upright(path) as im:
-                save_image_verified(fit_contain_on_blur(im, width, height), dest_jpg, quality=85)
-            diet_image_file(dest_jpg, dest=dest_jpg)
-        else:
-            tmp = work_dir / (dest_jpg.stem + "_grab.jpg")
-            run_ffmpeg(
-                ["-ss", "0.15", "-i", str(path), "-frames:v", "1", "-q:v", "4", str(tmp)],
-                timeout=20,
-            )
-            with open_image_upright(tmp) as im:
-                save_image_verified(fit_contain_on_blur(im, width, height), dest_jpg, quality=85)
+        return compose_blur_fill_frame(path, dest_jpg, width, height)
     except Exception as exc:
         print("[안내] 스틸 추출 실패, 단색 폴백: {}".format(exc))
     return ensure_jpeg_on_disk(dest_jpg, (width, height))
@@ -2188,85 +2226,217 @@ def ffmpeg_single_pass(
     audio_ducking=True,
     target_duration=None,
 ):
+    del xfade_sec, visual_fx
     speed = normalize_speed(speed)
-    if not frames:
-        raise RuntimeError("렌더할 프레임이 없습니다.")
-    work_dir = Path(work_dir or Path(frames[0]).parent)
+    out_file = Path(out_file)
+    job_dir = out_file.parent
+    os.makedirs(str(job_dir), exist_ok=True)
     width = int(width or TARGET_W)
     height = int(height or TARGET_H)
-    frames = [ensure_jpeg_on_disk(path, (width, height)) for path in frames]
-    entries = build_slideshow_entries(
-        frames, durations, work_dir, speed=speed, xfade_sec=xfade_sec
-    )
-    concat_path = work_dir / "slides.txt"
-    write_concat_list(entries, concat_path)
-    total = sum(dur for _png, dur in entries)
-    hold = max(float(target_duration or total), float(total), 1.0)
+    work_dir = Path(work_dir or job_dir)
+    os.makedirs(str(work_dir), exist_ok=True)
 
-    voice_mp3 = work_dir / "voice.mp3"
-    if Path(voice_path).resolve() != voice_mp3.resolve():
-        shutil.copy2(str(voice_path), str(voice_mp3))
-    else:
-        voice_mp3 = Path(voice_path)
-    voice_fit = work_dir / "voice_fit.m4a"
-    conform_audio_duration(voice_mp3, voice_fit, hold)
+    disk_frames = []
+    found = list(job_dir.glob("frame_*.jpg"))
 
-    bgm_mp3 = None
-    if bgm_path:
-        bgm_mp3 = work_dir / "bgm.mp3"
-        src = Path(bgm_path)
-        if src.suffix.lower() == ".mp3" and src.resolve() != bgm_mp3.resolve():
-            shutil.copy2(str(src), str(bgm_mp3))
-        elif src.suffix.lower() == ".mp3":
-            bgm_mp3 = src
+    def _frame_key(path):
+        try:
+            return int(Path(path).stem.split("_")[-1])
+        except (TypeError, ValueError):
+            return 0
+
+    for path in sorted(found, key=_frame_key):
+        if os.path.exists(str(path)) and os.path.getsize(str(path)) >= 32:
+            disk_frames.append(path)
+    if not disk_frames:
+        sources = list(frames or [])
+        disk_frames = prepare_job_frames(sources, job_dir, width, height)
+    if not disk_frames:
+        raise RuntimeError("렌더할 프레임이 없습니다.")
+    for frame in disk_frames:
+        require_image_for_ffmpeg(frame)
+
+    n = len(disk_frames)
+    hold = max(float(target_duration or 0), 1.0)
+    if durations and len(durations) == n:
+        scaled = [max(0.2, float(d) / max(0.5, speed)) for d in durations]
+        total = sum(scaled)
+        if total > 0.2:
+            scaled = [hold * (d / total) for d in scaled]
         else:
-            bgm_mp3 = src
+            scaled = even_scene_durations(n, hold)
+    else:
+        scaled = even_scene_durations(n, hold)
+    scaled[-1] = max(0.2, hold - sum(scaled[:-1]))
 
-    if len(entries) == 1:
-        args = [
+    voice_mp3 = job_dir / "voice.mp3"
+    src_voice = Path(voice_path)
+    if src_voice.resolve() != voice_mp3.resolve():
+        if src_voice.suffix.lower() == ".mp3":
+            shutil.copy2(str(src_voice), str(voice_mp3))
+        else:
+            try:
+                run_ffmpeg(
+                    ["-i", str(src_voice), "-vn", "-ac", "2", "-ar", "44100", "-b:a", "128k", str(voice_mp3)],
+                    timeout=20,
+                )
+            except Exception:
+                shutil.copy2(str(src_voice), str(voice_mp3))
+    if not os.path.exists(str(voice_mp3)):
+        raise RuntimeError("voice.mp3가 없습니다.")
+
+    bgm_wav = None
+    if bgm_path and Path(bgm_path).is_file():
+        bgm_wav = job_dir / "bgm.wav"
+        try:
+            run_ffmpeg(
+                [
+                    "-stream_loop",
+                    "-1",
+                    "-i",
+                    str(bgm_path),
+                    "-t",
+                    "{:.3f}".format(hold),
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "44100",
+                    str(bgm_wav),
+                ],
+                timeout=25,
+            )
+        except Exception as exc:
+            print("[안내] bgm.wav 변환 실패: {}".format(exc), flush=True)
+            bgm_wav = None
+        if bgm_wav is not None and (not os.path.exists(str(bgm_wav)) or os.path.getsize(str(bgm_wav)) < 32):
+            bgm_wav = None
+
+    srt = None
+    if cues and font_path:
+        srt = write_cues_srt(cues, job_dir / "subs.srt")
+
+    args = []
+    for frame, dur in zip(disk_frames, scaled):
+        args += [
             "-loop",
             "1",
             "-framerate",
             str(FPS),
             "-t",
-            "{:.3f}".format(hold),
+            "{:.3f}".format(max(0.2, float(dur))),
             "-i",
-            str(entries[0][0]),
-            "-i",
-            str(voice_fit),
+            str(frame),
         ]
+    args += ["-i", str(voice_mp3)]
+    voice_idx = n
+    bgm_idx = None
+    if bgm_wav is not None:
+        args += ["-i", str(bgm_wav)]
+        bgm_idx = n + 1
+
+    vf_parts = []
+    for i in range(n):
+        vf_parts.append(
+            "[{i}:v]scale={w}:{h}:force_original_aspect_ratio=disable,"
+            "setsar=1,fps={fps},format=yuv420p[v{i}]".format(
+                i=i, w=width, h=height, fps=FPS
+            )
+        )
+    if n == 1:
+        vstream = "v0"
     else:
-        args = ["-f", "concat", "-safe", "0", "-i", str(concat_path), "-i", str(voice_fit)]
+        vf_parts.append(
+            "{}concat=n={}:v=1:a=0[vcat]".format(
+                "".join("[v{}]".format(i) for i in range(n)), n
+            )
+        )
+        vstream = "vcat"
+    if srt is not None:
+        vf_parts.append("[{}]{}[vout]".format(vstream, subtitles_vf(srt, font_path, caption_style)))
+        vstream = "vout"
 
-    vf = visual_fx_filter(visual_fx, width, height, FPS)
-    if cues and font_path:
-        srt = write_cues_srt(cues, work_dir / "subs.srt")
-        vf = "{},{}".format(vf, subtitles_vf(srt, font_path, caption_style))
-
-    audio_map = ["-map", "0:v:0", "-map", "1:a:0"]
-    extra = ["-filter_complex", "[0:v]{}[v]".format(vf)]
-    audio_map = ["-map", "[v]", "-map", "1:a:0"]
-    if bgm_mp3 is not None:
-        args += ["-i", str(bgm_mp3)]
+    trim = "{:.3f}".format(hold)
+    audio_filters = []
+    if bgm_idx is not None:
         if audio_ducking:
-            af = ducking_audio_filter(speed)
+            mixed = ducking_audio_filter(speed, voice_idx=voice_idx, bgm_idx=bgm_idx)
+            if mixed.endswith("[a]"):
+                mixed = mixed[:-3] + "[amix]"
+            audio_filters.append(mixed)
+            audio_filters.append(
+                "[amix]apad,atrim=0:{t},asetpts=PTS-STARTPTS[a]".format(t=trim)
+            )
         else:
-            af = "[1:a]volume=1.05[va];[2:a]volume=0.16[ba];[va][ba]amix=inputs=2:duration=first:dropout_transition=0[a]"
-            if abs(speed - 1.0) > 0.001:
-                af = (
-                    "[1:a]volume=1.05,{tempo}[va];[2:a]volume=0.16,{tempo}[ba];"
-                    "[va][ba]amix=inputs=2:duration=first:dropout_transition=0[a]"
-                ).format(tempo=atempo_chain(speed))
-        extra = ["-filter_complex", "[0:v]{}[v];{}".format(vf, af)]
-        audio_map = ["-map", "[v]", "-map", "[a]"]
-    elif abs(speed - 1.0) > 0.001:
-        extra = ["-filter_complex", "[0:v]{}[v];[1:a]{}[a]".format(vf, atempo_chain(speed))]
-        audio_map = ["-map", "[v]", "-map", "[a]"]
+            audio_filters.append(
+                "[{v}:a]volume=1.05,apad,atrim=0:{t}[va];[{b}:a]volume=0.16,aloop=-1:size=2e+09,atrim=0:{t}[ba];"
+                "[va][ba]amix=inputs=2:duration=first:dropout_transition=0[a]".format(
+                    v=voice_idx, b=bgm_idx, t=trim
+                )
+            )
+        a_map = "[a]"
+    else:
+        audio_filters.append(
+            "[{v}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,"
+            "volume=1.05,apad,atrim=0:{t},asetpts=PTS-STARTPTS[a]".format(
+                v=voice_idx, t=trim
+            )
+        )
+        a_map = "[a]"
 
-    args += extra
-    args += audio_map
-    args += ["-t", "{:.3f}".format(hold), "-r", str(FPS)] + FFMPEG_ENCODE + [str(out_file)]
-    run_ffmpeg(args, timeout=max(90, min(int(hold * 5 + 40), 240)))
+    fc = ";".join(vf_parts + audio_filters)
+    encode = [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-tune",
+        "stillimage",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+    ]
+    cmd = args + [
+        "-filter_complex",
+        fc,
+        "-map",
+        "[{}]".format(vstream),
+        "-map",
+        a_map,
+        "-t",
+        trim,
+        "-r",
+        str(FPS),
+    ] + encode + [str(out_file)]
+    try:
+        run_ffmpeg(cmd, timeout=max(90, min(int(hold * 5 + 40), 240)))
+    except Exception as exc:
+        if srt is None:
+            raise
+        print("[안내] 자막 합성 실패, 자막 없이 재렌더: {}".format(exc), flush=True)
+        vf_parts = [p for p in vf_parts if "[vout]" not in p]
+        vstream = "v0" if n == 1 else "vcat"
+        fc = ";".join(vf_parts + audio_filters)
+        cmd = args + [
+            "-filter_complex",
+            fc,
+            "-map",
+            "[{}]".format(vstream),
+            "-map",
+            a_map,
+            "-t",
+            trim,
+            "-r",
+            str(FPS),
+        ] + encode + [str(out_file)]
+        run_ffmpeg(cmd, timeout=max(90, min(int(hold * 5 + 40), 240)))
 
 
 def resolve_bgm(mood, duration, dest):
@@ -3016,17 +3186,18 @@ def fast_blur_slideshow(media_files, out_file, work_dir, voice_path=None, durati
     out_file = Path(out_file)
     os.makedirs(str(out_file.parent), exist_ok=True)
     src = Path(media_files[0]) if media_files else None
+    preset = Path(out_file).parent / "frame_0.jpg"
     frame = work_dir / "fast_blur.jpg"
     try:
-        if src is not None and src.suffix.lower() in IMAGE_EXTS:
-            diet_image_file(src, dest=frame)
+        if os.path.exists(str(preset)) and os.path.getsize(str(preset)) >= 32:
+            shutil.copy2(str(preset), str(frame))
         elif src is not None:
-            still_from_media(src, frame, work_dir, TARGET_W, TARGET_H)
+            compose_blur_fill_frame(src, frame, TARGET_W, TARGET_H)
         else:
             raise RuntimeError("no media")
     except Exception as exc:
         print("[안내] fast_blur.jpg 준비 실패, 단색 폴백: {}".format(exc))
-        Image.new("RGB", (TARGET_W, TARGET_H), (18, 10, 28)).save(str(frame), "JPEG", quality=80)
+        Image.new("RGB", (TARGET_W, TARGET_H), (32, 28, 36)).save(str(frame), "JPEG", quality=80)
     ensure_jpeg_on_disk(frame, (TARGET_W, TARGET_H))
     require_image_for_ffmpeg(frame)
     args = [
@@ -3184,7 +3355,7 @@ def run_pipeline(
             "미디어 {}개 준비: {}".format(len(media_files), ", ".join(p.name for p in media_files)),
             progress_lock,
         )
-        _notify(progress_cb, 8, "사진 초경량 압축 및 하이라이트 추출", progress_lock)
+        _notify(progress_cb, 8, "9:16 블러 배경 프레임 사전 합성", progress_lock)
         slim = []
         for path in media_files:
             prepared = smart_prepare_media(path, work_dir)
@@ -3193,6 +3364,11 @@ def run_pipeline(
             else:
                 slim.append(prepared)
         media_files = slim
+        job_dir = out_file.parent
+        try:
+            prepare_job_frames(media_files, job_dir, width, height)
+        except Exception as exc:
+            print("[안내] 사전 프레임 합성 실패: {}".format(exc), flush=True)
         gc.collect()
 
         if spark or not fast_mode:
@@ -3231,15 +3407,7 @@ def run_pipeline(
                 cycle = [media_files[i] for i in photo_order if 0 <= i < len(media_files)]
                 if cycle:
                     ordered = cycle
-            stills = []
-            for index, src in enumerate(ordered):
-                dest = work_dir / "hold_{:03d}.jpg".format(index)
-                still_from_media(src, dest, work_dir, width, height)
-                stills.append(ensure_jpeg_on_disk(dest, (width, height)))
-            return stills or prepare_captioned_frames(
-                media_files, pieces or [script], photo_order, font_path, work_dir,
-                direction=direction, width=width, height=height,
-            )
+            return prepare_job_frames(ordered, out_file.parent, width, height)
 
         def _voice_job():
             _notify(progress_cb, 28, "ElevenLabs 음성 합성 중", progress_lock)

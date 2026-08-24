@@ -45,6 +45,8 @@ from main import (
     PIPELINE_HARD_LIMIT,
     VIDEO_EXTS,
     analyze_media_styles,
+    canvas_size,
+    compose_blur_fill_frame,
     diet_image_file,
     fast_blur_slideshow,
     load_settings,
@@ -187,7 +189,7 @@ def _purge_job_temps(job_dir, keep_file=None):
     if not job_dir.exists():
         return
     keep = None
-    keep_names = {"status.json", "final_shorts.mp4"}
+    keep_names = {"status.json", "final_shorts.mp4", "voice.mp3", "bgm.wav", "subs.srt"}
     if keep_file:
         try:
             keep = Path(keep_file).resolve()
@@ -197,7 +199,7 @@ def _purge_job_temps(job_dir, keep_file=None):
         try:
             if keep is not None and child.resolve() == keep:
                 continue
-            if child.name in keep_names:
+            if child.name in keep_names or child.name.startswith("frame_"):
                 continue
         except OSError:
             pass
@@ -612,6 +614,16 @@ async def create_video(
             dest = media_dir / "{:03d}_{}".format(index + 1, filename)
             dest = await _persist_upload(item, dest)
             saved.append(dest)
+            try:
+                canvas_w, canvas_h = canvas_size(ratio, height)
+                compose_blur_fill_frame(
+                    dest,
+                    job_dir / "frame_{}.jpg".format(index),
+                    canvas_w,
+                    canvas_h,
+                )
+            except Exception as exc:
+                print("[안내] 업로드 직후 9:16 프레임 합성 실패: {}".format(exc), flush=True)
             _release_memory()
     except HTTPException:
         shutil.rmtree(job_dir, ignore_errors=True)
