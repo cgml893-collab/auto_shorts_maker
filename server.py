@@ -244,10 +244,21 @@ def _update_job(job_id, **fields):
     _persist_job(job_id)
 
 
-def _payment_response(message=PAYMENT_MESSAGE):
+def _payment_response(message=PAYMENT_MESSAGE, status_code=402):
     return JSONResponse(
-        status_code=402,
+        status_code=status_code,
         content={"error": PAYMENT_REQUIRED, "message": message},
+    )
+
+
+def _vip_forbidden_response(message="👑 VIP 시네마 스튜디오는 프로 VIP 전용입니다."):
+    return JSONResponse(
+        status_code=403,
+        content={
+            "error": PAYMENT_REQUIRED,
+            "code": "VIP_PRO_REQUIRED",
+            "message": message,
+        },
     )
 
 
@@ -268,6 +279,10 @@ def _run_job(
     visual_fx="ken_burns",
     aspect_ratio="9:16",
     audio_ducking=True,
+    is_vip_mode=False,
+    action_motion_enabled=False,
+    action_style="",
+    action_preset="",
 ):
     started = time.time()
     target_duration = normalize_target_duration(target_duration)
@@ -333,6 +348,10 @@ def _run_job(
                 visual_fx=visual_fx,
                 aspect_ratio=aspect_ratio,
                 audio_ducking=audio_ducking,
+                is_vip_mode=is_vip_mode,
+                action_motion_enabled=action_motion_enabled,
+                action_style=action_style,
+                action_preset=action_preset,
             )
             try:
                 fut.result(timeout=max(8.0, budget - 6.0))
@@ -507,6 +526,10 @@ async def create_video(
     visual_fx: str = Form("ken_burns", description="ken_burns / zoom_punch / cinematic"),
     aspect_ratio: str = Form("9:16", description="9:16 / 16:9 / 1:1"),
     audio_ducking: str = Form("true", description="보이스 구간에 BGM 20% 더킹"),
+    is_vip_mode: str = Form("false", description="👑 VIP 시네마 스튜디오"),
+    action_motion_enabled: str = Form("false", description="다이내믹 액션 모션"),
+    action_style: str = Form("", description="액션 직접 입력"),
+    action_preset: str = Form("", description="bike_stunt/dance/dynamic/sprint"),
 ):
     prompt = (style or style_prompt or "").strip()
     if not files:
@@ -522,6 +545,8 @@ async def create_video(
     fx = normalize_visual_fx(visual_fx or motion)
     ratio = normalize_aspect_ratio(aspect_ratio)
     ducking = parse_flag(audio_ducking) if str(audio_ducking or "").strip() else True
+    vip = parse_flag(is_vip_mode) or spark
+    action_on = parse_flag(action_motion_enabled) or bool((action_style or action_preset or "").strip())
     try:
         height = int(float(output_height or 720))
     except (TypeError, ValueError):
@@ -542,8 +567,11 @@ async def create_video(
         speed,
         height,
         style_prompt=prompt,
+        is_vip_mode=vip,
     )
     if not allowed:
+        if vip and (features or {}).get("plan") != "pro":
+            return _vip_forbidden_response(err_msg or "👑 VIP 시네마 스튜디오는 프로 VIP 전용입니다.")
         return _payment_response(err_msg or PAYMENT_MESSAGE)
 
     job_id = uuid.uuid4().hex[:16]
@@ -594,7 +622,7 @@ async def create_video(
         voice_key,
         speed,
         mood,
-        spark,
+        spark or vip,
         motion,
         height,
         features,
@@ -603,6 +631,10 @@ async def create_video(
         fx,
         ratio,
         ducking,
+        vip,
+        action_on,
+        action_style,
+        action_preset,
     )
     return {
         "job_id": job_id,
@@ -611,8 +643,12 @@ async def create_video(
         "speed_multiplier": speed,
         "bgm_type": mood,
         "bgm_mood": mood,
-        "is_spark_cinema": spark,
-        "is_runway_mode": spark,
+        "is_spark_cinema": spark or vip,
+        "is_runway_mode": spark or vip,
+        "is_vip_mode": vip,
+        "action_motion_enabled": action_on,
+        "action_style": action_style,
+        "action_preset": action_preset,
         "camera_motion": motion,
         "output_height": height,
         "target_duration": duration,

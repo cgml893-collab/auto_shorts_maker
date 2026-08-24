@@ -113,6 +113,9 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
   String _aspectRatio = '9:16';
   String _captionStyle = 'hormozi';
   String _visualFx = 'ken_burns';
+  bool _actionMotion = true;
+  String _actionPreset = 'bike_stunt';
+  final _actionCtrl = TextEditingController();
   File? _resultVideo;
   VideoPlayerController? _player;
   String _plan = 'free';
@@ -170,6 +173,7 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _styleCtrl.dispose();
+    _actionCtrl.dispose();
     _player?.dispose();
     super.dispose();
   }
@@ -282,6 +286,7 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
         }
         if (_plan != 'pro') {
           _sparkCinema = false;
+          _actionMotion = false;
         }
       });
     } catch (_) {}
@@ -473,7 +478,7 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
   }
 
   bool _isPayment(http.Response res) {
-    if (res.statusCode == 402) {
+    if (res.statusCode == 402 || res.statusCode == 403) {
       return true;
     }
     try {
@@ -493,14 +498,15 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
       context: context,
       builder: (ctx) {
         return AlertDialog(
-          backgroundColor: const Color(0xFF1A1028),
-          title: const Text('라이선스 구매가 필요합니다'),
+          backgroundColor: const Color(0xFF1A1408),
+          title: const Text('👑 프로 VIP 라이선스 업그레이드'),
           content: Text(
-            message ?? '무료 체험이 만료되었습니다. 라이선스를 구매해 주세요.',
+            message ?? '이 기능은 프로 VIP 전용입니다. 라이선스를 업그레이드해 주세요.',
           ),
           actions: [
             TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('닫기')),
             FilledButton(
+              style: FilledButton.styleFrom(backgroundColor: const Color(0xFFD4AF37)),
               onPressed: () {
                 Navigator.pop(ctx);
                 _openLicenseModal();
@@ -619,7 +625,7 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
 
   Future<void> _selectMode(bool spark) async {
     if (spark && _plan != 'pro') {
-      await _showPaymentModal('✨ 스파크 시네마 AI는 프로 VIP 전용입니다.');
+      await _showPaymentModal('👑 VIP 시네마 스튜디오는 프로 VIP 전용입니다.');
       return;
     }
     setState(() => _sparkCinema = spark);
@@ -639,7 +645,7 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
       return;
     }
     if (_sparkCinema && _plan != 'pro') {
-      await _showPaymentModal('✨ 스파크 시네마 AI는 프로 VIP 전용입니다.');
+      await _showPaymentModal('👑 VIP 시네마 스튜디오는 프로 VIP 전용입니다.');
       return;
     }
     final auth = await _apiAuth();
@@ -674,6 +680,10 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
           req.fields['bgm_mood'] = _bgmMood;
           req.fields['is_spark_cinema'] = _sparkCinema ? 'true' : 'false';
           req.fields['is_runway_mode'] = _sparkCinema ? 'true' : 'false';
+          req.fields['is_vip_mode'] = _sparkCinema ? 'true' : 'false';
+          req.fields['action_motion_enabled'] = (_sparkCinema && _actionMotion) ? 'true' : 'false';
+          req.fields['action_preset'] = _sparkCinema ? _actionPreset : '';
+          req.fields['action_style'] = _sparkCinema ? _actionCtrl.text.trim() : '';
           req.fields['camera_motion'] = _cameraMotion;
           req.fields['output_height'] = _plan == 'pro' ? '1080' : '720';
           req.fields['target_duration'] = '$_targetDuration';
@@ -941,11 +951,13 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
       body: Stack(
         children: [
           Container(
-            decoration: const BoxDecoration(
+            decoration: BoxDecoration(
               gradient: RadialGradient(
-                center: Alignment(1.0, -1.0),
+                center: const Alignment(1.0, -1.0),
                 radius: 1.15,
-                colors: [Color(0x447C4DFF), Color(0xFF0B0714)],
+                colors: _sparkCinema
+                    ? const [Color(0x66D4AF37), Color(0xFF0C0904)]
+                    : const [Color(0x447C4DFF), Color(0xFF0B0714)],
               ),
             ),
             child: SafeArea(
@@ -968,13 +980,13 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
                     segments: [
                       const ButtonSegment(
                         value: false,
-                        label: Text('⚡ 10초 쾌속 모드'),
+                        label: Text('⚡ 쾌속 기본 모드'),
                         icon: Icon(Icons.bolt),
                       ),
                       ButtonSegment(
                         value: true,
-                        label: Text(_plan == 'pro' ? '✨ 스파크 시네마 AI' : '✨ 스파크 시네마 AI (PRO 🔒)'),
-                        icon: const Icon(Icons.auto_awesome),
+                        label: Text(_plan == 'pro' ? '👑 VIP 시네마 스튜디오' : '👑 VIP 시네마 스튜디오 (PRO 🔒)'),
+                        icon: const Icon(Icons.workspace_premium),
                       ),
                     ],
                     selected: {_sparkCinema},
@@ -984,23 +996,73 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
                     style: ButtonStyle(
                       backgroundColor: WidgetStateProperty.resolveWith((states) {
                         if (states.contains(WidgetState.selected)) {
-                          return const Color(0xFFFF4D8D);
+                          return _sparkCinema ? const Color(0xFFD4AF37) : const Color(0xFFFF4D8D);
                         }
                         return const Color(0x331A1028);
                       }),
+                      foregroundColor: WidgetStateProperty.all(Colors.white),
                     ),
                   ),
                   if (_sparkCinema) ...[
-                    const SizedBox(height: 12),
-                    const _Label('카메라 모션'),
-                    _OptionWrap(
-                      options: const [
-                        _Option('zoom_in', '줌인'),
-                        _Option('drone', '드론 샷'),
-                        _Option('pan', '패닝'),
-                      ],
-                      value: _cameraMotion,
-                      onChanged: (v) => setState(() => _cameraMotion = v),
+                    const SizedBox(height: 14),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+                      decoration: BoxDecoration(
+                        color: const Color(0xCC1A1408),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(color: const Color(0xFFD4AF37), width: 1.2),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'VIP 시네마 스튜디오',
+                            style: TextStyle(color: Color(0xFFE8C872), fontWeight: FontWeight.w800, fontSize: 15),
+                          ),
+                          const SizedBox(height: 8),
+                          SwitchListTile.adaptive(
+                            contentPadding: EdgeInsets.zero,
+                            title: const Text('🔥 다이내믹 액션 모션'),
+                            subtitle: const Text('사진 속 피사체가 액션을 수행하는 I2V'),
+                            value: _actionMotion,
+                            activeThumbColor: const Color(0xFFD4AF37),
+                            onChanged: (v) => setState(() => _actionMotion = v),
+                          ),
+                          const SizedBox(height: 6),
+                          const _Label('액션 프리셋'),
+                          _OptionWrap(
+                            options: const [
+                              _Option('bike_stunt', '🏍️ 바이크 묘기/질주'),
+                              _Option('dance', '💃 댄스/모션'),
+                              _Option('dynamic', '⚡ 다이내믹 액션'),
+                              _Option('sprint', '🏃 역동적 질주'),
+                            ],
+                            value: _actionPreset,
+                            onChanged: (v) => setState(() => _actionPreset = v),
+                          ),
+                          const SizedBox(height: 12),
+                          TextField(
+                            controller: _actionCtrl,
+                            minLines: 1,
+                            maxLines: 2,
+                            decoration: const InputDecoration(
+                              hintText: '액션 직접 입력 (예: 오토바이 앞바퀴 들고 묘기)',
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          const _Label('카메라 모션'),
+                          _OptionWrap(
+                            options: const [
+                              _Option('zoom_in', '줌인'),
+                              _Option('drone', '드론 샷'),
+                              _Option('pan', '패닝'),
+                            ],
+                            value: _cameraMotion,
+                            onChanged: (v) => setState(() => _cameraMotion = v),
+                          ),
+                        ],
+                      ),
                     ),
                   ],
                   const SizedBox(height: 20),

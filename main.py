@@ -70,6 +70,8 @@ BLUR_DIM = 0.38
 FAL_I2V_PRIMARY = os.getenv("FAL_I2V_MODEL", "fal-ai/minimax/video-01/image-to-video")
 FAL_I2V_FALLBACK = "fal-ai/kling-video/v1/standard/image-to-video"
 FAL_WAIT_TIMEOUT = 25.0
+SPARK_MAX_CLIPS = 3
+SPARK_CLIP_SEC = 5.0
 PIPELINE_HARD_LIMIT = 90.0
 FAST_BLUR_SEC = 3.0
 HD_W = 1080
@@ -2233,8 +2235,369 @@ async def fal_image_to_video_timed(image_path, prompt, dest_mp4, timeout=FAL_WAI
             timeout=float(timeout),
         )
     except asyncio.TimeoutError:
-        print("[안내] fal.ai {}초 타임아웃 → 블러 폴백".format(timeout))
+        print("[안내] fal.ai {}초 타임아웃 → 하위 엔진 폴백".format(timeout))
         raise RuntimeError("fal.ai 대기열 타임아웃 ({}s)".format(timeout))
+
+
+VIP_I2V_TIMEOUT = 32.0
+ACTION_PRESETS = {
+    "bike_stunt": "오토바이 앞바퀴를 들고 묘기 부리며 질주하는 장면, 엔진 배기음과 타이어 연기",
+    "dance": "비트에 맞춘 역동적인 댄스, 강한 제스처와 카메라 펀치 인",
+    "dynamic": "폭발적인 다이내믹 액션, 파편과 에너지, 빠른 카메라 푸시",
+    "sprint": "전력 질주하는 추적 샷, 바람과 먼지가 흩날리는 장면",
+}
+MULTI_ANGLES = (
+    ("wide", "wide cinematic establishing shot, full body visible in the environment, natural parallax"),
+    ("close", "tight close-up preserving the exact face and outfit, shallow depth of field, micro motion"),
+    ("drone", "high cinematic drone aerial tracking shot, smooth orbit, keep subject identity"),
+)
+
+
+def normalize_action_preset(value):
+    key = (value or "").strip().lower().replace("-", "_").replace(" ", "")
+    aliases = {
+        "bike_stunt": "bike_stunt",
+        "bike": "bike_stunt",
+        "바이크": "bike_stunt",
+        "오토바이": "bike_stunt",
+        "dance": "dance",
+        "댄스": "dance",
+        "dynamic": "dynamic",
+        "다이내믹": "dynamic",
+        "sprint": "sprint",
+        "질주": "sprint",
+        "run": "sprint",
+    }
+    return aliases.get(key, "")
+
+
+def resolve_action_style(preset="", custom=""):
+    preset_key = normalize_action_preset(preset)
+    custom = (custom or "").strip()
+    parts = []
+    if preset_key:
+        parts.append(ACTION_PRESETS[preset_key])
+    if custom:
+        parts.append(custom)
+    return " / ".join(parts) or ACTION_PRESETS["dynamic"]
+
+
+def expand_action_i2v_prompt(settings, action_style, angle_prompt, style_prompt=""):
+    fallback = (
+        "Photorealistic image-to-video. Keep the exact person, face, clothing, and body proportions. "
+        "{angle}. Action: {action}. Physically plausible motion, cinematic camera move, 24fps, "
+        "high detail, no morphing, no extra limbs. Style: {style}."
+    ).format(
+        angle=angle_prompt,
+        action=action_style or "dynamic cinematic motion",
+        style=style_prompt or "cinematic short-form",
+    )
+    api_key = getattr(settings, "openai_api_key", "") or os.getenv("OPENAI_API_KEY") or ""
+    if not api_key:
+        return fallback
+    try:
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You write a single English image-to-video prompt. Preserve identity. "
+                        "Include real-world physics and a camera move. No quotes, no lists."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Action (Korean/English): {}\nCamera/angle: {}\nStyle: {}\n"
+                        "Write one dense I2V prompt."
+                    ).format(action_style, angle_prompt, style_prompt or "cinematic"),
+                },
+            ],
+            temperature=0.7,
+            max_tokens=220,
+        )
+        text = (response.choices[0].message.content or "").strip().replace("\n", " ")
+        return text or fallback
+    except Exception as exc:
+        print("[안내] 액션 프롬프트 확장 실패, 로컬 프롬프트 사용: {}".format(exc))
+        return fallback
+
+
+def action_sfx_kinds(action_style):
+    text = (action_style or "").lower()
+    if any(k in text for k in ("바이크", "오토바이", "bike", "wheelie", "엔진", "질주", "타이어")):
+        return ("engine", "tire", "wind")
+    if any(k in text for k in ("댄스", "dance", "춤")):
+        return ("whoosh", "pop", "boom")
+    if any(k in text for k in ("폭발", "파열", "boom", "임팩트")):
+        return ("boom", "whoosh", "wind")
+    return ("whoosh", "wind", "boom")
+
+
+def ensure_engine_sfx():
+    found = find_named_sfx("engine")
+    if found:
+        return found
+    path = SFX_DIR / "engine.wav"
+    sr = 44100
+    n = int(sr * 1.8)
+    t = np.arange(n, dtype=np.float64) / sr
+    rumble = 0.22 * np.sin(2 * np.pi * 72 * t) + 0.12 * np.sin(2 * np.pi * 36 * t)
+    pops = ((t * 18) % 1.0 < 0.08).astype(np.float64) * 0.18 * np.sin(2 * np.pi * 220 * t)
+    env = np.minimum(1.0, np.minimum(t / 0.05, (t[-1] - t) / 0.12))
+    _write_wav_mono(path, (rumble + pops) * env, sr)
+    return path
+
+
+def ensure_tire_sfx():
+    found = find_named_sfx("tire") or find_named_sfx("skid")
+    if found:
+        return found
+    path = SFX_DIR / "tire.wav"
+    sr = 44100
+    n = int(sr * 0.7)
+    t = np.arange(n, dtype=np.float64) / sr
+    noise = np.random.default_rng(21).normal(0, 1, n)
+    hiss = noise * np.exp(-t * 3.2) * (0.35 + 0.2 * np.sin(2 * np.pi * 18 * t))
+    _write_wav_mono(path, hiss, sr)
+    return path
+
+
+def ensure_boom_sfx():
+    found = find_named_sfx("boom") or find_named_sfx("impact")
+    if found:
+        return found
+    path = SFX_DIR / "boom.wav"
+    sr = 44100
+    n = int(sr * 0.9)
+    t = np.arange(n, dtype=np.float64) / sr
+    boom = np.sin(2 * np.pi * (48 + t * 20) * t) * np.exp(-t * 5.5)
+    noise = np.random.default_rng(3).normal(0, 1, n) * np.exp(-t * 9) * 0.22
+    _write_wav_mono(path, 0.85 * boom + noise, sr)
+    return path
+
+
+def ensure_wind_sfx():
+    found = find_named_sfx("wind") or find_named_sfx("air")
+    if found:
+        return found
+    path = SFX_DIR / "wind.wav"
+    sr = 44100
+    n = int(sr * 1.4)
+    t = np.arange(n, dtype=np.float64) / sr
+    noise = np.random.default_rng(11).normal(0, 1, n)
+    wind = noise * (0.18 + 0.12 * np.sin(2 * np.pi * 0.7 * t)) * np.minimum(1.0, t / 0.08)
+    _write_wav_mono(path, wind, sr)
+    return path
+
+
+def resolve_sfx_file(kind):
+    if kind == "engine":
+        return ensure_engine_sfx()
+    if kind == "tire":
+        return ensure_tire_sfx()
+    if kind == "boom":
+        return ensure_boom_sfx()
+    if kind == "wind":
+        return ensure_wind_sfx()
+    if kind == "pop":
+        return ensure_pop_sfx()
+    return ensure_whoosh_sfx()
+
+
+def split_words_timed(script, duration):
+    words = [w for w in re.findall(r"\S+", sanitize_narration(script) or "") if w]
+    duration = max(1.0, float(duration))
+    if not words:
+        return []
+    weights = [max(1, len(re.sub(r"\W+", "", w, flags=re.U)) or 1) for w in words]
+    total = float(sum(weights))
+    cursor = 0.0
+    out = []
+    for word, weight in zip(words, weights):
+        span = duration * (weight / total)
+        out.append((word, cursor, min(duration, cursor + max(0.08, span))))
+        cursor += span
+    if out:
+        out[-1] = (out[-1][0], out[-1][1], duration)
+    return out
+
+
+def _ass_clock(seconds):
+    seconds = max(0.0, float(seconds))
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = seconds - hours * 3600 - minutes * 60
+    return "{:d}:{:02d}:{:05.2f}".format(hours, minutes, secs)
+
+
+def write_kinetic_ass(words, dest, play_w=720, play_h=1280):
+    dest = Path(dest)
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "PlayResX: {}".format(int(play_w)),
+        "PlayResY: {}".format(int(play_h)),
+        "WrapStyle: 2",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        "Style: Kinetic,NanumGothic,28,&H00FFFFFF,&H000000FF,&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,4,0,2,36,36,72,1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    for index, (word, start, end) in enumerate(words):
+        left = " ".join(w for w, _s, _e in words[max(0, index - 2) : index])
+        right = " ".join(w for w, _s, _e in words[index + 1 : index + 3])
+        text = r"{{\c&H00FFFFFF&}}" + left
+        if left:
+            text += " "
+        text += r"{{\c&H0000EAFF&\b1}}" + word + r"{{\c&H00FFFFFF&\b0}}"
+        if right:
+            text += " " + right
+        lines.append(
+            "Dialogue: 0,{},{},Kinetic,,0,0,0,,{}".format(
+                _ass_clock(start), _ass_clock(end), text.replace("\n", " ")
+            )
+        )
+    dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return dest
+
+
+def generate_vip_action_clips(
+    media_files,
+    settings,
+    action_style,
+    style_prompt,
+    work_dir,
+    progress_cb=None,
+    lock=None,
+    width=None,
+    height=None,
+):
+    sources = list(media_files)[:SPARK_MAX_CLIPS]
+    width = int(width or TARGET_W)
+    height = int(height or TARGET_H)
+    _notify(progress_cb, 32, "👑 VIP 액션 모션 · Kling/Minimax I2V 합성", lock)
+    clips = []
+
+    async def _one(index, src):
+        angle_key, angle_prompt = MULTI_ANGLES[index % len(MULTI_ANGLES)]
+        prompt = expand_action_i2v_prompt(settings, action_style, angle_prompt, style_prompt)
+        print("   VIP I2V [{}]: {}".format(angle_key, prompt[:160]))
+        frame = work_dir / ("vip_src_{:02d}.jpg".format(index + 1))
+        await asyncio.to_thread(still_from_media, src, frame, work_dir, width, height)
+        clip = work_dir / ("vip_{:02d}.mp4".format(index + 1))
+        await fal_image_to_video_timed(frame, prompt, clip, timeout=VIP_I2V_TIMEOUT)
+        return clip
+
+    async def _gather():
+        return await asyncio.wait_for(
+            asyncio.gather(*[_one(i, src) for i, src in enumerate(sources)], return_exceptions=True),
+            timeout=VIP_I2V_TIMEOUT + 4,
+        )
+
+    try:
+        results = asyncio.run(_gather())
+    except Exception as exc:
+        print("[안내] VIP I2V 병렬 실패: {}".format(exc))
+        return []
+    for item in results:
+        if isinstance(item, Exception):
+            print("[안내] VIP 클립 실패: {}".format(item))
+        elif item and Path(item).is_file():
+            clips.append(item)
+    return clips
+
+
+def mix_vip_sfx(video_path, out_file, duration, action_style, cue_starts, scene_starts, work_dir):
+    kinds = action_sfx_kinds(action_style)
+    inputs = ["-i", str(video_path)]
+    filters = []
+    mix_labels = ["[0:a]"]
+    index = 1
+    climax = max(0.6, float(duration) * 0.72)
+
+    def _add(kind, at, volume=0.42):
+        nonlocal index
+        path = resolve_sfx_file(kind)
+        inputs.extend(["-i", str(path)])
+        delay_ms = max(0, int(round(float(at) * 1000)))
+        lab = "s{}".format(index)
+        filters.append("[{}:a]adelay={}|{},volume={:.2f},apad=pad_dur=2[{}]".format(index, delay_ms, delay_ms, volume, lab))
+        mix_labels.append("[{}]".format(lab))
+        index += 1
+
+    for kind in kinds[:2]:
+        _add(kind, 0.15 if kind != "boom" else climax, 0.38 if kind != "engine" else 0.28)
+    _add("whoosh", 0.04, 0.34)
+    for start in list(scene_starts or [])[1:4]:
+        _add("whoosh", max(0.0, float(start) - 0.05), 0.32)
+    for start in list(cue_starts or [])[:6]:
+        _add("pop", float(start), 0.28)
+    _add("boom", climax, 0.55)
+    n = len(mix_labels)
+    filters.append("{}amix=inputs={}:duration=first:dropout_transition=0,volume=1.05[aout]".format("".join(mix_labels), n))
+    args = inputs + [
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        "0:v:0",
+        "-map",
+        "[aout]",
+        "-t",
+        "{:.3f}".format(float(duration)),
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        str(out_file),
+    ]
+    run_ffmpeg(args, timeout=40)
+    return Path(out_file)
+
+
+def burn_kinetic_captions(video_path, script, duration, font_path, out_file, work_dir, width, height, caption_style="hormozi"):
+    words = split_words_timed(script, duration)
+    ass = write_kinetic_ass(words, Path(work_dir) / "kinetic.ass", play_w=width, play_h=height)
+    srt = write_cues_srt([(w, s, e) for w, s, e in words], Path(work_dir) / "kinetic.srt")
+    vf = "ass={}".format(_ffmpeg_filter_path(ass))
+    try:
+        run_ffmpeg(
+            [
+                "-i",
+                str(video_path),
+                "-vf",
+                vf,
+                "-c:a",
+                "copy",
+            ]
+            + FFMPEG_PRESET
+            + [str(out_file)],
+            timeout=50,
+        )
+        return Path(out_file)
+    except Exception as exc:
+        print("[안내] ASS 키네틱 자막 실패, SRT 폴백: {}".format(exc))
+        run_ffmpeg(
+            [
+                "-i",
+                str(video_path),
+                "-vf",
+                subtitles_vf(srt, font_path, caption_style),
+                "-c:a",
+                "copy",
+            ]
+            + FFMPEG_PRESET
+            + [str(out_file)],
+            timeout=50,
+        )
+        return Path(out_file)
 
 
 def generate_spark_cinema_clips(
@@ -2632,6 +2995,10 @@ def run_pipeline(
     visual_fx="ken_burns",
     aspect_ratio="9:16",
     audio_ducking=True,
+    is_vip_mode=False,
+    action_motion_enabled=False,
+    action_style="",
+    action_preset="",
 ):
     if check_license:
         ok, message = verify_saved_license()
@@ -2647,13 +3014,24 @@ def run_pipeline(
     out_file.parent.mkdir(parents=True, exist_ok=True)
     speed = normalize_speed(speed_multiplier)
     mood = normalize_bgm_mood(bgm_mood)
+    vip = bool(is_vip_mode)
     spark = bool(is_spark_cinema) if is_spark_cinema is not None else bool(is_runway_mode)
+    spark = spark or vip
     motion = normalize_camera_motion(camera_motion)
     target_duration = normalize_target_duration(target_duration)
     caption_style = normalize_caption_style(caption_style)
     visual_fx = normalize_visual_fx(visual_fx or motion)
     aspect_ratio = normalize_aspect_ratio(aspect_ratio)
     width, height = canvas_size(aspect_ratio, output_height)
+    action_enabled = bool(action_motion_enabled) or bool((action_style or action_preset or "").strip())
+    if vip and action_enabled:
+        action_style = resolve_action_style(action_preset, action_style)
+    elif vip:
+        action_style = resolve_action_style(action_preset or "dynamic", action_style)
+    else:
+        action_style = ""
+    if vip and action_enabled:
+        visual_fx = "zoom_punch"
     if spark and mood == "none":
         mood = "lofi"
     voice_key, _voice_id, _preset = resolve_voice(voice_type)
@@ -2746,6 +3124,24 @@ def run_pipeline(
             return path
 
         def _frame_job():
+            if vip and _left() > 10:
+                try:
+                    clips = generate_vip_action_clips(
+                        media_files,
+                        settings,
+                        action_style,
+                        style_prompt,
+                        work_dir,
+                        progress_cb=progress_cb,
+                        lock=progress_lock,
+                        width=width,
+                        height=height,
+                    )
+                    if clips:
+                        return clips
+                    print("[안내] VIP I2V 빈 결과 → 쾌속 모션 엔진")
+                except Exception as exc:
+                    print("[안내] VIP I2V 실패 → 쾌속 모션: {}".format(exc))
             if spark and _left() > 8:
                 try:
                     return generate_spark_cinema_clips(
@@ -2759,7 +3155,7 @@ def run_pipeline(
                         height=height,
                     )
                 except Exception as exc:
-                    print("[안내] 스파크 시네마 실패, 사진 홀드 렌더로 전환: {}".format(exc))
+                    print("[안내] 쾌속 모션 실패, 블러/홀드 렌더로 전환: {}".format(exc))
                     return None
             _notify(progress_cb, 30, "사진 노출 균등 배분 및 리사이즈 중", progress_lock)
             frames = _hold_frames()
@@ -2856,6 +3252,40 @@ def run_pipeline(
 
         if not Path(out_file).is_file():
             raise RuntimeError("완성된 영상 파일을 찾지 못했습니다.")
+        if vip and Path(out_file).is_file():
+            try:
+                _notify(progress_cb, 88, "👑 키네틱 자막 · 스튜디오 오디오 마스터링", progress_lock)
+                captioned = work_dir / "vip_kinetic.mp4"
+                burn_kinetic_captions(
+                    out_file,
+                    script,
+                    audio_duration,
+                    font_path,
+                    captioned,
+                    work_dir,
+                    width,
+                    height,
+                    caption_style,
+                )
+                mixed = work_dir / "vip_master.mp4"
+                scene_starts = []
+                acc = 0.0
+                for dur in durations:
+                    scene_starts.append(acc)
+                    acc += float(dur)
+                mix_vip_sfx(
+                    captioned if Path(captioned).is_file() else out_file,
+                    mixed,
+                    audio_duration,
+                    action_style,
+                    [start for _t, start, _e in cues],
+                    scene_starts,
+                    work_dir,
+                )
+                if Path(mixed).is_file() and Path(mixed).stat().st_size > 1000:
+                    shutil.copy2(str(mixed), str(out_file))
+            except Exception as exc:
+                print("[안내] VIP 마스터링 생략: {}".format(exc))
         _notify(
             progress_cb,
             96,

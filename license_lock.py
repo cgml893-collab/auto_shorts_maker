@@ -239,6 +239,7 @@ def plan_features(plan):
             "label": plan_label(PLAN_PRO),
             "status_bar": "[프로 VIP 회원]",
             "spark_cinema": True,
+            "vip_mode": True,
             "variety_mode": True,
             "voices": list(PRO_VOICES),
             "bgm": list(PRO_BGM),
@@ -253,6 +254,7 @@ def plan_features(plan):
             "label": plan_label(PLAN_BASIC),
             "status_bar": "[베이직 회원]",
             "spark_cinema": False,
+            "vip_mode": False,
             "variety_mode": False,
             "voices": list(BASIC_VOICES),
             "bgm": list(BASIC_BGM),
@@ -266,6 +268,7 @@ def plan_features(plan):
         "label": plan_label(PLAN_FREE),
         "status_bar": "[무료 체험: 1회 가능]",
         "spark_cinema": False,
+        "vip_mode": False,
         "variety_mode": False,
         "voices": ["vlog_female", "variety_male"],
         "bgm": ["pop", "lofi"],
@@ -720,12 +723,15 @@ def authorize_create_job(
     speed,
     height,
     style_prompt="",
+    is_vip_mode=False,
 ):
     ok, message, features = resolve_mobile_entitlement(device_id, platform, license_key)
     hwid = features.get("hwid") or mobile_hwid(device_id, platform)
     plan = features["plan"]
     if plan == PLAN_FREE and not ok:
         return False, PAYMENT_REQUIRED, PAYMENT_MESSAGE, features
+    if is_vip_mode and plan != PLAN_PRO:
+        return False, PAYMENT_REQUIRED, "👑 VIP 시네마 스튜디오는 프로 VIP 전용입니다.", features
     if spark_cinema and not features["spark_cinema"]:
         return False, PAYMENT_REQUIRED, "✨ 스파크 시네마 AI는 프로 VIP 전용입니다.", features
     if float(speed) >= 1.45 and 1.5 not in features["speeds"]:
