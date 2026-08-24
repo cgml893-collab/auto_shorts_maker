@@ -54,6 +54,7 @@ from main import (
     normalize_bgm_mood,
     normalize_camera_motion,
     normalize_caption_style,
+    normalize_motion_intensity,
     normalize_speed,
     normalize_target_duration,
     normalize_visual_fx,
@@ -289,6 +290,7 @@ def _run_job(
     action_motion_enabled=False,
     action_style="",
     action_preset="",
+    motion_intensity=7,
 ):
     started = time.time()
     target_duration = normalize_target_duration(target_duration)
@@ -381,6 +383,7 @@ def _run_job(
                 action_motion_enabled=action_motion_enabled,
                 action_style=action_style,
                 action_preset=action_preset,
+                motion_intensity=motion_intensity,
             )
             try:
                 fut.result(timeout=max(90.0, budget))
@@ -558,7 +561,7 @@ async def create_video(
     bgm_type: str = Form("lofi", description="BGM 분위기"),
     is_runway_mode: str = Form("false", description="하위 호환"),
     is_spark_cinema: str = Form("false", description="✨ 스파크 시네마 AI"),
-    camera_motion: str = Form("zoom_in", description="zoom_in/drone/pan"),
+    camera_motion: str = Form("zoom_in", description="push_in/fpv/orbit/low_angle"),
     output_height: str = Form("720", description="720 또는 1080 (프로)"),
     target_duration: str = Form("15", description="15 / 30 / 60초"),
     caption_style: str = Form("hormozi", description="hormozi / neon / minimal / variety"),
@@ -570,6 +573,7 @@ async def create_video(
     action_style: str = Form("", description="액션 직접 입력"),
     action_preset: str = Form("", description="bike_stunt/dance/dynamic/sprint"),
     subject_motion: str = Form("", description="피사체 동작 지정"),
+    motion_intensity: str = Form("7", description="모션 강도 6~8"),
 ):
     prompt = (style or style_prompt or "").strip()
     action_style = (action_style or subject_motion or "").strip()
@@ -588,6 +592,7 @@ async def create_video(
     ducking = parse_flag(audio_ducking) if str(audio_ducking or "").strip() else True
     vip = parse_flag(is_vip_mode)
     action_on = parse_flag(action_motion_enabled)
+    intensity = normalize_motion_intensity(motion_intensity)
     try:
         height = int(float(output_height or 720))
     except (TypeError, ValueError):
@@ -635,12 +640,15 @@ async def create_video(
             saved.append(dest)
             try:
                 canvas_w, canvas_h = canvas_size(ratio, height)
+                frame_dest = job_dir / "frame_{}.jpg".format(index)
                 compose_blur_fill_frame(
                     dest,
-                    job_dir / "frame_{}.jpg".format(index),
+                    frame_dest,
                     canvas_w,
                     canvas_h,
                 )
+                if index == 0:
+                    shutil.copy2(str(frame_dest), str(job_dir / "i2v_source.jpg"))
             except Exception as exc:
                 print("[안내] 업로드 직후 9:16 프레임 합성 실패: {}".format(exc), flush=True)
             _release_memory()
@@ -686,6 +694,7 @@ async def create_video(
         action_on,
         action_style,
         action_preset,
+        intensity,
     )
     return {
         "job_id": job_id,
@@ -701,6 +710,7 @@ async def create_video(
         "action_style": action_style,
         "action_preset": action_preset,
         "camera_motion": motion,
+        "motion_intensity": intensity,
         "output_height": height,
         "target_duration": duration,
         "caption_style": captions,

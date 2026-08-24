@@ -71,15 +71,19 @@ BLUR_RADIUS = 26
 BLUR_DIM = 0.38
 FAL_I2V_PRIMARY = os.getenv("FAL_I2V_MODEL", "fal-ai/kling-video/v1/standard/image-to-video")
 FAL_I2V_FALLBACK = "fal-ai/minimax/video-01/image-to-video"
-FAL_WAIT_TIMEOUT = 90.0
+FAL_I2V_FAST = os.getenv("FAL_I2V_FAST_MODEL", "fal-ai/stable-video")
+FAL_WAIT_TIMEOUT = 25.0
+MOTION_INTENSITY_DEFAULT = 7
+MOTION_BUCKET_ID = 180
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "https://auto-shorts-maker.onrender.com").rstrip("/")
 NATURAL_I2V_PROMPT = (
     "Keep the exact subject from the input photo. Add physically accurate motion that matches "
     "the subject: wheels spin, hair or fur moves, limbs shift, breathing, a slight weight transfer. "
     "Photorealistic, preserve identity, no morphing, no extra limbs, no slideshow, cinematic 9:16."
 )
-SPARK_MAX_CLIPS = 1
+SPARK_MAX_CLIPS = 3
 SPARK_CLIP_SEC = 5.0
+I2V_QUALITY_LAYER = "Photorealistic physics, 4k 60fps, 35mm anamorphic lens, preserve exact identity, no morphing, no extra limbs"
 MOTION_CLIP_EXTS = (".mp4", ".mov", ".webm", ".m4v")
 PIPELINE_HARD_LIMIT = 90.0
 FAST_BLUR_SEC = 3.0
@@ -91,10 +95,28 @@ DURATION_TARGETS = {
     60: {"min_chars": 500, "max_chars": 580, "label": "60초 롱쇼츠"},
 }
 CAMERA_MOTIONS = {
-    "zoom_in": "[Zoom in] Cinematic slow push-in, natural subtle motion, keep the subject centered, photorealistic.",
-    "drone": "[Pedestal up, Tracking shot] Smooth drone-style rise and gentle forward glide over the scene.",
-    "pan": "[Pan left] Smooth cinematic pan across the scene with natural parallax.",
+    "zoom_in": "Cinematic Push-in, keep the subject centered, photorealistic.",
+    "push_in": "Cinematic Push-in, keep the subject centered, photorealistic.",
+    "drone": "Orbit 360, smooth aerial orbit keeping subject identity.",
+    "orbit": "Orbit 360, smooth cinematic orbit around the subject.",
+    "pan": "Dynamic Low-angle Pan across the scene with natural parallax.",
+    "low_angle": "Dynamic Low-angle Pan, tracking along the ground plane.",
+    "fpv": "FPV Tracking Shot, aggressive forward follow through the scene.",
 }
+CAMERA_LAYER = {
+    "zoom_in": "Cinematic Push-in",
+    "push_in": "Cinematic Push-in",
+    "drone": "Orbit 360",
+    "orbit": "Orbit 360",
+    "pan": "Dynamic Low-angle Pan",
+    "low_angle": "Dynamic Low-angle Pan",
+    "fpv": "FPV Tracking Shot",
+}
+SHOT_SEQUENCE = (
+    ("wide", "Opening wide establishing shot, full subject and environment visible, FPV tracking, natural parallax"),
+    ("action", "Dynamic action shot, forceful subject physics, motion blur, dynamic low-angle tracking camera"),
+    ("close", "Cinematic close-up, shallow depth of field, blinking, breathing, organic micro-motion"),
+)
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
@@ -483,19 +505,39 @@ def parse_flag(value):
 
 
 def normalize_camera_motion(value):
-    key = (value or "zoom_in").strip().lower()
+    key = (value or "zoom_in").strip().lower().replace("-", "_").replace(" ", "_")
     aliases = {
         "zoom_in": "zoom_in",
         "zoom": "zoom_in",
+        "push_in": "push_in",
+        "pushin": "push_in",
         "줌인": "zoom_in",
-        "drone": "drone",
-        "drone_shot": "drone",
-        "드론": "drone",
-        "pan": "pan",
-        "panning": "pan",
-        "패닝": "pan",
+        "푸시인": "push_in",
+        "drone": "orbit",
+        "drone_shot": "orbit",
+        "orbit": "orbit",
+        "orbit_360": "orbit",
+        "드론": "orbit",
+        "오빗": "orbit",
+        "pan": "low_angle",
+        "panning": "low_angle",
+        "low_angle": "low_angle",
+        "lowangle": "low_angle",
+        "패닝": "low_angle",
+        "로우앵글": "low_angle",
+        "fpv": "fpv",
+        "tracking": "fpv",
+        "트래킹": "fpv",
     }
     return aliases.get(key, "zoom_in")
+
+
+def normalize_motion_intensity(value):
+    try:
+        intensity = int(round(float(value)))
+    except (TypeError, ValueError):
+        intensity = MOTION_INTENSITY_DEFAULT
+    return max(6, min(8, intensity))
 
 
 def normalize_speed(value):
@@ -1060,6 +1102,24 @@ FFMPEG_ENCODE = [
     "ultrafast",
     "-tune",
     "stillimage",
+    "-crf",
+    "23",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
+    "-threads",
+    "0",
+    "-movflags",
+    "+faststart",
+]
+FFMPEG_MOTION_ENCODE = [
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
     "-crf",
     "23",
     "-pix_fmt",
@@ -2109,52 +2169,26 @@ def _is_motion_clip(path):
     return str(path).lower().endswith(MOTION_CLIP_EXTS)
 
 
-def i2v_source_paths(media_files, job_dir):
-    found = []
+def i2v_hero_source(media_files, job_dir):
     media_dir = Path(job_dir) / "media"
+    candidates = []
     if media_dir.is_dir():
         for child in sorted(media_dir.iterdir()):
             if child.suffix.lower() in IMAGE_EXTS or child.suffix.lower() in VIDEO_EXTS:
-                found.append(child)
-    if not found:
-        found = [Path(p) for p in media_files]
-    return found[:SPARK_MAX_CLIPS]
+                candidates.append(child)
+    if not candidates:
+        candidates = [Path(p) for p in (media_files or [])]
+    return candidates[0] if candidates else None
 
 
 def prepare_i2v_still(path, dest_jpg, width=None, height=None):
-    """원본 피사체를 유지한 9:16 커버 크롭 JPEG. 블러 레터박스는 I2V에 쓰지 않는다."""
-    width = int(width or TARGET_W)
-    height = int(height or TARGET_H)
-    dest_jpg = Path(dest_jpg)
-    dest_jpg.parent.mkdir(parents=True, exist_ok=True)
-    src = Path(path)
-    temp_frame = None
-    if src.suffix.lower() not in IMAGE_EXTS:
-        temp_frame = dest_jpg.with_name(dest_jpg.stem + "_grab.jpg")
-        run_ffmpeg(
-            ["-ss", "0.2", "-i", str(src), "-frames:v", "1", "-q:v", "3", str(temp_frame)],
-            timeout=20,
-        )
-        src = temp_frame
-    resampling = getattr(Image, "Resampling", Image)
-    with Image.open(src) as raw:
-        try:
-            im = ImageOps.exif_transpose(raw) or raw
-        except Exception:
-            im = raw
-        rgb = im.convert("RGB")
-    fitted = ImageOps.fit(rgb, (width, height), method=resampling.LANCZOS, centering=(0.5, 0.42))
-    rgb.close()
-    fitted.save(str(dest_jpg), "JPEG", quality=92, subsampling=1)
-    fitted.close()
-    if temp_frame and temp_frame != dest_jpg:
-        try:
-            temp_frame.unlink()
-        except OSError:
-            pass
-    if not dest_jpg.is_file() or dest_jpg.stat().st_size < 32:
-        raise RuntimeError("I2V 소스 JPEG를 만들지 못했습니다.")
-    return dest_jpg
+    """업로드 사진을 9:16으로 아웃페인팅(블러 확장)해 잘림·왜곡 없이 I2V에 넣는다."""
+    return compose_blur_fill_frame(path, dest_jpg, width, height)
+
+
+def i2v_source_paths(media_files, job_dir):
+    hero = i2v_hero_source(media_files, job_dir)
+    return [hero] if hero is not None else []
 
 
 def still_from_media(path, dest_jpg, work_dir, width=None, height=None):
@@ -2585,8 +2619,8 @@ def _user_motion_english_hint(user_action):
         ("고개", "the subject turns its head slightly"),
         ("꼬리", "the animal wags its tail"),
         ("바퀴", "wheels rotate and the vehicle rolls forward"),
-        ("오토바이", "the motorcycle accelerates, wheels spin, slight camera push-in"),
-        ("바이크", "the motorcycle accelerates, wheels spin, slight camera push-in"),
+        ("오토바이", "the motorcycle rider accelerates forcefully, wheels spinning, suspension reacting"),
+        ("바이크", "the motorcycle rider accelerates forcefully, wheels spinning, suspension reacting"),
         ("스윙", "the swing moves back and forth with pendulum physics"),
         ("그네", "the swing moves back and forth with pendulum physics"),
         ("jump", "the subject jumps with realistic weight and landing"),
@@ -2600,41 +2634,57 @@ def _user_motion_english_hint(user_action):
     return text
 
 
-def vision_subject_motion_prompt(settings, image_path, user_action="", style_prompt="", camera_motion=""):
-    user_hint = _user_motion_english_hint(user_action)
-    cam = {
-        "zoom_in": "slow cinematic push-in",
-        "drone": "gentle drone-like orbit",
-        "pan": "slow horizontal pan",
-    }.get(normalize_camera_motion(camera_motion), "subtle camera push-in")
-    fallback = natural_i2v_prompt(style_prompt)
-    if user_hint:
-        fallback = (
-            "Keep the exact subject from the input photo. Motion: {}. Camera: {}. "
-            "Photorealistic, preserve identity, no morphing, no extra limbs, cinematic 9:16. {}"
-        ).format(user_hint, cam, fallback)
+def _default_i2v_layers(user_action="", style_prompt="", camera_motion=""):
+    hint = _user_motion_english_hint(user_action)
+    cam_key = normalize_camera_motion(camera_motion)
+    subject_action = hint or (
+        "The subject in the photo moves naturally, blinking, breathing, turning head smoothly with organic physics"
+    )
+    environment = (
+        "asphalt reflections, motion blur, smoke and dust particles, refractive lighting, "
+        "soft depth of field, cinematic night or daylight matching the photo"
+    )
+    if any(k in (hint + " " + (style_prompt or "")).lower() for k in ("bike", "motorcycle", "바이크", "오토바이")):
+        subject_action = (
+            "The motorcycle rider in the photo accelerates forcefully along the city asphalt, "
+            "wheels spinning with realistic motion blur, suspension rebound, headlights beaming forward"
+        )
+        environment = "cinematic night reflections on wet asphalt, tire smoke, dust particles, motion blur"
+    return {
+        "subject": "the exact subject from the input photo",
+        "subject_action": subject_action,
+        "camera": CAMERA_LAYER.get(cam_key, "Cinematic Push-in"),
+        "environment": environment,
+        "quality": I2V_QUALITY_LAYER,
+    }
+
+
+def vision_four_layer_analysis(settings, image_path, user_action="", style_prompt="", camera_motion=""):
+    layers = _default_i2v_layers(user_action, style_prompt, camera_motion)
     api_key = getattr(settings, "openai_api_key", "") or os.getenv("OPENAI_API_KEY") or ""
     b64 = media_to_preview_b64(Path(image_path)) if image_path else None
     if not api_key or not b64:
-        return fallback
+        return layers
     try:
         client = OpenAI(api_key=api_key)
         body = [
             {
                 "type": "text",
                 "text": (
-                    "Look at this photo. Identify the main subject (motorcycle, dog, person, car, swing, etc.). "
-                    "Write ONE English image-to-video prompt (max 60 words) with concrete physics motion "
-                    "that this exact subject can perform. Examples: "
-                    "'motorcycle accelerates and wheels spin', 'swing moves back and forth', "
-                    "'puppy wags tail and looks at camera'. "
-                    "Preserve identity, face, clothes, colors, proportions. No morphing, no extra limbs. "
-                    "Camera: {cam}. Style: {style}. User requested action: {action}. "
-                    "Output the prompt only."
+                    "Analyze this photo. Detect the main subject (person, motorcycle, animal, background). "
+                    "Return JSON only with keys: subject, subject_action, camera, environment, quality. "
+                    "subject_action: concrete physics (wheels spinning, suspension rebound, gaze shift, tail wag, breathing). "
+                    "camera: one of FPV Tracking Shot, Dynamic Low-angle Pan, Cinematic Push-in, Orbit 360. "
+                    "Preferred camera: {cam}. "
+                    "environment: asphalt reflections, motion blur, smoke/dust particles, lighting refraction matching the photo. "
+                    "quality: always '{quality}'. "
+                    "User action: {action}. Style: {style}. "
+                    "Preserve identity. English values only."
                 ).format(
-                    cam=cam,
+                    cam=CAMERA_LAYER.get(normalize_camera_motion(camera_motion), "Cinematic Push-in"),
+                    quality=I2V_QUALITY_LAYER,
+                    action=_user_motion_english_hint(user_action) or "(infer natural physics)",
                     style=sanitize_narration(style_prompt) or "cinematic short-form",
-                    action=user_hint or "(choose the most natural motion for this subject)",
                 ),
             },
             {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}},
@@ -2642,15 +2692,51 @@ def vision_subject_motion_prompt(settings, image_path, user_action="", style_pro
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": body}],
-            temperature=0.4,
-            max_tokens=160,
+            temperature=0.35,
+            max_tokens=280,
+            response_format={"type": "json_object"},
         )
-        text = (response.choices[0].message.content or "").strip().replace("\n", " ")
-        text = text.strip(" \"'`")
-        return text or fallback
+        raw = (response.choices[0].message.content or "").strip()
+        data = json.loads(raw)
+        for key in ("subject", "subject_action", "camera", "environment", "quality"):
+            value = sanitize_narration(str(data.get(key) or "")).replace("\n", " ")
+            if value:
+                layers[key] = value
+        print("   Vision 4레이어: {subject} | {action} | {cam}".format(
+            subject=layers["subject"][:48],
+            action=layers["subject_action"][:72],
+            cam=layers["camera"][:40],
+        ), flush=True)
+        return layers
     except Exception as exc:
-        print("[안내] Vision 동작 프롬프트 실패, 로컬 프롬프트 사용: {}".format(exc), flush=True)
-        return fallback
+        print("[안내] Vision 4레이어 분석 실패, 로컬 레이어 사용: {}".format(exc), flush=True)
+        return layers
+
+
+def compose_layered_i2v_prompt(layers, shot_prompt, user_action=""):
+    hint = _user_motion_english_hint(user_action)
+    extra = (" User-requested action: {}.".format(hint) if hint else "")
+    return (
+        "{action}. Camera: {camera}. Shot: {shot}. Environment: {env}. {quality}. "
+        "Keep the exact subject from the input photo.{extra}"
+    ).format(
+        action=layers.get("subject_action") or NATURAL_I2V_PROMPT,
+        camera=layers.get("camera") or "Cinematic Push-in",
+        shot=shot_prompt,
+        env=layers.get("environment") or "motion blur, cinematic lighting",
+        quality=layers.get("quality") or I2V_QUALITY_LAYER,
+        extra=extra,
+    )
+
+
+def build_multishot_i2v_prompts(layers, target_duration, user_action=""):
+    shots = list(SHOT_SEQUENCE) if int(target_duration or 15) >= 15 else [SHOT_SEQUENCE[1]]
+    return [(key, compose_layered_i2v_prompt(layers, prompt, user_action)) for key, prompt in shots]
+
+
+def vision_subject_motion_prompt(settings, image_path, user_action="", style_prompt="", camera_motion=""):
+    layers = vision_four_layer_analysis(settings, image_path, user_action, style_prompt, camera_motion)
+    return compose_layered_i2v_prompt(layers, SHOT_SEQUENCE[1][1], user_action)
 
 
 def _job_dir_for_media(path):
@@ -2713,11 +2799,15 @@ def _fal_queue_subscribe(model, payload, timeout=90):
             return resp.json()
         if status in ("FAILED", "ERROR"):
             raise RuntimeError("fal 작업 실패: {}".format(str(js)[:400]))
-        time.sleep(2.0)
+        time.sleep(1.0)
     raise RuntimeError("fal queue 대기 시간 초과 ({}s)".format(int(timeout)))
 
 
-def fal_image_to_video(image_path, prompt, dest_mp4):
+def fal_image_to_video(image_path, prompt, dest_mp4, timeout=None, models=None, motion_intensity=None):
+    timeout = float(timeout or FAL_WAIT_TIMEOUT)
+    motion_intensity = normalize_motion_intensity(motion_intensity)
+    models = tuple(models or (FAL_I2V_PRIMARY, FAL_I2V_FALLBACK, FAL_I2V_FAST))
+    deadline = time.time() + timeout
     try:
         try:
             import fal_client
@@ -2738,55 +2828,69 @@ def fal_image_to_video(image_path, prompt, dest_mp4):
             image_urls.append(_public_i2v_image_url(slim))
         except Exception as exc:
             print("[안내] 공개 I2V URL 생성 실패: {}".format(exc), flush=True)
-        if fal_client is not None:
-            try:
-                image_urls.append(fal_client.upload_file(str(slim)))
-            except Exception as exc:
-                print("[안내] fal CDN 업로드 생략: {}".format(exc), flush=True)
         try:
             image_urls.append(_fal_data_uri(slim))
         except Exception:
             pass
         if not image_urls:
             raise RuntimeError("I2V에 넘길 이미지 URL이 없습니다.")
-        models = (FAL_I2V_PRIMARY, FAL_I2V_FALLBACK, "fal-ai/minimax/video-01")
         last_error = None
         for model in models:
-            for image_url in image_urls:
-                try:
-                    print("   fal I2V: {} ← {}".format(model, str(image_url)[:88]), flush=True)
-                    payload = {"prompt": prompt, "image_url": image_url}
-                    if "kling" in model:
-                        payload["duration"] = "5"
-                    else:
-                        payload["prompt_optimizer"] = True
-                    result = None
-                    if fal_client is not None:
-                        try:
-                            result = fal_client.subscribe(model, arguments=payload, with_logs=False)
-                        except Exception as exc:
-                            print("[안내] fal subscribe 실패, queue API 재시도: {}".format(exc), flush=True)
-                    if result is None:
-                        result = _fal_queue_subscribe(model, payload, timeout=FAL_WAIT_TIMEOUT)
-                    url = _fal_video_url(result)
-                    if not url:
-                        raise RuntimeError("fal 응답에 video url이 없습니다: {}".format(str(result)[:400]))
-                    download_http_file(url, dest_mp4, timeout=40)
-                    if Path(dest_mp4).is_file() and Path(dest_mp4).stat().st_size > 1000:
-                        return Path(dest_mp4)
-                except Exception as exc:
-                    last_error = exc
-                    print("[안내] {} 실패: {}".format(model, exc), flush=True)
+            left = deadline - time.time()
+            if left < 3.5:
+                break
+            image_url = image_urls[0]
+            try:
+                print("   fal I2V: {} ← {}".format(model, str(image_url)[:88]), flush=True)
+                payload = {
+                    "prompt": prompt,
+                    "image_url": image_url,
+                    "motion_bucket_id": MOTION_BUCKET_ID,
+                    "motion_intensity": motion_intensity,
+                }
+                if "kling" in model:
+                    payload["duration"] = "5"
+                    payload["cfg_scale"] = 0.5
+                elif "stable-video" in model or "svd" in model:
+                    payload.pop("prompt", None)
+                    payload["prompt"] = prompt
+                else:
+                    payload["prompt_optimizer"] = True
+                result = None
+                if fal_client is not None and left > 8:
+                    try:
+                        result = fal_client.subscribe(model, arguments=payload, with_logs=False)
+                    except Exception as exc:
+                        print("[안내] fal subscribe 실패, queue API 재시도: {}".format(exc), flush=True)
+                if result is None:
+                    result = _fal_queue_subscribe(model, payload, timeout=max(4.0, left - 2.0))
+                url = _fal_video_url(result)
+                if not url:
+                    raise RuntimeError("fal 응답에 video url이 없습니다: {}".format(str(result)[:400]))
+                download_http_file(url, dest_mp4, timeout=min(20, max(8, int(deadline - time.time()))))
+                if Path(dest_mp4).is_file() and Path(dest_mp4).stat().st_size > 1000:
+                    return Path(dest_mp4)
+            except Exception as exc:
+                last_error = exc
+                print("[안내] {} 실패: {}".format(model, exc), flush=True)
         raise RuntimeError("Image-to-Video 생성 실패: {}".format(last_error))
     except Exception as exc:
         print("[안내] fal.ai 전체 실패(프로세스 유지): {}".format(exc))
         raise RuntimeError("✨ 스파크 시네마 AI 호출 실패: {}".format(exc))
 
 
-async def fal_image_to_video_timed(image_path, prompt, dest_mp4, timeout=FAL_WAIT_TIMEOUT):
+async def fal_image_to_video_timed(image_path, prompt, dest_mp4, timeout=FAL_WAIT_TIMEOUT, models=None, motion_intensity=None):
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(fal_image_to_video, image_path, prompt, dest_mp4),
+            asyncio.to_thread(
+                fal_image_to_video,
+                image_path,
+                prompt,
+                dest_mp4,
+                timeout,
+                models,
+                motion_intensity,
+            ),
             timeout=float(timeout),
         )
     except asyncio.TimeoutError:
@@ -2794,7 +2898,7 @@ async def fal_image_to_video_timed(image_path, prompt, dest_mp4, timeout=FAL_WAI
         raise RuntimeError("fal.ai 대기열 타임아웃 ({}s)".format(timeout))
 
 
-VIP_I2V_TIMEOUT = 90.0
+VIP_I2V_TIMEOUT = 25.0
 ACTION_PRESETS = {
     "bike_stunt": "오토바이 앞바퀴를 들고 묘기 부리며 질주하는 장면, 엔진 배기음과 타이어 연기",
     "dance": "비트에 맞춘 역동적인 댄스, 강한 제스처와 카메라 펀치 인",
@@ -3155,6 +3259,74 @@ def burn_kinetic_captions(video_path, script, duration, font_path, out_file, wor
         return Path(out_file)
 
 
+def pillow_ken_burns_sequence(src_jpg, work_dir, count=3, duration=5.0, width=None, height=None, intensity=7):
+    width = int(width or TARGET_W)
+    height = int(height or TARGET_H)
+    intensity = normalize_motion_intensity(intensity)
+    count = max(1, int(count or 1))
+    fps = STILL_FPS
+    n_frames = max(8, int(round(float(duration) * fps)))
+    src = Image.open(src_jpg).convert("RGB")
+    if src.size != (width, height):
+        src = src.resize((width, height), _lanczos())
+    paths = (
+        (0.50, 0.42, 0.50, 0.36, 1.00, 1.16),
+        (0.42, 0.50, 0.58, 0.46, 1.06, 1.20),
+        (0.52, 0.40, 0.48, 0.48, 1.08, 1.18),
+    )
+    clips = []
+    zoom_span = 0.08 * (intensity / 7.0)
+    for index in range(count):
+        x0, y0, x1, y1, z0, z1 = paths[index % len(paths)]
+        z1 = z0 + (z1 - z0) + zoom_span
+        frame_dir = Path(work_dir) / ("kb_{:02d}".format(index + 1))
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        for f in range(n_frames):
+            t = f / float(max(1, n_frames - 1))
+            zoom = z0 + (z1 - z0) * t
+            cx = x0 + (x1 - x0) * t
+            cy = y0 + (y1 - y0) * t
+            zw = max(2, int(round(width / zoom)))
+            zh = max(2, int(round(height / zoom)))
+            zw -= zw % 2
+            zh -= zh % 2
+            x = int(max(0, min(width - zw, round(cx * (width - zw)))))
+            y = int(max(0, min(height - zh, round(cy * (height - zh)))))
+            crop = src.crop((x, y, x + zw, y + zh)).resize((width, height), _lanczos())
+            crop.save(str(frame_dir / "f{:04d}.jpg".format(f)), "JPEG", quality=82, subsampling=2)
+            crop.close()
+        dest = Path(work_dir) / ("kb_{:02d}.mp4".format(index + 1))
+        run_ffmpeg(
+            [
+                "-framerate",
+                str(fps),
+                "-i",
+                str(frame_dir / "f%04d.jpg"),
+                "-an",
+                "-vf",
+                "scale={w}:{h}:flags=fast_bilinear,setsar=1,fps={fps},format=yuv420p".format(
+                    w=width, h=height, fps=fps
+                ),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                str(dest),
+            ],
+            timeout=40,
+        )
+        if dest.is_file() and dest.stat().st_size > 1000:
+            clips.append(dest)
+    src.close()
+    return clips
+
+
 def generate_spark_cinema_clips(
     media_files,
     style_prompt,
@@ -3167,65 +3339,92 @@ def generate_spark_cinema_clips(
     settings=None,
     user_action="",
     job_dir=None,
+    target_duration=15,
+    motion_intensity=None,
 ):
     width = int(width or TARGET_W)
     height = int(height or TARGET_H)
+    motion_intensity = normalize_motion_intensity(motion_intensity)
     job_dir = Path(job_dir) if job_dir else Path(work_dir).parent
-    sources = i2v_source_paths(media_files, job_dir)
-    if not sources:
+    hero = i2v_hero_source(media_files, job_dir)
+    if hero is None:
         print("[안내] I2V 원본 미디어가 없습니다")
         return []
-    _notify(progress_cb, 32, "Vision으로 피사체 동작 분석 중", lock)
-    frames = []
-    for index, src in enumerate(sources):
-        frame = job_dir / ("i2v_source.jpg" if index == 0 else "i2v_src_{:02d}.jpg".format(index + 1))
-        try:
-            prepare_i2v_still(src, frame, width, height)
-            frames.append(frame)
-        except Exception as exc:
-            print("[안내] I2V 원본 프레임 준비 실패: {}".format(exc), flush=True)
-    if not frames:
+    _notify(progress_cb, 30, "9:16 네이티브 캔버스 아웃페인팅", lock)
+    frame = job_dir / "i2v_source.jpg"
+    try:
+        prepare_i2v_still(hero, frame, width, height)
+    except Exception as exc:
+        print("[안내] I2V 9:16 캔버스 실패: {}".format(exc), flush=True)
         return []
-    prompt = vision_subject_motion_prompt(
+    _notify(progress_cb, 33, "Vision 4레이어 프롬프트 엔진", lock)
+    layers = vision_four_layer_analysis(
         settings or load_settings(),
-        frames[0],
+        frame,
         user_action=user_action,
         style_prompt=style_prompt,
         camera_motion=camera_motion,
     )
-    print("   I2V 프롬프트: {}".format(prompt[:220]), flush=True)
-    _notify(progress_cb, 36, "✨ fal.ai Image-to-Video 5초 모션 생성", lock)
+    shots = build_multishot_i2v_prompts(layers, target_duration, user_action)
+    for key, prompt in shots:
+        print("   I2V [{}]: {}".format(key, prompt[:200]), flush=True)
+    _notify(progress_cb, 36, "✨ 멀티숏 I2V 병렬 생성 ({}숏, {}초 제한)".format(len(shots), int(FAL_WAIT_TIMEOUT)), lock)
 
-    async def _one(index, frame):
-        clip = work_dir / ("i2v_{:02d}.mp4".format(index + 1))
-        await fal_image_to_video_timed(frame, prompt, clip, timeout=FAL_WAIT_TIMEOUT)
+    async def _one(index, shot_key, prompt, models):
+        clip = work_dir / ("i2v_{:02d}_{}.mp4".format(index + 1, shot_key))
+        await fal_image_to_video_timed(
+            frame,
+            prompt,
+            clip,
+            timeout=FAL_WAIT_TIMEOUT,
+            models=models,
+            motion_intensity=motion_intensity,
+        )
         return clip
 
-    async def _gather():
+    async def _wave(models):
+        tasks = [_one(i, key, prompt, models) for i, (key, prompt) in enumerate(shots)]
         return await asyncio.wait_for(
-            asyncio.gather(*[_one(i, frame) for i, frame in enumerate(frames)], return_exceptions=True),
-            timeout=FAL_WAIT_TIMEOUT + 25,
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=FAL_WAIT_TIMEOUT,
         )
 
-    try:
-        results = asyncio.run(_gather())
-    except asyncio.TimeoutError:
-        print("[안내] 스파크 시네마 I2V 대기 초과")
-        return []
-    except Exception as exc:
-        print("[안내] 스파크 시네마 I2V 호출 실패: {}".format(exc))
-        return []
     clips = []
+    try:
+        results = asyncio.run(_wave((FAL_I2V_PRIMARY, FAL_I2V_FALLBACK, FAL_I2V_FAST)))
+    except Exception as exc:
+        print("[안내] I2V 병렬 25초 제한 초과/실패: {}".format(exc), flush=True)
+        results = []
     for item in results:
         if isinstance(item, Exception):
-            print("[안내] 스파크 시네마 클립 실패: {}".format(item))
+            print("[안내] I2V 클립 실패: {}".format(item), flush=True)
         elif item and Path(item).is_file() and Path(item).stat().st_size > 1000:
             clips.append(item)
-    if not clips:
-        print("[안내] 스파크 시네마 클립 없음 → 쾌속 블러 폴백")
-        return []
-    _notify(progress_cb, 62, "✨ 스파크 시네마 AI 모션 클립 {}개 준비 완료".format(len(clips)), lock)
-    return clips
+
+    unique = []
+    seen = set()
+    for clip in clips:
+        key = str(Path(clip).resolve())
+        if key not in seen:
+            seen.add(key)
+            unique.append(clip)
+    clips = unique
+    if clips:
+        _notify(progress_cb, 62, "✨ I2V 모션 클립 {}개 준비 완료".format(len(clips)), lock)
+        return clips[:SPARK_MAX_CLIPS]
+
+    _notify(progress_cb, 58, "3순위 Pillow 켄 번스 다이내믹 무빙", lock)
+    print("[안내] I2V 25초 초과/실패 → 켄 번스 모션 블러 폴백", flush=True)
+    kb = pillow_ken_burns_sequence(
+        frame,
+        work_dir,
+        count=len(shots),
+        duration=SPARK_CLIP_SEC,
+        width=width,
+        height=height,
+        intensity=motion_intensity,
+    )
+    return kb
 
 
 def generate_runway_clips(*args, **kwargs):
@@ -3389,7 +3588,7 @@ def ffmpeg_spark_pass(
             "[0:v]{}[v];{}".format(vf, ducking_audio_filter(1.0)),
         ]
         maps = ["-map", "[v]", "-map", "[a]"]
-    args += extra + maps + FFMPEG_ENCODE + ["-t", "{:.3f}".format(float(audio_duration)), str(out_file)]
+    args += extra + maps + FFMPEG_MOTION_ENCODE + ["-t", "{:.3f}".format(float(audio_duration)), str(out_file)]
     run_ffmpeg(args, timeout=50)
 
 
@@ -3573,6 +3772,7 @@ def run_pipeline(
     action_motion_enabled=False,
     action_style="",
     action_preset="",
+    motion_intensity=None,
 ):
     if check_license:
         ok, message = verify_saved_license()
@@ -3597,6 +3797,7 @@ def run_pipeline(
     visual_fx = normalize_visual_fx(visual_fx or motion)
     aspect_ratio = normalize_aspect_ratio(aspect_ratio)
     width, height = canvas_size(aspect_ratio, output_height)
+    motion_intensity = normalize_motion_intensity(motion_intensity)
     user_motion = (action_style or "").strip()
     sfx_on = bool(action_motion_enabled)
     action_enabled = sfx_on or bool((user_motion or action_preset or "").strip())
@@ -3697,7 +3898,7 @@ def run_pipeline(
             return path
 
         def _frame_job():
-            if spark and _left() > 20:
+            if spark and _left() > 12:
                 try:
                     clips = generate_spark_cinema_clips(
                         media_files,
@@ -3711,30 +3912,14 @@ def run_pipeline(
                         settings=settings,
                         user_action=action_style,
                         job_dir=out_file.parent,
+                        target_duration=target_duration,
+                        motion_intensity=motion_intensity,
                     )
                     if clips:
                         return clips
-                    print("[안내] 스파크 I2V 빈 결과 → VIP/홀드 폴백")
+                    print("[안내] 스파크 I2V/켄번스 빈 결과 → 홀드 렌더")
                 except Exception as exc:
                     print("[안내] 스파크 I2V 실패: {}".format(exc))
-            if vip and sfx_on and _left() > 20:
-                try:
-                    clips = generate_vip_action_clips(
-                        media_files,
-                        settings,
-                        action_style,
-                        style_prompt,
-                        work_dir,
-                        progress_cb=progress_cb,
-                        lock=progress_lock,
-                        width=width,
-                        height=height,
-                    )
-                    if clips:
-                        return clips
-                    print("[안내] VIP I2V 빈 결과 → 홀드 렌더")
-                except Exception as exc:
-                    print("[안내] VIP I2V 실패 → 홀드 렌더: {}".format(exc))
             _notify(progress_cb, 30, "사진 노출 균등 배분 및 리사이즈 중", progress_lock)
             frames = _hold_frames()
             _notify(progress_cb, 52, "장면 프레임 준비 완료", progress_lock)
@@ -3751,7 +3936,7 @@ def run_pipeline(
                     settings, script, voice_file, voice_key, duration=float(target_duration)
                 )
             try:
-                i2v_wait = 130.0 if (vip or spark) else 20.0
+                i2v_wait = 55.0 if (vip or spark) else 20.0
                 generated = frame_fut.result(timeout=max(12.0, min(i2v_wait, max(12.0, _left() - 8))))
             except Exception as exc:
                 print("[안내] 영상 생성 대기 중단: {}".format(exc))

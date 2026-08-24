@@ -115,6 +115,7 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
   String _visualFx = 'ken_burns';
   bool _actionMotion = false;
   String _actionPreset = 'natural';
+  String _motionIntensity = '7';
   final _actionCtrl = TextEditingController();
   File? _resultVideo;
   VideoPlayerController? _player;
@@ -686,6 +687,7 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
           req.fields['action_style'] = _sparkCinema ? _actionCtrl.text.trim() : '';
           req.fields['subject_motion'] = _sparkCinema ? _actionCtrl.text.trim() : '';
           req.fields['camera_motion'] = _cameraMotion;
+          req.fields['motion_intensity'] = _motionIntensity;
           req.fields['output_height'] = _plan == 'pro' ? '1080' : '720';
           req.fields['target_duration'] = '$_targetDuration';
           req.fields['caption_style'] = _captionStyle;
@@ -1023,7 +1025,7 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
                           ),
                           const SizedBox(height: 6),
                           const Text(
-                            '사진을 분석해 피사체가 실제로 움직이는 5초 Image-to-Video를 만들고, 나레이션·BGM과 한 번에 합성합니다.',
+                            '사진을 9:16으로 맞춘 뒤 Vision 4레이어 프롬프트로 Wide→Action→Close-up 모션을 병렬 생성합니다.',
                             style: TextStyle(color: Color(0xCCFFFFFF), fontSize: 12.5, height: 1.35),
                           ),
                           const SizedBox(height: 12),
@@ -1062,12 +1064,24 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
                           const _Label('카메라 모션'),
                           _OptionWrap(
                             options: const [
-                              _Option('zoom_in', '줌인'),
-                              _Option('drone', '드론 샷'),
-                              _Option('pan', '패닝'),
+                              _Option('fpv', 'FPV 트래킹'),
+                              _Option('zoom_in', '시네마틱 푸시인'),
+                              _Option('low_angle', '로우앵글 팬'),
+                              _Option('orbit', '오빗 360'),
                             ],
                             value: _cameraMotion,
                             onChanged: (v) => setState(() => _cameraMotion = v),
+                          ),
+                          const SizedBox(height: 12),
+                          const _Label('모션 강도'),
+                          _OptionWrap(
+                            options: const [
+                              _Option('6', '6 · 자연'),
+                              _Option('7', '7 · 주행'),
+                              _Option('8', '8 · 강렬'),
+                            ],
+                            value: _motionIntensity,
+                            onChanged: (v) => setState(() => _motionIntensity = v),
                           ),
                         ],
                       ),
