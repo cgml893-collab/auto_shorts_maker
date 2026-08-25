@@ -24,6 +24,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+# 이모지 로그 한 줄이 UnicodeEncodeError로 파이프라인 전체를 죽이지 않게 한다 (cp949 콘솔 등)
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+
 import numpy as np
 import requests
 from dotenv import load_dotenv
@@ -74,7 +81,9 @@ FAL_I2V_FALLBACK = "fal-ai/minimax/video-01/image-to-video"
 FAL_I2V_FAST = os.getenv("FAL_I2V_FAST_MODEL", "fal-ai/stable-video")
 FAL_LIPSYNC_MODEL = os.getenv("FAL_LIPSYNC_MODEL", "fal-ai/sync-lipsync/v3/image-to-video")
 FAL_WAIT_TIMEOUT = 12.0
+# 에러/헝 상태에서 폴백 영상을 완성해야 하는 상한 (정상 렌더 예산은 JOB_BUDGET_SEC)
 HARD_JOB_LIMIT_SEC = 30.0
+JOB_BUDGET_SEC = {15: 110.0, 30: 150.0, 60: 200.0}
 BEFORE_AFTER_SEC = 1.5
 BEFORE_SWIPE_SEC = 0.45
 MOTION_INTENSITY_DEFAULT = 7
@@ -93,7 +102,9 @@ LIPSYNC_I2V_PROMPT = (
     "Talking portrait close-up: natural lip sync mouth shapes, subtle facial expression, blinking, "
     "micro head motion matching speech rhythm. Preserve exact face identity, photorealistic 9:16."
 )
+# fal.ai 유료 호출은 1회로 고정. 로컬(무료) 클립은 사진 수만큼 만들어도 비용이 0원이다.
 SPARK_MAX_CLIPS = 1
+LOCAL_MAX_CLIPS = 6
 SPARK_CLIP_SEC = 5.0
 # True면 fal/멀티숏 비활성 · Pillow/FFmpeg 켄 번스만 (스파크 PRO 명시 ON 시에만 fal 1회)
 ZERO_COST_DEFAULT = True
@@ -450,12 +461,14 @@ def _pil_to_jpeg_b64(image, max_side=1024):
 def media_to_preview_b64(path):
     # type: (Path) -> Optional[str]
     suffix = path.suffix.lower()
+    # 동시 요청이 같은 파일명을 덮어쓰지 않도록 매번 고유 경로를 쓰고, 끝나면 지운다
+    preview = None
     try:
         if suffix in IMAGE_EXTS:
             with open_image_upright(path) as im:
                 return _pil_to_jpeg_b64(im)
         if suffix in VIDEO_EXTS:
-            preview = OUTPUT_DIR / ("_preview_{}.jpg".format(path.stem))
+            preview = OUTPUT_DIR / ("_preview_{}.jpg".format(uuid.uuid4().hex[:10]))
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
             try:
                 ffmpeg_extract_still(path, preview, ss="0.3", qv=6, timeout=20)
@@ -471,6 +484,12 @@ def media_to_preview_b64(path):
                 return _pil_to_jpeg_b64(Image.fromarray(frame.astype("uint8")))
     except Exception as exc:
         print("[경고] 미리보기 추출 실패 ({}): {}".format(path.name, exc))
+    finally:
+        if preview is not None:
+            try:
+                preview.unlink()
+            except OSError:
+                pass
     return None
 
 
@@ -597,9 +616,8 @@ def normalize_target_duration(value):
 
 
 def pipeline_time_budget(duration):
-    # 모바일 무한 폴링 방지: 어떤 길이여도 하드 캡 30초 안에 폴백 완성
-    del duration
-    return float(HARD_JOB_LIMIT_SEC)
+    """정상 렌더에 필요한 현실적인 예산. 폴백 경로는 HARD_JOB_LIMIT_SEC로 별도 제한한다."""
+    return float(JOB_BUDGET_SEC.get(normalize_target_duration(duration), 110.0))
 
 
 def ffmpeg_extract_still(src, dest, ss="0.15", qv=2, timeout=20):
@@ -739,10 +757,12 @@ def caption_force_style(style, font_path):
             "OutlineColour=&H00000000,BackColour=&H00000000,BorderStyle=1,"
             "Outline=3,Shadow=0,Alignment=2,MarginV=72,MarginL=48,MarginR=48"
         ).format(name)
+    # 자동 줄바꿈은 켜 둔다(WrapStyle 기본). 우리가 넣은 줄바꿈이 우선 적용되고,
+    # 그래도 넘칠 때 libass가 접어 주므로 화면 밖으로 잘려 나가는 일이 없다.
     return raw.replace(",", "\\,")
 
 
-def ducking_audio_filter(speed=1.0, voice_idx=1, bgm_idx=2):
+def ducking_audio_filter(speed=1.0, voice_idx=1, bgm_idx=2, out_label="a"):
     tempo = ""
     if abs(float(speed) - 1.0) > 0.001:
         tempo = "," + atempo_chain(speed)
@@ -751,8 +771,8 @@ def ducking_audio_filter(speed=1.0, voice_idx=1, bgm_idx=2):
         "[{b}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo{tempo},volume=0.55[bgm];"
         "[bgm][sc]sidechaincompress=threshold=0.045:ratio=12:attack=20:release=260:makeup=1:knee=8[dk];"
         "[voice]volume=1.08[va];"
-        "[va][dk]amix=inputs=2:duration=first:dropout_transition=0[a]"
-    ).format(v=int(voice_idx), b=int(bgm_idx), tempo=tempo)
+        "[va][dk]amix=inputs=2:duration=first:dropout_transition=0[{out}]"
+    ).format(v=int(voice_idx), b=int(bgm_idx), tempo=tempo, out=out_label)
 
 
 def conform_audio_duration(src, dest, seconds):
@@ -863,9 +883,41 @@ def interpret_style_direction(settings, style_prompt=""):
         return base
 
 
+DEFAULT_STYLE_CHIPS = [
+    {"label": "감성 브이로그", "prompt": "감성 브이로그"},
+    {"label": "무한도전 스타일", "prompt": "무한도전 스타일"},
+    {"label": "뉴스 브리핑", "prompt": "뉴스 브리핑"},
+    {"label": "시네마틱 하이라이트", "prompt": "시네마틱 하이라이트"},
+]
+
+
+def local_media_styles(media_files):
+    """API 없이 파일명 힌트만으로 스타일 칩을 만든다 (분석 화면이 절대 비지 않게)."""
+    hint = _vision_tags_from_media(media_files, "")
+    styles = []
+    if hint and hint != "일상 순간":
+        styles.append({"label": hint[:18], "prompt": "{} 감성 브이로그".format(hint)})
+    for item in DEFAULT_STYLE_CHIPS:
+        if len(styles) >= 4:
+            break
+        styles.append(dict(item))
+    return {
+        "place": "",
+        "mood": "",
+        "action": "",
+        "theme": hint,
+        "styles": styles[:4],
+        "degraded": True,
+    }
+
+
 def analyze_media_styles(settings, media_files):
     if not media_files:
         raise RuntimeError("분석할 미디어가 없습니다.")
+    if not (getattr(settings, "openai_api_key", "") or "").strip():
+        print("[안내] 미디어 분석 로컬 폴백: OPENAI_API_KEY 없음")
+        return local_media_styles(media_files)
+
     b64 = media_to_preview_b64(media_files[0])
     prompt = (
         "사진/영상 첫 프레임을 보고 장소, 분위기, 행동을 파악한 뒤 "
@@ -879,14 +931,20 @@ def analyze_media_styles(settings, media_files):
         content.append(
             {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}}
         )
-    client = OpenAI(api_key=settings.openai_api_key)
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": content}],
-        temperature=0.7,
-        max_tokens=420,
-    )
-    data = _extract_json(response.choices[0].message.content or "")
+    # 429/타임아웃/네트워크 오류로 분석 화면이 막히면 안 되므로 실패 시 로컬 칩으로 내려간다
+    try:
+        client = OpenAI(api_key=settings.openai_api_key, timeout=15.0, max_retries=1)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": content}],
+            temperature=0.7,
+            max_tokens=420,
+        )
+        data = _extract_json(response.choices[0].message.content or "")
+    except Exception as exc:  # noqa: BLE001
+        print("[안내] 미디어 분석 로컬 폴백: {}".format(exc))
+        return local_media_styles(media_files)
+
     styles = []
     for item in data.get("styles") or []:
         if isinstance(item, dict):
@@ -897,18 +955,14 @@ def analyze_media_styles(settings, media_files):
         elif isinstance(item, str) and item.strip():
             styles.append({"label": item.strip(), "prompt": item.strip()})
     if len(styles) < 3:
-        styles = [
-            {"label": "감성 브이로그", "prompt": "감성 브이로그"},
-            {"label": "무한도전 스타일", "prompt": "무한도전 스타일"},
-            {"label": "뉴스 브리핑", "prompt": "뉴스 브리핑"},
-            {"label": "시네마틱 하이라이트", "prompt": "시네마틱 하이라이트"},
-        ]
+        styles = [dict(item) for item in DEFAULT_STYLE_CHIPS]
     return {
         "place": (data.get("place") or "").strip(),
         "mood": (data.get("mood") or "").strip(),
         "action": (data.get("action") or "").strip(),
         "theme": (data.get("theme") or "").strip(),
         "styles": styles[:4],
+        "degraded": False,
     }
 
 
@@ -1422,14 +1476,14 @@ def _publish_temp_mp4(temp, dest):
     return dest
 
 
-def run_ffmpeg(args, timeout=None):
+def run_ffmpeg(args, timeout=None, cwd=None):
     if timeout is None:
         timeout = FFMPEG_TIMEOUT
     with FFMPEG_RUN_LOCK:
-        return _run_ffmpeg_locked(args, timeout)
+        return _run_ffmpeg_locked(args, timeout, cwd=cwd)
 
 
-def _run_ffmpeg_locked(args, timeout):
+def _run_ffmpeg_locked(args, timeout, cwd=None):
     temp, dest, argv = _atomic_mp4_args(args)
     if temp is not None and temp.exists():
         _discard_temp_mp4(temp)
@@ -1442,6 +1496,7 @@ def _run_ffmpeg_locked(args, timeout):
             capture_output=True,
             timeout=timeout,
             creationflags=flags,
+            cwd=str(cwd) if cwd else None,
         )
     except subprocess.TimeoutExpired as exc:
         _discard_temp_mp4(temp)
@@ -1466,6 +1521,25 @@ def _run_ffmpeg_locked(args, timeout):
     if stderr.strip():
         print("[ffmpeg log]\n{}".format(stderr[-800:]), flush=True)
     return proc
+
+
+def probe_video_size(path):
+    """영상 해상도 (w, h). 읽지 못하면 None."""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        proc = subprocess.run(
+            [ffmpeg_bin(), "-hide_banner", "-i", str(path)],
+            capture_output=True,
+            timeout=20,
+            creationflags=flags,
+        )
+    except Exception:
+        return None
+    stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
+    match = re.search(r"Video:.*?[\s,](\d{2,5})x(\d{2,5})", stderr)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
 
 
 def probe_duration(path):
@@ -1747,18 +1821,40 @@ def _srt_clock(seconds):
     return "{:02d}:{:02d}:{:02d},{:03d}".format(hours, minutes, whole, millis)
 
 
-def wrap_caption_lines(text, width=16):
+def wrap_caption_lines(text, width=10, max_lines=2):
+    """자막을 단어 경계에서 최대 2줄로 접는다.
+
+    예전 구현은 16자에서 문장을 잘라 버려 나레이션 뒷부분이 화면에 아예 안 나왔고,
+    libass 자동 줄바꿈이 '갈수록'처럼 단어 중간을 끊어 가독성을 떨어뜨렸다.
+    """
     text = sanitize_narration(text).replace("\n", " ").strip()
     if not text:
         return ""
-    width = max(8, int(width or 16))
+    width = max(8, int(width or 13))
     if len(text) <= width:
         return text
-    cut = text[:width]
-    space = cut.rfind(" ")
-    if space >= 8:
-        cut = cut[:space]
-    return cut.strip()
+    lines = []
+    current = ""
+    for word in text.split():
+        while len(word) > width:
+            if current:
+                lines.append(current)
+                current = ""
+            lines.append(word[:width])
+            word = word[width:]
+            if len(lines) >= max_lines:
+                return "\n".join(lines[:max_lines])
+        candidate = (current + " " + word).strip()
+        if len(candidate) <= width or not current:
+            current = candidate
+            continue
+        lines.append(current)
+        current = word
+        if len(lines) >= max_lines:
+            break
+    if current and len(lines) < max_lines:
+        lines.append(current)
+    return "\n".join(lines[:max_lines])
 
 
 def write_cues_srt(cues, dest):
@@ -1797,10 +1893,30 @@ def subtitle_font_name(font_path):
 
 
 def subtitles_vf(srt_path, font_path, caption_style="hormozi"):
-    srt = _ffmpeg_filter_path(srt_path)
-    fontsdir = _ffmpeg_filter_path(Path(font_path).resolve().parent)
+    """libass 자막 필터.
+
+    FFmpeg 필터 문법은 인자 값 안의 ':'를 항상 구분자로 본다(따옴표·백슬래시로도 못 막는다).
+    윈도우 드라이브 문자(C:)가 들어가면 필터 그래프 파싱이 통째로 깨지므로,
+    ffmpeg를 자막 폴더에서(cwd) 실행하고 상대 이름만 넘긴다.
+    """
     style = caption_force_style(caption_style, font_path)
-    return "subtitles={}:fontsdir={}:force_style='{}'".format(srt, fontsdir, style)
+    name = Path(srt_path).name
+    return "subtitles={}:fontsdir=.:force_style='{}'".format(name, style)
+
+
+def stage_subtitle_assets(cues, work_dir, font_path):
+    """자막 SRT와 폰트를 같은 폴더에 모아 두고 (cwd, srt경로)를 돌려준다."""
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    srt = write_cues_srt(cues, work_dir / "subs.srt")
+    if font_path:
+        try:
+            local_font = work_dir / Path(font_path).name
+            if not local_font.is_file():
+                shutil.copy2(str(font_path), str(local_font))
+        except Exception as exc:
+            print("[안내] 자막 폰트 복사 실패, 시스템 폰트로 진행: {}".format(exc), flush=True)
+    return work_dir, srt
 
 
 def _text_size(draw, text, font, stroke_width):
@@ -2144,12 +2260,22 @@ def build_before_still_clip(still_jpg, dest_mp4, width, height, duration=BEFORE_
     width -= width % 2
     height -= height % 2
     duration = max(1.0, float(duration))
-    shutter = ensure_shutter_sfx()
+    # drawtext의 fontfile도 subtitles와 같은 문제를 겪는다: 값 안의 ':'는 항상 인자 구분자다.
+    # 폰트를 출력 폴더에 복사해 두고 ffmpeg를 그 폴더에서 실행해 상대 이름만 넘긴다.
+    dest = Path(dest_mp4)
+    dest.parent.mkdir(parents=True, exist_ok=True)
     font = find_korean_font()
     font_opt = ""
+    run_cwd = None
     if font and Path(font).is_file():
-        font_path = str(Path(font)).replace("\\", "/").replace(":", "\\:")
-        font_opt = "fontfile={}:".format(font_path)
+        try:
+            local_font = dest.parent / Path(font).name
+            if not local_font.is_file():
+                shutil.copy2(str(font), str(local_font))
+            font_opt = "fontfile={}:".format(local_font.name)
+            run_cwd = dest.parent
+        except Exception as exc:
+            print("[안내] Before 텍스트 폰트 준비 실패: {}".format(exc), flush=True)
     label = _escape_drawtext("Before")
     vf = (
         "scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,"
@@ -2157,39 +2283,45 @@ def build_before_still_clip(still_jpg, dest_mp4, width, height, duration=BEFORE_
         "x=(w-text_w)/2:y=h*0.10,"
         "format=yuv420p,fps={fps}"
     ).format(w=width, h=height, font=font_opt, label=label, fs=max(42, height // 18), fps=FPS)
-    dest = Path(dest_mp4)
-    run_ffmpeg(
-        [
-            "-loop",
-            "1",
-            "-t",
-            "{:.3f}".format(duration),
-            "-i",
-            str(still_jpg),
-            "-i",
-            str(shutter),
-            "-vf",
-            vf,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-crf",
-            "22",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-shortest",
-            "-movflags",
-            "+faststart",
-            str(dest),
-        ],
-        timeout=30,
+    plain_vf = "scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,format=yuv420p,fps={fps}".format(
+        w=width, h=height, fps=FPS
     )
-    if not dest.is_file() or dest.stat().st_size < 1000:
-        raise RuntimeError("Before 클립 생성 실패")
-    return dest
+    # 셔터음은 최종 오디오 믹스에서 t=0에 얹는다. 여기서 -shortest를 쓰면 1.5초가 셔터음 길이로 잘린다.
+    for filters, cwd in ((vf, run_cwd), (plain_vf, None)):
+        try:
+            run_ffmpeg(
+                [
+                    "-loop",
+                    "1",
+                    "-framerate",
+                    str(FPS),
+                    "-i",
+                    str(still_jpg),
+                    "-an",
+                    "-vf",
+                    filters,
+                    "-t",
+                    "{:.3f}".format(duration),
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "22",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-movflags",
+                    "+faststart",
+                    str(dest),
+                ],
+                timeout=30,
+                cwd=cwd,
+            )
+            if dest.is_file() and dest.stat().st_size > 1000:
+                return dest
+        except Exception as exc:
+            print("[안내] Before 클립 drawtext 실패, 텍스트 없이 재시도: {}".format(exc), flush=True)
+    raise RuntimeError("Before 클립 생성 실패")
 
 
 def apply_before_after_hook(still_jpg, motion_mp4, dest_mp4, width=None, height=None, work_dir=None):
@@ -2225,7 +2357,13 @@ def apply_before_after_hook(still_jpg, motion_mp4, dest_mp4, width=None, height=
     if not after_norm.is_file():
         shutil.copy2(str(motion_mp4), str(dest_mp4))
         return Path(dest_mp4)
-    offset = max(0.4, BEFORE_AFTER_SEC - BEFORE_SWIPE_SEC)
+    before_len = BEFORE_AFTER_SEC
+    try:
+        before_len = max(0.6, probe_duration(before))
+    except Exception:
+        pass
+    fade = max(0.2, min(BEFORE_SWIPE_SEC, before_len - 0.25))
+    offset = max(0.1, before_len - fade)
     dest = Path(dest_mp4)
     try:
         run_ffmpeg(
@@ -2235,24 +2373,20 @@ def apply_before_after_hook(still_jpg, motion_mp4, dest_mp4, width=None, height=
                 "-i",
                 str(after_norm),
                 "-filter_complex",
-                (
-                    "[0:v][1:v]xfade=transition=slideleft:duration={fade}:offset={off}[v];"
-                    "[0:a]aformat=sample_rates=44100:channel_layouts=stereo,apad=pad_dur=0.35[a0];"
-                    "[a0]anull[a]"
-                ).format(fade=BEFORE_SWIPE_SEC, off=offset),
+                "[0:v][1:v]xfade=transition=slideleft:duration={fade}:offset={off}[v]".format(
+                    fade="{:.3f}".format(fade), off="{:.3f}".format(offset)
+                ),
                 "-map",
                 "[v]",
-                "-map",
-                "[a]",
+                "-an",
                 "-c:v",
                 "libx264",
                 "-preset",
                 "ultrafast",
                 "-crf",
                 "22",
-                "-c:a",
-                "aac",
-                "-shortest",
+                "-pix_fmt",
+                "yuv420p",
                 "-movflags",
                 "+faststart",
                 str(dest),
@@ -2263,34 +2397,38 @@ def apply_before_after_hook(still_jpg, motion_mp4, dest_mp4, width=None, height=
         print("[안내] xfade 스와이프 실패, concat 폴백: {}".format(exc), flush=True)
         list_path = work / "ba_concat.txt"
         list_path.write_text(
-            "ffconcat version 1.0\nfile '{}'\nfile '{}'\n".format(
-                str(before).replace("'", "'\\''"),
-                str(after_norm).replace("'", "'\\''"),
-            ),
+            "\n".join(
+                ["ffconcat version 1.0", _concat_file_line(before), _concat_file_line(after_norm)]
+            )
+            + "\n",
             encoding="utf-8",
         )
-        run_ffmpeg(
-            [
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                str(list_path),
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-crf",
-                "22",
-                "-c:a",
-                "aac",
-                "-movflags",
-                "+faststart",
-                str(dest),
-            ],
-            timeout=40,
-        )
+        try:
+            run_ffmpeg(
+                [
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(list_path),
+                    "-an",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "22",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-movflags",
+                    "+faststart",
+                    str(dest),
+                ],
+                timeout=40,
+            )
+        except Exception as exc2:
+            print("[안내] 비포/애프터 concat 폴백도 실패: {}".format(exc2), flush=True)
     if dest.is_file() and dest.stat().st_size > 1000:
         return dest
     shutil.copy2(str(motion_mp4), str(dest))
@@ -2330,12 +2468,13 @@ def ffmpeg_parallax_clip(src_jpg, dest_mp4, duration=5.0, width=None, height=Non
         fps=FPS,
     )
     try:
+        # zoompan은 입력 1장에서 d개 프레임을 만든다. 입력을 -t로 늘리면 길이가 frames배로 폭주한다.
         run_ffmpeg(
             [
                 "-loop",
                 "1",
-                "-t",
-                "{:.3f}".format(duration),
+                "-framerate",
+                str(FPS),
                 "-i",
                 str(src_jpg),
                 "-filter_complex",
@@ -2353,9 +2492,13 @@ def ffmpeg_parallax_clip(src_jpg, dest_mp4, duration=5.0, width=None, height=Non
                 "yuv420p",
                 "-movflags",
                 "+faststart",
+                "-frames:v",
+                str(frames),
+                "-t",
+                "{:.3f}".format(duration),
                 str(dest),
             ],
-            timeout=35,
+            timeout=45,
         )
     except Exception as exc:
         print("[안내] 파라랙스 합성 실패, 켄 번스 폴백: {}".format(exc), flush=True)
@@ -2407,7 +2550,7 @@ def fal_lipsync_image_to_video(image_path, audio_path, dest_mp4, timeout=45.0):
         raise RuntimeError("fal 잔액 부족 · 립싱크 폴백")
     key = (os.getenv("FAL_KEY") or "").strip()
     if not key:
-        raise RuntimeError("FAL_KEY가 없습니다.")
+        raise RuntimeError("FAL_KEY가 없어 립싱크를 건너뜁니다 · 제로코스트 폴백")
     os.environ["FAL_KEY"] = key
     image_url = _fal_upload_or_url(image_path, kind="image")
     audio_url = _fal_upload_or_url(audio_path, kind="audio")
@@ -2455,7 +2598,8 @@ def generate_viral_motion_clips(
     allow_fal=False,
 ):
     """인스타 바이럴 특수 연출. allow_fal=False(기본)면 fal 호출 없이 로컬만."""
-    del style_prompt, settings, user_action, target_duration
+    del style_prompt, settings, user_action
+    target_hint = max(2.5, float(target_duration or SPARK_CLIP_SEC))
     width = int(width or TARGET_W)
     height = int(height or TARGET_H)
     motion_intensity = normalize_motion_intensity(motion_intensity)
@@ -2473,6 +2617,7 @@ def generate_viral_motion_clips(
         return []
 
     clips = []
+    used_fal = False
     # 립싱크 fal은 스파크 PRO(allow_fal)일 때만 1회
     if allow_fal and ai_lipsync and voice_path and Path(voice_path).is_file():
         _notify(progress_cb, 34, "🎙️ AI 페이스 립싱크 1회", lock)
@@ -2481,6 +2626,7 @@ def generate_viral_motion_clips(
             fal_lipsync_image_to_video(frame, voice_path, lipsync_out, timeout=min(40.0, FAL_WAIT_TIMEOUT + 20))
             if lipsync_out.is_file():
                 clips.append(lipsync_out)
+                used_fal = True
         except Exception as exc:
             print("[안내] 립싱크 실패(제로코스트 유지): {}".format(exc), flush=True)
 
@@ -2499,6 +2645,23 @@ def generate_viral_motion_clips(
             clips.append(local)
         except Exception as exc:
             print("[안내] 로컬 파라랙스 실패: {}".format(exc), flush=True)
+        # 나머지 사진도 켄 번스로 살려서 한 장만 반복되는 현상을 막는다 (전부 로컬·비용 0원)
+        try:
+            frames = prepare_job_frames(media_files, job_dir, width, height)
+            if len(frames) > 1:
+                clips.extend(
+                    ken_burns_clips_per_photo(
+                        frames[1:],
+                        work_dir,
+                        max(2.5, float(target_hint or SPARK_CLIP_SEC)),
+                        width=width,
+                        height=height,
+                        intensity=motion_intensity,
+                        max_clips=LOCAL_MAX_CLIPS - 1,
+                    )
+                )
+        except Exception as exc:
+            print("[안내] 파라랙스 보조 컷 실패: {}".format(exc), flush=True)
 
     if not clips:
         clips = generate_zero_cost_motion_clips(
@@ -2510,7 +2673,7 @@ def generate_viral_motion_clips(
             height=height,
             job_dir=job_dir,
             motion_intensity=motion_intensity,
-            count=1,
+            duration=target_hint,
         )
 
     if before_after and clips:
@@ -2534,7 +2697,8 @@ def generate_viral_motion_clips(
         if key not in seen and Path(clip).is_file():
             seen.add(key)
             unique.append(Path(clip))
-    return unique[:SPARK_MAX_CLIPS]
+    # 유료(fal) 결과는 1클립으로 제한, 로컬 클립은 사진 수만큼 허용(비용 0원)
+    return unique[: SPARK_MAX_CLIPS if used_fal else LOCAL_MAX_CLIPS]
 
 
 def scale_volume(clip, factor):
@@ -3149,14 +3313,21 @@ def resolve_bgm(mood, duration, dest):
 
 
 def _notify(progress_cb, percent, message, lock=None):
-    print(message)
+    """진행 알림은 절대 파이프라인을 죽이지 않는다(로그 인코딩·콜백 오류 포함)."""
+    try:
+        print(message, flush=True)
+    except Exception:
+        pass
     if progress_cb is None:
         return
-    if lock is not None:
-        with lock:
+    try:
+        if lock is not None:
+            with lock:
+                progress_cb(percent, message)
+        else:
             progress_cb(percent, message)
-    else:
-        progress_cb(percent, message)
+    except Exception as exc:
+        print("[안내] 진행 알림 콜백 오류 무시: {}".format(exc))
 
 
 def download_http_file(url, dest, timeout=180):
@@ -3431,6 +3602,9 @@ def fal_image_to_video(image_path, prompt, dest_mp4, timeout=None, models=None, 
     deadline = time.time() + timeout
     if _fal_billing_dead():
         raise RuntimeError("fal 잔액 부족 · 켄 번스 폴백")
+    # 키가 없으면 업로드·URL 준비를 시작하지도 않는다 (예전엔 여기서 60초 이상 헛돌았다)
+    if not (os.getenv("FAL_KEY") or "").strip():
+        raise RuntimeError("FAL_KEY가 없어 스파크 I2V를 건너뜁니다 · 제로코스트 폴백")
     try:
         try:
             import fal_client
@@ -3479,7 +3653,7 @@ def fal_image_to_video(image_path, prompt, dest_mp4, timeout=None, models=None, 
                     payload["prompt"] = prompt
                 else:
                     payload["prompt_optimizer"] = True
-                    result = None
+                result = None
                 if fal_client is not None and left > 8 and not _fal_billing_dead():
                     try:
                         result = fal_client.subscribe(model, arguments=payload, with_logs=False)
@@ -3885,12 +4059,14 @@ def burn_kinetic_captions(video_path, script, duration, font_path, out_file, wor
 def salvage_motion_clips(work_dir):
     work_dir = Path(work_dir)
     found = []
-    for pattern in ("i2v_*.mp4", "kb_*.mp4", "temp_render_kb_*.mp4", "temp_render_i2v_*.mp4"):
+    # temp_render_* 는 ffmpeg가 지금 쓰고 있는 스테이징 파일이다.
+    # 여기서 주워 오면 os.replace 직후 사라져 "Error opening input file"이 난다.
+    for pattern in ("i2v_*.mp4", "kb_*.mp4", "lipsync_*.mp4", "parallax_*.mp4", "before_after_*.mp4"):
         found.extend(sorted(work_dir.glob(pattern)))
     clips = []
     seen = set()
     for path in found:
-        if "temp_render_final" in path.name:
+        if path.name.startswith("temp_render"):
             continue
         if not path.is_file() or path.stat().st_size < 1000:
             continue
@@ -3904,16 +4080,27 @@ def salvage_motion_clips(work_dir):
     return clips
 
 
-def ffmpeg_ken_burns_sequence(src_jpg, work_dir, count=3, duration=5.0, width=None, height=None, intensity=7):
-    """정지 컷을 zoompan/crop(n)으로 움직이게 만든다. crop의 잘못된 'on' 변수는 사용하지 않는다."""
+KEN_BURNS_CROPS = (
+    "(iw-ow)*n/{n}:(ih-oh)*n/{n}*0.45",
+    "(iw-ow)*(1-n/{n}):(ih-oh)*0.42",
+    "(iw-ow)*0.5:(ih-oh)*(1-n/{n})",
+)
+KEN_BURNS_ZOOMS = (
+    "min(zoom+0.0015\\,{z})",
+    "min(zoom+0.0018\\,{z})",
+    "min(zoom+0.0012\\,{z})",
+)
+
+
+def ffmpeg_ken_burns_clip(src_jpg, dest_mp4, duration=5.0, width=None, height=None, intensity=7, variant=0):
+    """정지 컷 1장 → 움직이는 클립. crop에는 프레임 번호 n만 쓴다(zoompan의 on 아님)."""
     width = int(width or TARGET_W)
     height = int(height or TARGET_H)
     width -= width % 2
     height -= height % 2
     intensity = normalize_motion_intensity(intensity)
-    count = max(1, int(count or 1))
     duration = max(2.0, float(duration))
-    fps = STILL_FPS
+    fps = FPS
     frames = max(24, int(round(duration * fps)))
     n_last = max(1, frames - 1)
     zoom = 1.12 + 0.04 * (intensity - 6)
@@ -3921,74 +4108,108 @@ def ffmpeg_ken_burns_sequence(src_jpg, work_dir, count=3, duration=5.0, width=No
     sh = int(round(height * zoom))
     sw += sw % 2
     sh += sh % 2
-    # crop 표현식은 프레임 번호 n (zoompan의 on 아님)
-    crops = (
-        "(iw-ow)*n/{n}:(ih-oh)*n/{n}*0.45",
-        "(iw-ow)*(1-n/{n}):(ih-oh)*0.42",
-        "(iw-ow)*0.5:(ih-oh)*(1-n/{n})",
+    xy = KEN_BURNS_CROPS[variant % len(KEN_BURNS_CROPS)].format(n=n_last)
+    zexpr = KEN_BURNS_ZOOMS[variant % len(KEN_BURNS_ZOOMS)].format(z="{:.3f}".format(zoom))
+    dest = Path(dest_mp4)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # zoompan이 crop(n)보다 안정적이라 1순위, 실패 시 crop(n) 폴백
+    vf_zoom = (
+        "scale={sw}:{sh}:flags=fast_bilinear,"
+        "zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps={fps},"
+        "setsar=1,format=yuv420p"
+    ).format(sw=sw, sh=sh, z=zexpr, frames=frames, w=width, h=height, fps=fps)
+    vf_crop = (
+        "scale={sw}:{sh}:flags=fast_bilinear,"
+        "crop={w}:{h}:{xy},"
+        "setsar=1,fps={fps},format=yuv420p"
+    ).format(sw=sw, sh=sh, w=width, h=height, xy=xy, fps=fps)
+    # zoompan은 입력 프레임 1장마다 d개 프레임을 뽑는다.
+    # 입력을 -t로 늘리면 frames×frames 프레임을 만들어 클립이 수백 초로 늘어나고 렌더가 수십 배 느려진다.
+    # → zoompan은 입력 1장 + 출력 -frames:v, crop은 입력 -t 로 각각 다르게 잘라 준다.
+    variants = (
+        (vf_zoom, ["-loop", "1", "-framerate", str(fps), "-i", str(src_jpg)],
+         ["-frames:v", str(frames), "-t", "{:.3f}".format(duration)]),
+        (vf_crop, ["-loop", "1", "-framerate", str(fps), "-t", "{:.3f}".format(duration), "-i", str(src_jpg)],
+         ["-frames:v", str(frames)]),
     )
-    zooms = (
-        "min(zoom+0.0015\\,{z})",
-        "min(zoom+0.0018\\,{z})",
-        "min(zoom+0.0012\\,{z})",
-    )
-    clips = []
-    src = Path(src_jpg)
+    for vf, input_args, cut_args in variants:
+        try:
+            run_ffmpeg(
+                input_args
+                + [
+                    "-an",
+                    "-vf",
+                    vf,
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "23",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-movflags",
+                    "+faststart",
+                ]
+                + cut_args
+                + [str(dest)],
+                timeout=30,
+            )
+            if dest.is_file() and dest.stat().st_size > 1000:
+                return dest
+        except Exception as exc:
+            print("[안내] 켄 번스 시도 실패: {}".format(exc), flush=True)
+    return None
+
+
+def ffmpeg_ken_burns_sequence(src_jpg, work_dir, count=3, duration=5.0, width=None, height=None, intensity=7):
+    """한 장의 스틸에서 서로 다른 무빙 변형 클립을 count개 만든다."""
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
-    for index in range(count):
+    clips = []
+    for index in range(max(1, int(count or 1))):
         dest = work_dir / ("kb_{:02d}.mp4".format(index + 1))
-        xy = crops[index % len(crops)].format(n=n_last)
-        zexpr = zooms[index % len(zooms)].format(z="{:.3f}".format(zoom))
-        # zoompan이 crop(n)보다 안정적이라 1순위, 실패 시 crop(n) 폴백
-        vf_zoom = (
-            "scale={sw}:{sh}:flags=fast_bilinear,"
-            "zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps={fps},"
-            "setsar=1,format=yuv420p"
-        ).format(sw=sw, sh=sh, z=zexpr, frames=frames, w=width, h=height, fps=fps)
-        vf_crop = (
-            "scale={sw}:{sh}:flags=fast_bilinear,"
-            "crop={w}:{h}:{xy},"
-            "setsar=1,fps={fps},format=yuv420p"
-        ).format(sw=sw, sh=sh, w=width, h=height, xy=xy, fps=fps)
-        ok = False
-        for vf in (vf_zoom, vf_crop):
-            try:
-                run_ffmpeg(
-                    [
-                        "-loop",
-                        "1",
-                        "-framerate",
-                        str(fps),
-                        "-t",
-                        "{:.3f}".format(duration),
-                        "-i",
-                        str(src),
-                        "-an",
-                        "-vf",
-                        vf,
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "ultrafast",
-                        "-crf",
-                        "23",
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-movflags",
-                        "+faststart",
-                        str(dest),
-                    ],
-                    timeout=25,
-                )
-                if dest.is_file() and dest.stat().st_size > 1000:
-                    clips.append(dest)
-                    ok = True
-                    break
-            except Exception as exc:
-                print("[안내] 켄 번스 시도 실패: {}".format(exc), flush=True)
-        if not ok:
+        made = ffmpeg_ken_burns_clip(
+            src_jpg,
+            dest,
+            duration=duration,
+            width=width,
+            height=height,
+            intensity=intensity,
+            variant=index,
+        )
+        if made is not None:
+            clips.append(made)
+        else:
             print("[안내] 켄 번스 클립 생성 실패: {}".format(dest), flush=True)
+    return clips
+
+
+def ken_burns_clips_per_photo(frames, work_dir, total_duration, width=None, height=None, intensity=7, max_clips=None):
+    """사진 한 장당 한 컷씩 무빙 클립을 만든다(전부 로컬 · 비용 0원)."""
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    sources = [Path(p) for p in (frames or []) if Path(p).is_file()]
+    if not sources:
+        return []
+    limit = max(1, int(max_clips or LOCAL_MAX_CLIPS))
+    sources = sources[:limit]
+    total = max(2.5, float(total_duration or SPARK_CLIP_SEC))
+    per_clip = max(2.5, min(6.0, total / len(sources)))
+    clips = []
+    for index, src in enumerate(sources):
+        dest = work_dir / ("kb_{:02d}.mp4".format(index + 1))
+        made = ffmpeg_ken_burns_clip(
+            src,
+            dest,
+            duration=per_clip,
+            width=width,
+            height=height,
+            intensity=intensity,
+            variant=index,
+        )
+        if made is not None:
+            clips.append(made)
     return clips
 
 
@@ -4013,38 +4234,58 @@ def generate_zero_cost_motion_clips(
     height=None,
     job_dir=None,
     motion_intensity=None,
-    count=1,
+    count=None,
     duration=None,
 ):
-    """비용 0원 · Pillow/FFmpeg 켄 번스 블러 엔진 (fal.ai 호출 없음)."""
+    """비용 0원 · Pillow/FFmpeg 켄 번스 블러 엔진 (fal.ai 호출 없음). 업로드한 사진 전부를 살린다."""
     width = int(width or TARGET_W)
     height = int(height or TARGET_H)
     motion_intensity = normalize_motion_intensity(motion_intensity)
     job_dir = Path(job_dir) if job_dir else Path(work_dir).parent
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
-    hero = i2v_hero_source(media_files, job_dir)
-    if hero is None:
-        return []
     _notify(progress_cb, 30, "💰 제로코스트 · 켄 번스 블러 엔진", lock)
-    frame = job_dir / "i2v_source.jpg"
+
+    frames = []
     try:
-        prepare_i2v_still(hero, frame, width, height)
+        frames = prepare_job_frames(media_files, job_dir, width, height)
     except Exception as exc:
-        print("[안내] 제로코스트 캔버스 실패: {}".format(exc), flush=True)
-        return []
-    clips = pillow_ken_burns_sequence(
-        frame,
+        print("[안내] 제로코스트 프레임 준비 실패: {}".format(exc), flush=True)
+    if not frames:
+        hero = i2v_hero_source(media_files, job_dir)
+        if hero is None:
+            return []
+        frame = job_dir / "i2v_source.jpg"
+        try:
+            prepare_i2v_still(hero, frame, width, height)
+        except Exception as exc:
+            print("[안내] 제로코스트 캔버스 실패: {}".format(exc), flush=True)
+            return []
+        frames = [frame]
+
+    total = float(duration or SPARK_CLIP_SEC)
+    clips = ken_burns_clips_per_photo(
+        frames,
         work_dir,
-        count=max(1, int(count or 1)),
-        duration=float(duration or SPARK_CLIP_SEC),
+        total,
         width=width,
         height=height,
         intensity=motion_intensity,
+        max_clips=count or LOCAL_MAX_CLIPS,
     )
+    if not clips:
+        clips = pillow_ken_burns_sequence(
+            frames[0],
+            work_dir,
+            count=1,
+            duration=max(2.5, min(6.0, total)),
+            width=width,
+            height=height,
+            intensity=motion_intensity,
+        )
     if clips:
         _notify(progress_cb, 62, "켄 번스 모션 {}클립 준비 (fal 미사용)".format(len(clips)), lock)
-    return clips[: max(1, int(count or 1))]
+    return clips
 
 
 def generate_spark_cinema_clips(
@@ -4116,7 +4357,25 @@ def generate_spark_cinema_clips(
         )
         if Path(clip).is_file() and Path(clip).stat().st_size > 1000:
             _notify(progress_cb, 62, "✨ I2V 모션 1클립 준비 완료", lock)
-            return [Path(clip)]
+            spark = [Path(clip)]
+            # 나머지 사진은 로컬 켄 번스로 이어 붙인다(추가 크레딧 0원)
+            try:
+                frames = prepare_job_frames(media_files, job_dir, width, height)
+                if len(frames) > 1:
+                    spark.extend(
+                        ken_burns_clips_per_photo(
+                            frames[1:],
+                            work_dir,
+                            max(2.5, float(target_duration or SPARK_CLIP_SEC)),
+                            width=width,
+                            height=height,
+                            intensity=motion_intensity,
+                            max_clips=LOCAL_MAX_CLIPS - 1,
+                        )
+                    )
+            except Exception as exc:
+                print("[안내] 스파크 보조 컷 생성 실패(1클립 유지): {}".format(exc), flush=True)
+            return spark
     except Exception as exc:
         print("[안내] 스파크 I2V 1회 실패 → 제로코스트 폴백: {}".format(exc), flush=True)
 
@@ -4130,8 +4389,7 @@ def generate_spark_cinema_clips(
         height=height,
         job_dir=job_dir,
         motion_intensity=motion_intensity,
-        count=1,
-        duration=SPARK_CLIP_SEC,
+        duration=float(target_duration or SPARK_CLIP_SEC),
     )
 
 
@@ -4259,14 +4517,58 @@ def ffmpeg_spark_pass(
     width=None,
     height=None,
     caption_style="hormozi",
+    intro_sfx=None,
 ):
     if not clips:
         raise RuntimeError("✨ 스파크 시네마 AI 비디오 클립이 없습니다.")
+    if not voice_path or not Path(voice_path).is_file():
+        raise RuntimeError("모션 합성에 사용할 음성 트랙이 없습니다.")
     width = int(width or TARGET_W)
     height = int(height or TARGET_H)
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
     target = max(float(audio_duration), 1.0)
+
+    # concat 디먹서는 스트림 규격이 같아야 한다. 클립이 여러 개면 캔버스/무음으로 통일한다.
+    canon = [Path(p) for p in clips]
+    if len(canon) > 1:
+        unified = []
+        for index, clip in enumerate(canon):
+            size = probe_video_size(clip)
+            dest = work_dir / ("norm_{:02d}.mp4".format(index + 1))
+            try:
+                run_ffmpeg(
+                    [
+                        "-i",
+                        str(clip),
+                        "-an",
+                        "-vf",
+                        (
+                            "scale={w}:{h}:force_original_aspect_ratio=increase,"
+                            "crop={w}:{h},setsar=1,fps={fps},format=yuv420p"
+                        ).format(w=width, h=height, fps=FPS),
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "ultrafast",
+                        "-crf",
+                        "23",
+                        "-movflags",
+                        "+faststart",
+                        str(dest),
+                    ],
+                    timeout=45,
+                )
+                unified.append(dest if dest.is_file() and dest.stat().st_size > 1000 else clip)
+            except Exception as exc:
+                print("[안내] 모션 클립 규격 통일 실패({}x{} → 원본 사용): {}".format(
+                    (size or ("?", "?"))[0], (size or ("?", "?"))[1], exc
+                ), flush=True)
+                unified.append(clip)
+        canon = unified
+
     durs = []
-    for path in clips:
+    for path in canon:
         try:
             durs.append(max(0.4, probe_duration(path)))
         except Exception:
@@ -4275,29 +4577,85 @@ def ffmpeg_spark_pass(
     lines = ["ffconcat version 1.0"]
     elapsed = 0.0
     index = 0
-    while elapsed < target + 0.05 and index < 24:
-        path = clips[index % len(clips)]
-        lines.append(_concat_file_line(path))
-        elapsed += durs[index % len(clips)]
+    while elapsed < target + 0.05 and index < 48:
+        lines.append(_concat_file_line(canon[index % len(canon)]))
+        elapsed += durs[index % len(canon)]
         index += 1
     list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    srt = write_cues_srt(cues, work_dir / "subs.srt")
-    vf = (
-        "scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,fps={fps},format=yuv420p,{subs}"
-    ).format(w=width, h=height, fps=FPS, subs=subtitles_vf(srt, font_path, caption_style or "hormozi"))
-    args = ["-f", "concat", "-safe", "0", "-i", str(list_path), "-i", str(voice_path)]
-    maps = ["-map", "[v]", "-map", "1:a:0"]
-    extra = ["-filter_complex", "[0:v]{}[v]".format(vf)]
-    if bgm_path:
-        args += ["-i", str(bgm_path)]
-        extra = [
-            "-filter_complex",
-            "[0:v]{}[v];{}".format(vf, ducking_audio_filter(1.0)),
-        ]
-        maps = ["-map", "[v]", "-map", "[a]"]
-    args += extra + maps + FFMPEG_MOTION_ENCODE + ["-t", "{:.3f}".format(float(audio_duration)), str(out_file)]
-    run_ffmpeg(args, timeout=50)
+    base_vf = "scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,fps={fps},format=yuv420p".format(
+        w=width, h=height, fps=FPS
+    )
+    subs_vf = ""
+    subs_cwd = None
+    try:
+        if cues:
+            subs_cwd, srt = stage_subtitle_assets(cues, work_dir, font_path)
+            subs_vf = base_vf + "," + subtitles_vf(srt, font_path, caption_style or "hormozi")
+    except Exception as exc:
+        print("[안내] 자막 트랙 준비 실패, 무자막으로 진행: {}".format(exc), flush=True)
+
+    sfx = Path(intro_sfx) if intro_sfx and Path(intro_sfx).is_file() else None
+    timeout = int(max(60, min(240, target * 5 + 40)))
+
+    def _attempt(vf, use_sfx, cwd=None):
+        args = ["-f", "concat", "-safe", "0", "-i", str(list_path), "-i", str(voice_path)]
+        next_idx = 2
+        bgm_idx = None
+        if bgm_path:
+            args += ["-i", str(bgm_path)]
+            bgm_idx = next_idx
+            next_idx += 1
+        sfx_idx = None
+        if use_sfx and sfx is not None:
+            args += ["-i", str(sfx)]
+            sfx_idx = next_idx
+            next_idx += 1
+
+        chain = ["[0:v]{}[v]".format(vf)]
+        if bgm_idx is not None:
+            chain.append(ducking_audio_filter(1.0, bgm_idx=bgm_idx, out_label="amix0" if sfx_idx is not None else "a"))
+        elif sfx_idx is not None:
+            chain.append(
+                "[1:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[amix0]"
+            )
+        if sfx_idx is not None:
+            chain.append(
+                "[{s}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume=0.85[sx];"
+                "[amix0][sx]amix=inputs=2:duration=first:dropout_transition=0[a]".format(s=sfx_idx)
+            )
+        maps = ["-map", "[v]"]
+        maps += ["-map", "[a]"] if (bgm_idx is not None or sfx_idx is not None) else ["-map", "1:a:0"]
+        run_ffmpeg(
+            args
+            + ["-filter_complex", ";".join(chain)]
+            + maps
+            + FFMPEG_MOTION_ENCODE
+            + ["-t", "{:.3f}".format(float(audio_duration)), str(out_file)],
+            timeout=timeout,
+            cwd=cwd,
+        )
+
+    attempts = []
+    if subs_vf:
+        attempts.append((subs_vf, True, subs_cwd))
+        attempts.append((subs_vf, False, subs_cwd))
+    attempts.append((base_vf, True, None))
+    attempts.append((base_vf, False, None))
+    last_error = None
+    for vf, use_sfx, cwd in attempts:
+        if use_sfx and sfx is None:
+            continue
+        try:
+            _attempt(vf, use_sfx, cwd=cwd)
+            return
+        except Exception as exc:
+            last_error = exc
+            print(
+                "[안내] 모션 합성 재시도(자막={} 셔터={}): {}".format(bool(vf == subs_vf), use_sfx, exc),
+                flush=True,
+            )
+    raise RuntimeError("모션 클립 합성 실패: {}".format(last_error))
 
 
 def ffmpeg_runway_pass(*args, **kwargs):
@@ -4609,7 +4967,7 @@ def run_pipeline(
 
         _notify(progress_cb, 16, "대본 작성 중", progress_lock)
         try:
-            if _left() < 14:
+            if _left() < 20:
                 raise RuntimeError("잔여시간 부족")
             script, photo_order, instagram = generate_script(
                 settings,
@@ -4620,11 +4978,14 @@ def run_pipeline(
             )
         except Exception as exc:
             print("[안내] 대본 API 실패, 로컬 스토리로 폴백: {}".format(exc))
-            script, photo_order, instagram = fallback_script(style_prompt, target_duration=target_duration)
+            script, photo_order, instagram = fallback_script(
+                style_prompt,
+                target_duration=target_duration,
+                vision_tags=_vision_tags_from_media(media_files, style_prompt),
+            )
             used_fallback = True
         script = sanitize_narration(script)
         instagram = normalize_instagram_payload(instagram, style_prompt=style_prompt, script=script)
-        pieces = split_script_pieces(script)
         _notify(progress_cb, 24, "대본 완료 · 음성 합성과 사진 보정을 동시에 시작", progress_lock)
 
         def _hold_frames():
@@ -4643,7 +5004,7 @@ def run_pipeline(
 
         def _frame_job(voice_for_lipsync=None):
             # 제로코스트 기본: fal 미사용. 스파크 PRO(spark)일 때만 fal 1회.
-            if spark and _left() > 10:
+            if spark and _left() > 40:
                 try:
                     clips = generate_spark_cinema_clips(
                         media_files,
@@ -4669,13 +5030,13 @@ def run_pipeline(
                                     apply_before_after_hook(
                                         src, clips[0], hooked, width=width, height=height, work_dir=work_dir
                                     )
-                                    clips = [hooked]
+                                    clips = [hooked] + list(clips[1:])
                                 except Exception as exc:
                                     print("[안내] 스파크 비포/애프터 훅 실패: {}".format(exc))
                         return clips
                 except Exception as exc:
                     print("[안내] 스파크 I2V 실패 → 제로코스트: {}".format(exc))
-            if viral_on and _left() > 8:
+            if viral_on and _left() > 25:
                 try:
                     clips = generate_viral_motion_clips(
                         media_files,
@@ -4701,7 +5062,7 @@ def run_pipeline(
                         return clips
                 except Exception as exc:
                     print("[안내] 바이럴(로컬) 실패: {}".format(exc))
-            # 기본 경로: 비용 0원 켄 번스
+            # 기본 경로: 비용 0원 켄 번스 (업로드한 사진 전부에 무빙 적용)
             try:
                 clips = generate_zero_cost_motion_clips(
                     media_files,
@@ -4712,8 +5073,19 @@ def run_pipeline(
                     height=height,
                     job_dir=out_file.parent,
                     motion_intensity=motion_intensity,
-                    count=1,
+                    duration=float(target_duration),
                 )
+                if clips and before_after_hook:
+                    src = out_file.parent / "frame_0.jpg"
+                    if src.is_file():
+                        try:
+                            hooked = work_dir / "before_after_zero.mp4"
+                            apply_before_after_hook(
+                                src, clips[0], hooked, width=width, height=height, work_dir=work_dir
+                            )
+                            clips = [hooked] + list(clips[1:])
+                        except Exception as exc:
+                            print("[안내] 제로코스트 비포/애프터 훅 실패: {}".format(exc))
                 if clips:
                     return clips
             except Exception as exc:
@@ -4742,15 +5114,15 @@ def run_pipeline(
                 voice_fut = pool.submit(_voice_job)
                 frame_fut = pool.submit(_frame_job)
                 try:
-                    voice_path = voice_fut.result(timeout=max(8.0, min(40.0, _left() - 8)))
+                    voice_path = voice_fut.result(timeout=max(1.0, min(45.0, _left() - 25)))
                 except Exception as exc:
                     print("[안내] 음성 대기 중단: {}".format(exc))
                     voice_path = ensure_voice_track(
                         settings, script, voice_file, voice_key, duration=float(target_duration)
                     )
                 try:
-                    i2v_wait = 14.0 if spark else 10.0
-                    generated = frame_fut.result(timeout=max(8.0, min(i2v_wait, max(8.0, _left() - 3))))
+                    # 렌더에 최소 20초는 남겨 둔다
+                    generated = frame_fut.result(timeout=max(1.0, min(70.0, _left() - 20)))
                 except Exception as exc:
                     print("[안내] 영상 생성 대기 중단: {}".format(exc), flush=True)
                     generated = salvage_motion_clips(work_dir)
@@ -4787,11 +5159,13 @@ def run_pipeline(
             print("[안내] 음성 길이 보정 실패: {}".format(exc))
         audio_duration = float(target_duration)
         cues = split_script_cues(script, audio_duration)
-        spark_clips = None
+        # 모션 클립이 있으면 spark 여부와 무관하게 모션 렌더로 간다.
+        # (예전에는 제로코스트 켄 번스 클립을 만들고도 정지 슬라이드쇼로 버렸다)
+        motion_clips = None
         if generated and _is_motion_clip(generated[0]):
-            spark_clips = generated
-            hold_frames = generated
-            durations = even_scene_durations(len(generated), audio_duration)
+            motion_clips = [Path(p) for p in generated if _is_motion_clip(p)]
+            durations = even_scene_durations(len(motion_clips), audio_duration)
+            hold_frames = None
         else:
             hold_frames = _hold_frames()
             durations = even_scene_durations(len(hold_frames), audio_duration)
@@ -4801,53 +5175,76 @@ def run_pipeline(
         except Exception:
             bgm_path = None
 
-        spark_clips = spark_clips if spark else None
+        spark_clips = motion_clips
+
+        def _render_stills():
+            frames = hold_frames or _hold_frames()
+            still_durations = (
+                durations if hold_frames and len(durations) == len(frames)
+                else even_scene_durations(len(frames), audio_duration)
+            )
+            print("   목표 길이: {:.2f}초 / 사진 {}장 균등 배분 / 배속 {}x / BGM {}".format(
+                audio_duration, len(frames), speed, mood
+            ))
+            _notify(progress_cb, 76, "{}초 전문 편집 렌더링 중".format(int(target_duration)), progress_lock)
+            ffmpeg_single_pass(
+                frames,
+                still_durations,
+                voice_path,
+                bgm_path,
+                out_file,
+                speed=speed,
+                work_dir=work_dir,
+                xfade_sec=0.12 if fast_mode and not spark else direction.xfade,
+                cues=cues,
+                font_path=font_path,
+                width=width,
+                height=height,
+                visual_fx=visual_fx,
+                caption_style=caption_style,
+                audio_ducking=bool(audio_ducking),
+                target_duration=audio_duration,
+            )
+
         try:
-            if spark_clips:
+            if motion_clips:
                 if mood == "none":
                     bgm_path = resolve_bgm("lofi", audio_duration, work_dir / "bgm.wav")
-                _notify(progress_cb, 78, "✨ 스파크 시네마 · 음성·BGM 단일 패스 합성", progress_lock)
-                ffmpeg_spark_pass(
-                    spark_clips,
-                    durations,
-                    cues,
-                    font_path,
-                    direction,
-                    voice_path,
-                    bgm_path,
-                    out_file,
-                    work_dir,
-                    audio_duration,
-                    width=width,
-                    height=height,
-                    caption_style=caption_style,
-                )
+                label = "✨ 스파크 시네마" if spark else "💰 제로코스트 모션"
+                _notify(progress_cb, 78, "{} · 음성·BGM 단일 패스 합성".format(label), progress_lock)
+                intro_sfx = None
+                if before_after_hook:
+                    try:
+                        intro_sfx = ensure_shutter_sfx()
+                    except Exception as exc:
+                        print("[안내] 셔터음 준비 실패: {}".format(exc))
+                try:
+                    ffmpeg_spark_pass(
+                        motion_clips,
+                        durations,
+                        cues,
+                        font_path,
+                        direction,
+                        voice_path,
+                        bgm_path,
+                        out_file,
+                        work_dir,
+                        audio_duration,
+                        width=width,
+                        height=height,
+                        caption_style=caption_style,
+                        intro_sfx=intro_sfx,
+                    )
+                except Exception as exc:
+                    print("[안내] 모션 합성 실패, 정지컷 전문 렌더로 폴백: {}".format(exc), flush=True)
+                    spark_clips = None
+                    _render_stills()
             else:
-                print("   목표 길이: {:.2f}초 / 사진 {}장 균등 배분 / 배속 {}x / BGM {}".format(
-                    audio_duration, len(hold_frames), speed, mood
-                ))
-                _notify(progress_cb, 76, "{}초 전문 편집 렌더링 중".format(int(target_duration)), progress_lock)
-                ffmpeg_single_pass(
-                    hold_frames,
-                    durations,
-                    voice_path,
-                    bgm_path,
-                    out_file,
-                    speed=speed,
-                    work_dir=work_dir,
-                    xfade_sec=0.12 if fast_mode and not spark else direction.xfade,
-                    cues=cues,
-                    font_path=font_path,
-                    width=width,
-                    height=height,
-                    visual_fx=visual_fx,
-                    caption_style=caption_style,
-                    audio_ducking=bool(audio_ducking),
-                    target_duration=audio_duration,
-                )
+                _render_stills()
         except Exception as exc:
             print("[안내] 렌더 실패, 목표 길이 슬라이드 폴백: {}".format(exc))
             used_fallback = True
+            spark_clips = None
             _notify(progress_cb, 80, "{}초 안전 슬라이드쇼로 전환".format(int(target_duration)), progress_lock)
             fast_blur_slideshow(
                 media_files, out_file, work_dir, voice_path=voice_path, duration=float(target_duration)
@@ -4887,7 +5284,11 @@ def run_pipeline(
         print("[안내] 파이프라인 예외, 최종 블러 폴백(프로세스 유지): {}".format(exc))
         used_fallback = True
         if not script:
-            script, _order, instagram = fallback_script(style_prompt, target_duration=target_duration)
+            script, _order, instagram = fallback_script(
+                style_prompt,
+                target_duration=target_duration,
+                vision_tags=_vision_tags_from_media(media_files, style_prompt),
+            )
             script = sanitize_narration(script)
             instagram = normalize_instagram_payload(instagram, style_prompt=style_prompt, script=script)
         try:

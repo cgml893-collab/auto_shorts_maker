@@ -40,9 +40,9 @@ from license_lock import (
     verify_or_activate_mobile,
 )
 from main import (
+    HARD_JOB_LIMIT_SEC,
     IMAGE_EXTS,
     OUTPUT_DIR,
-    PIPELINE_HARD_LIMIT,
     VIDEO_EXTS,
     analyze_media_styles,
     canvas_size,
@@ -50,6 +50,7 @@ from main import (
     diet_image_file,
     fast_blur_slideshow,
     load_settings,
+    local_media_styles,
     normalize_aspect_ratio,
     normalize_bgm_mood,
     normalize_camera_motion,
@@ -199,7 +200,6 @@ def _purge_job_temps(job_dir, keep_file=None):
         "subs.srt",
         "i2v_source.jpg",
         "instagram_caption.json",
-        "voice.mp3",
     }
     if keep_file:
         try:
@@ -340,10 +340,13 @@ def _run_job(
 ):
     started = time.time()
     target_duration = normalize_target_duration(target_duration)
-    budget = min(float(pipeline_time_budget(target_duration)), 28.0)
+    # 정상 렌더에 필요한 예산. 폴백은 이 예산 + HARD_JOB_LIMIT_SEC 안에 반드시 끝난다.
+    budget = float(pipeline_time_budget(target_duration))
     deadline = started + budget
     finished = threading.Event()
     write_lock = threading.Lock()
+    # 워치독이 쓰는 원본 목록은 별도 스냅샷으로 둔다(파이프라인이 리스트를 건드려도 안전)
+    fallback_sources = [Path(p) for p in (media_files or [])]
     content_fields = _instagram_fields(style_prompt=prompt)
     viral_flags = {
         "before_after_hook": bool(before_after_hook),
@@ -372,11 +375,9 @@ def _run_job(
         return True
 
     def progress(percent, message):
-        pct = max(0, min(100, int(percent)))
-        msg = str(message or "")
-        if pct >= 96 or msg.startswith("완료") or msg == "completed":
-            if _mark_completed(out_file):
-                return
+        # 대본/캡션은 run_pipeline이 리턴한 뒤에 채워지므로 여기서 completed로 올리면
+        # 폴링을 멈춘 앱이 빈 대본을 받는다. 완료 선언은 호출부에만 맡긴다.
+        pct = min(95, max(0, min(100, int(percent))))
         fields = {
             "status": "processing",
             "stage": message,
@@ -395,16 +396,16 @@ def _run_job(
         with write_lock:
             if _mark_completed(out_file):
                 return
-            progress(92, "30초 안전 완성 · 균등 슬라이드쇼")
-            fast_blur_slideshow(media_files, out_file, work, duration=float(target_duration))
+            progress(92, "안전 완성 · 균등 슬라이드쇼")
+            fast_blur_slideshow(fallback_sources, out_file, work, duration=float(target_duration))
             if not _mark_completed(out_file):
                 raise RuntimeError("안전 슬라이드쇼가 완성된 MP4를 만들지 못했습니다.")
 
     def _watchdog():
-        # 무한 폴링 원천 차단: 30초 하드 캡
-        if finished.wait(timeout=30.0):
+        # 무한 폴링 원천 차단: 예산을 넘기면 폴백 영상으로 반드시 완성한다
+        if finished.wait(timeout=budget + HARD_JOB_LIMIT_SEC):
             return
-        print("[안내] 30초 하드 캡 도달 → 강제 완성", flush=True)
+        print("[안내] 예산 {}초 초과 → 강제 완성".format(int(budget)), flush=True)
         try:
             _force_complete()
         except Exception as exc:
@@ -413,6 +414,7 @@ def _run_job(
     watcher = threading.Thread(target=_watchdog, daemon=True)
     watcher.start()
 
+    abandoned = False
     try:
         boot = {"stage": "대본 작성 중", "percent": 8, "progress": 8, "elapsed_sec": 0}
         boot.update(content_fields)
@@ -450,7 +452,7 @@ def _run_job(
                 parallax_3d=viral_flags["parallax_3d"],
             )
             try:
-                result = fut.result(timeout=28.0)
+                result = fut.result(timeout=budget + 10.0)
                 script_text = ""
                 ig_payload = {}
                 if isinstance(result, tuple):
@@ -463,14 +465,15 @@ def _run_job(
                     _instagram_fields(ig_payload, style_prompt=prompt, script=script_text)
                 )
             except TimeoutError:
-                print("[안내] 파이프라인 28초 초과 → 폴백 완성", flush=True)
+                abandoned = True
+                print("[안내] 파이프라인 {}초 초과 → 폴백 완성".format(int(budget + 10)), flush=True)
                 try:
                     _force_complete()
                 except Exception as exc:
                     print("[안내] 타임아웃 폴백 실패: {}".format(exc))
             except Exception as exc:
                 traceback.print_exc()
-                progress(80, "외부 API 대기열 · 30초 안전 슬라이드쇼로 전환")
+                progress(80, "외부 API 대기열 · 안전 슬라이드쇼로 전환")
                 try:
                     _force_complete()
                 except Exception:
@@ -508,10 +511,11 @@ def _run_job(
         finished.set()
         job_dir = Path(out_file).parent
         keep = out_file if Path(out_file).is_file() else None
-        if isinstance(media_files, list):
-            media_files.clear()
         if keep is None:
             _purge_path(job_dir)
+            _release_memory()
+        elif abandoned:
+            # 버려진 파이프라인 스레드가 아직 작업 폴더에 쓰고 있을 수 있어 임시파일 정리는 건너뛴다
             _release_memory()
         else:
             _finish_job_cleanup(job_dir, keep_file=keep)
@@ -648,7 +652,13 @@ async def analyze_media(
             saved.append(dest)
         if not saved:
             raise HTTPException(status_code=400, detail="지원하는 미디어가 없습니다.")
-        result = analyze_media_styles(load_settings(), saved)
+        # 키 미설정(.env 없음)이어도 분석 화면은 열려야 한다
+        try:
+            settings = load_settings()
+        except Exception as exc:  # noqa: BLE001
+            print("[안내] 설정 로드 실패 → 로컬 스타일 칩: {}".format(exc))
+            settings = None
+        result = analyze_media_styles(settings, saved) if settings else local_media_styles(saved)
         result["ok"] = True
         return result
     except HTTPException:
@@ -742,6 +752,17 @@ async def create_video(
         if vip and (features or {}).get("plan") != "pro":
             return _vip_forbidden_response(err_msg or "👑 VIP 시네마 스튜디오는 프로 VIP 전용입니다.")
         return _payment_response(err_msg or PAYMENT_MESSAGE)
+
+    # 바이럴 특수 연출은 프로 전용. 조작된 요청이 유료 연출을 뚫지 못하게 서버에서 다시 잠근다.
+    if (features or {}).get("plan") != "pro":
+        if ba_hook or lipsync_on or parallax_on:
+            print("[안내] 프로 플랜이 아니어서 바이럴 특수 연출을 끕니다.", flush=True)
+        ba_hook = False
+        lipsync_on = False
+        parallax_on = False
+    # 립싱크는 유료 fal 호출이므로 스파크 시네마 PRO가 켜져 있어야만 유효하다
+    if lipsync_on and not spark:
+        lipsync_on = False
 
     job_id = uuid.uuid4().hex[:16]
     job_dir = JOBS_DIR / job_id
