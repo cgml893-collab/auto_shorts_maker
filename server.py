@@ -340,7 +340,7 @@ def _run_job(
 ):
     started = time.time()
     target_duration = normalize_target_duration(target_duration)
-    budget = pipeline_time_budget(target_duration)
+    budget = min(float(pipeline_time_budget(target_duration)), 28.0)
     deadline = started + budget
     finished = threading.Event()
     write_lock = threading.Lock()
@@ -395,14 +395,16 @@ def _run_job(
         with write_lock:
             if _mark_completed(out_file):
                 return
-            progress(92, "{}초 안전 완성 · 균등 슬라이드쇼".format(int(target_duration)))
+            progress(92, "30초 안전 완성 · 균등 슬라이드쇼")
             fast_blur_slideshow(media_files, out_file, work, duration=float(target_duration))
             if not _mark_completed(out_file):
                 raise RuntimeError("안전 슬라이드쇼가 완성된 MP4를 만들지 못했습니다.")
 
     def _watchdog():
-        if finished.wait(timeout=max(30.0, budget + 45.0)):
+        # 무한 폴링 원천 차단: 30초 하드 캡
+        if finished.wait(timeout=30.0):
             return
+        print("[안내] 30초 하드 캡 도달 → 강제 완성", flush=True)
         try:
             _force_complete()
         except Exception as exc:
@@ -448,7 +450,7 @@ def _run_job(
                 parallax_3d=viral_flags["parallax_3d"],
             )
             try:
-                result = fut.result(timeout=max(90.0, budget))
+                result = fut.result(timeout=28.0)
                 script_text = ""
                 ig_payload = {}
                 if isinstance(result, tuple):
@@ -461,16 +463,23 @@ def _run_job(
                     _instagram_fields(ig_payload, style_prompt=prompt, script=script_text)
                 )
             except TimeoutError:
-                print("[안내] 파이프라인 대기 시간 초과, 완성 파일 확인", flush=True)
+                print("[안내] 파이프라인 28초 초과 → 폴백 완성", flush=True)
+                try:
+                    _force_complete()
+                except Exception as exc:
+                    print("[안내] 타임아웃 폴백 실패: {}".format(exc))
             except Exception as exc:
                 traceback.print_exc()
-                progress(80, "외부 API 대기열 · {}초 안전 슬라이드쇼로 전환".format(int(target_duration)))
+                progress(80, "외부 API 대기열 · 30초 안전 슬라이드쇼로 전환")
                 try:
                     _force_complete()
                 except Exception:
                     print("[안내] 서버 안전장치 폴백 실패: {}".format(exc))
         finally:
-            runner.shutdown(wait=True)
+            try:
+                runner.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                runner.shutdown(wait=False)
         if not _output_valid(out_file):
             _force_complete()
         if not _mark_completed(out_file):
@@ -484,14 +493,17 @@ def _run_job(
         if _mark_completed(out_file):
             print("[안내] 예외 후에도 완성 MP4가 있어 completed 유지: {}".format(exc))
         else:
-            fail = {
-                "status": "failed",
-                "stage": "실패",
-                "error": str(exc),
-                "elapsed_sec": round(time.time() - started, 1),
-            }
-            fail.update(content_fields)
-            _update_job(job_id, **fail)
+            try:
+                _force_complete()
+            except Exception:
+                fail = {
+                    "status": "failed",
+                    "stage": "실패",
+                    "error": str(exc),
+                    "elapsed_sec": round(time.time() - started, 1),
+                }
+                fail.update(content_fields)
+                _update_job(job_id, **fail)
     finally:
         finished.set()
         job_dir = Path(out_file).parent
@@ -505,22 +517,38 @@ def _run_job(
             _finish_job_cleanup(job_dir, keep_file=keep)
 
 
-@app.get("/i2v-image/{job_id}")
+@app.api_route("/i2v-image/{job_id}", methods=["GET", "HEAD"])
 def i2v_image(job_id: str):
+    """fal.ai가 사전 HEAD 검증 후 GET으로 이미지를 가져간다."""
     job_dir = JOBS_DIR / job_id
+    path = None
     for name in ("i2v_source.jpg", "frame_0.jpg"):
-        path = job_dir / name
-        if path.is_file() and path.stat().st_size >= 32:
-            return FileResponse(path=str(path), media_type="image/jpeg")
-    media_dir = job_dir / "media"
-    if media_dir.is_dir():
-        for child in sorted(media_dir.iterdir()):
-            if child.suffix.lower() in IMAGE_EXTS and child.stat().st_size >= 32:
-                return FileResponse(path=str(child), media_type="image/jpeg")
-    raise HTTPException(status_code=404, detail="I2V 소스 이미지를 찾지 못했습니다.")
+        candidate = job_dir / name
+        if candidate.is_file() and candidate.stat().st_size >= 32:
+            path = candidate
+            break
+    if path is None:
+        media_dir = job_dir / "media"
+        if media_dir.is_dir():
+            for child in sorted(media_dir.iterdir()):
+                if child.suffix.lower() in IMAGE_EXTS and child.stat().st_size >= 32:
+                    path = child
+                    break
+    if path is None:
+        raise HTTPException(status_code=404, detail="I2V 소스 이미지를 찾지 못했습니다.")
+    headers = {
+        "Content-Type": "image/jpeg",
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=120",
+    }
+    return FileResponse(
+        path=str(path),
+        media_type="image/jpeg",
+        headers=headers,
+    )
 
 
-@app.get("/job-audio/{job_id}")
+@app.api_route("/job-audio/{job_id}", methods=["GET", "HEAD"])
 def job_audio(job_id: str):
     """립싱크용 공개 음성 URL (fal.ai가 fetch)."""
     job_dir = JOBS_DIR / job_id

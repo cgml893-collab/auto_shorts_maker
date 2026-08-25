@@ -73,7 +73,8 @@ FAL_I2V_PRIMARY = os.getenv("FAL_I2V_MODEL", "fal-ai/kling-video/v1/standard/ima
 FAL_I2V_FALLBACK = "fal-ai/minimax/video-01/image-to-video"
 FAL_I2V_FAST = os.getenv("FAL_I2V_FAST_MODEL", "fal-ai/stable-video")
 FAL_LIPSYNC_MODEL = os.getenv("FAL_LIPSYNC_MODEL", "fal-ai/sync-lipsync/v3/image-to-video")
-FAL_WAIT_TIMEOUT = 25.0
+FAL_WAIT_TIMEOUT = 12.0
+HARD_JOB_LIMIT_SEC = 30.0
 BEFORE_AFTER_SEC = 1.5
 BEFORE_SWIPE_SEC = 0.45
 MOTION_INTENSITY_DEFAULT = 7
@@ -455,10 +456,7 @@ def media_to_preview_b64(path):
             preview = OUTPUT_DIR / ("_preview_{}.jpg".format(path.stem))
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
             try:
-                run_ffmpeg(
-                    ["-ss", "0.3", "-i", str(path), "-frames:v", "1", "-q:v", "6", str(preview)],
-                    timeout=20,
-                )
+                ffmpeg_extract_still(path, preview, ss="0.3", qv=6, timeout=20)
                 with open_image_upright(preview) as im:
                     return _pil_to_jpeg_b64(im)
             except Exception:
@@ -597,7 +595,32 @@ def normalize_target_duration(value):
 
 
 def pipeline_time_budget(duration):
-    return {15: 240.0, 30: 320.0, 60: 420.0}.get(int(duration), 240.0)
+    # 모바일 무한 폴링 방지: 어떤 길이여도 하드 캡 30초 안에 폴백 완성
+    del duration
+    return float(HARD_JOB_LIMIT_SEC)
+
+
+def ffmpeg_extract_still(src, dest, ss="0.15", qv=2, timeout=20):
+    """단일 프레임 JPEG 추출. FFmpeg image2 시퀀스 경고 방지용 -update 1 포함."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    run_ffmpeg(
+        [
+            "-ss",
+            str(ss),
+            "-i",
+            str(src),
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            "-q:v",
+            str(qv),
+            str(dest),
+        ],
+        timeout=timeout,
+    )
+    return dest
 
 
 def normalize_caption_style(value):
@@ -1084,6 +1107,7 @@ def generate_script(settings, media_files, style_prompt="", direction=None, targ
     target_duration = normalize_target_duration(target_duration)
     spec = DURATION_TARGETS[target_duration]
     min_chars, max_chars = spec["min_chars"], spec["max_chars"]
+    vision_hint = _vision_tags_from_media(media_files, style)
     guide = ""
     if direction is not None:
         guide = "\n연출 지시: {} / {}".format(direction.tone, direction.script_guide)
@@ -1093,8 +1117,9 @@ def generate_script(settings, media_files, style_prompt="", direction=None, targ
     user_prompt = (
         "첨부된 사진/영상 프레임을 보고 인스타그램 릴스/유튜브 쇼츠용 콘텐츠를 JSON으로만 작성하세요.\n"
         "영상 스타일/분위기: {}{}\n"
+        "비전 힌트: {}\n"
         "이미지 번호: {}\n"
-        "목표 길이: {}초 ({}) · 나레이션은 말할 때 약 {}초 (공백 제외 {}~{}자. 짧으면 실패)\n"
+        "목표 길이: {}초 ({}) · 나레이션은 말할 때 약 {}초 (공백 제외 {}~{}자)\n"
         "사진이 1~2장뿐이어도 선택한 길이에 맞는 완성형 Hook-Body-Outro로 작성하세요.\n"
         "목표 길이가 15초면 Body를 압축하고, 30초 이상이면 Outro CTA를 분명히 넣으세요.\n"
         "응답 JSON 스키마:\n"
@@ -1106,7 +1131,17 @@ def generate_script(settings, media_files, style_prompt="", direction=None, targ
         "- photo_order는 대본 흐름에 맞는 이미지 번호(1부터). 반복 가능\n"
         "- instagram.caption은 저장/공유를 유도하는 업로드용 본문(이모지 소량 허용)\n"
         "- hashtags는 핵심 한글/영문 해시태그 정확히 5개"
-    ).format(style, guide, numbered, target_duration, spec["label"], target_duration, min_chars, max_chars)
+    ).format(
+        style,
+        guide,
+        vision_hint,
+        numbered,
+        target_duration,
+        spec["label"],
+        target_duration,
+        min_chars,
+        max_chars,
+    )
     content = [{"type": "text", "text": user_prompt}]
 
     attached = 0
@@ -1127,51 +1162,59 @@ def generate_script(settings, media_files, style_prompt="", direction=None, targ
     if attached == 0:
         content[0]["text"] += "\n미디어 파일명 힌트: {}".format(numbered)
 
-    client = OpenAI(api_key=settings.openai_api_key)
-    ig_payload = normalize_instagram_payload({}, style_prompt=style)
+    def _instant_fallback(reason):
+        print("[안내] 대본 즉시 로컬 폴백 ({}): {}".format(reason, vision_hint), flush=True)
+        return fallback_script(style_prompt or vision_hint, target_duration=target_duration, vision_tags=vision_hint)
 
-    def _ask(extra=""):
-        body = list(content)
-        if extra:
-            body = [dict(body[0])] + body[1:]
-            body[0]["text"] = content[0]["text"] + extra
+    if not (settings.openai_api_key or "").strip():
+        return _instant_fallback("OPENAI_API_KEY 없음")
+
+    try:
+        client = OpenAI(api_key=settings.openai_api_key, timeout=12.0)
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": VIRAL_REELS_SYSTEM_PROMPT},
-                {"role": "user", "content": body},
+                {"role": "user", "content": content},
             ],
             temperature=0.85,
             response_format={"type": "json_object"},
-            max_tokens=1100 if target_duration <= 15 else (1600 if target_duration <= 30 else 2000),
+            max_tokens=900 if target_duration <= 15 else (1400 if target_duration <= 30 else 1800),
         )
         raw_text = (response.choices[0].message.content or "").strip()
-        return parse_script_json_response(raw_text, len(media_files))
+        if not raw_text:
+            return _instant_fallback("빈 응답")
+        script, order, ig_payload = parse_script_json_response(raw_text, len(media_files))
+        compact = re.sub(r"\s+", "", script or "")
+        if not script or len(compact) < 80:
+            return _instant_fallback("응답 짧음/파싱 실패")
+        ig_payload = normalize_instagram_payload(ig_payload, style_prompt=style, script=script)
+        print("   대본 ({}자):\n   {}\n".format(len(compact), script))
+        print(
+            "   인스타 캡션: {}\n   태그: {}".format(
+                ig_payload.get("caption"), " ".join(ig_payload.get("hashtags") or [])
+            )
+        )
+        if order:
+            print("   사진 배치: {}".format([i + 1 for i in order]))
+        return script, order, ig_payload
+    except Exception as exc:
+        return _instant_fallback(str(exc)[:160])
 
-    script, order, ig_payload = _ask()
-    compact = re.sub(r"\s+", "", script)
-    if len(compact) < min_chars:
-        script, order, ig_payload = _ask(
-            "\n이전 script가 너무 짧습니다. 공백 제외 {}~{}자로 Hook-Body-Outro를 다시 쓰세요. JSON만 반환.".format(
-                min_chars, max_chars
-            )
-        )
-        compact = re.sub(r"\s+", "", script)
-    if len(compact) < min_chars:
-        script, order, ig_payload = _ask(
-            "\n{}자 미만입니다. 3단 스토리로 공백 제외 {}자 전후의 완성형 script와 instagram을 JSON으로 다시 쓰세요.".format(
-                min_chars, (min_chars + max_chars) // 2
-            )
-        )
-        compact = re.sub(r"\s+", "", script)
-    if not script or len(compact) < 80:
-        raise RuntimeError("대본 생성에 실패했습니다. OpenAI 응답이 비어 있거나 너무 짧습니다.")
-    ig_payload = normalize_instagram_payload(ig_payload, style_prompt=style, script=script)
-    print("   대본 ({}자):\n   {}\n".format(len(compact), script))
-    print("   인스타 캡션: {}\n   태그: {}".format(ig_payload.get("caption"), " ".join(ig_payload.get("hashtags") or [])))
-    if order:
-        print("   사진 배치: {}".format([i + 1 for i in order]))
-    return script, order, ig_payload
+
+def _vision_tags_from_media(media_files, style_prompt=""):
+    bits = []
+    style = sanitize_narration(style_prompt or "")
+    if style:
+        bits.append(style[:40])
+    for path in list(media_files or [])[:4]:
+        stem = re.sub(r"[_\-]+", " ", Path(path).stem)
+        stem = re.sub(r"\d{4}.*", "", stem).strip()
+        stem = re.sub(r"\s+", " ", stem)
+        if stem and stem.lower() not in {"image", "video", "img", "photo", "media"}:
+            bits.append(stem[:28])
+    joined = " · ".join(bits[:3]).strip(" ·")
+    return joined or "일상 순간"
 
 
 def generate_voice(settings, script, output_path=None, voice_type=DEFAULT_VOICE_TYPE):
@@ -2692,10 +2735,7 @@ def compose_blur_fill_frame(src_path, dest_path, width=None, height=None):
     grab = None
     if src.suffix.lower() in VIDEO_EXTS:
         grab = dest_path.with_name(dest_path.stem + "_grab.jpg")
-        run_ffmpeg(
-            ["-ss", "0.15", "-i", str(src), "-frames:v", "1", "-q:v", "2", str(grab)],
-            timeout=20,
-        )
+        ffmpeg_extract_still(src, grab, ss="0.15", qv=2, timeout=20)
         src = grab
     with Image.open(src) as raw:
         composed = fit_contain_on_blur(raw, width, height)
@@ -3897,7 +3937,7 @@ def salvage_motion_clips(work_dir):
 
 
 def ffmpeg_ken_burns_sequence(src_jpg, work_dir, count=3, duration=5.0, width=None, height=None, intensity=7):
-    """정지 컷을 한 번의 FFmpeg crop 이동으로 움직이게 만든다. JPEG 시퀀스는 쓰지 않는다."""
+    """정지 컷을 zoompan/crop(n)으로 움직이게 만든다. crop의 잘못된 'on' 변수는 사용하지 않는다."""
     width = int(width or TARGET_W)
     height = int(height or TARGET_H)
     width -= width % 2
@@ -3907,55 +3947,80 @@ def ffmpeg_ken_burns_sequence(src_jpg, work_dir, count=3, duration=5.0, width=No
     duration = max(2.0, float(duration))
     fps = STILL_FPS
     frames = max(24, int(round(duration * fps)))
+    n_last = max(1, frames - 1)
     zoom = 1.12 + 0.04 * (intensity - 6)
     sw = int(round(width * zoom))
     sh = int(round(height * zoom))
     sw += sw % 2
     sh += sh % 2
+    # crop 표현식은 프레임 번호 n (zoompan의 on 아님)
     crops = (
-        "(iw-ow)*on/{n}:(ih-oh)*on/{n}*0.45",
-        "(iw-ow)*(1-on/{n}):(ih-oh)*0.42",
-        "(iw-ow)*0.5:(ih-oh)*(1-on/{n})",
+        "(iw-ow)*n/{n}:(ih-oh)*n/{n}*0.45",
+        "(iw-ow)*(1-n/{n}):(ih-oh)*0.42",
+        "(iw-ow)*0.5:(ih-oh)*(1-n/{n})",
+    )
+    zooms = (
+        "min(zoom+0.0015\\,{z})",
+        "min(zoom+0.0018\\,{z})",
+        "min(zoom+0.0012\\,{z})",
     )
     clips = []
     src = Path(src_jpg)
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
     for index in range(count):
-        dest = Path(work_dir) / ("kb_{:02d}.mp4".format(index + 1))
-        xy = crops[index % len(crops)].format(n=max(1, frames - 1))
-        vf = (
+        dest = work_dir / ("kb_{:02d}.mp4".format(index + 1))
+        xy = crops[index % len(crops)].format(n=n_last)
+        zexpr = zooms[index % len(zooms)].format(z="{:.3f}".format(zoom))
+        # zoompan이 crop(n)보다 안정적이라 1순위, 실패 시 crop(n) 폴백
+        vf_zoom = (
+            "scale={sw}:{sh}:flags=fast_bilinear,"
+            "zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps={fps},"
+            "setsar=1,format=yuv420p"
+        ).format(sw=sw, sh=sh, z=zexpr, frames=frames, w=width, h=height, fps=fps)
+        vf_crop = (
             "scale={sw}:{sh}:flags=fast_bilinear,"
             "crop={w}:{h}:{xy},"
             "setsar=1,fps={fps},format=yuv420p"
         ).format(sw=sw, sh=sh, w=width, h=height, xy=xy, fps=fps)
-        run_ffmpeg(
-            [
-                "-loop",
-                "1",
-                "-framerate",
-                str(fps),
-                "-t",
-                "{:.3f}".format(duration),
-                "-i",
-                str(src),
-                "-an",
-                "-vf",
-                vf,
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-crf",
-                "23",
-                "-pix_fmt",
-                "yuv420p",
-                "-movflags",
-                "+faststart",
-                str(dest),
-            ],
-            timeout=25,
-        )
-        if dest.is_file() and dest.stat().st_size > 1000:
-            clips.append(dest)
+        ok = False
+        for vf in (vf_zoom, vf_crop):
+            try:
+                run_ffmpeg(
+                    [
+                        "-loop",
+                        "1",
+                        "-framerate",
+                        str(fps),
+                        "-t",
+                        "{:.3f}".format(duration),
+                        "-i",
+                        str(src),
+                        "-an",
+                        "-vf",
+                        vf,
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "ultrafast",
+                        "-crf",
+                        "23",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-movflags",
+                        "+faststart",
+                        str(dest),
+                    ],
+                    timeout=25,
+                )
+                if dest.is_file() and dest.stat().st_size > 1000:
+                    clips.append(dest)
+                    ok = True
+                    break
+            except Exception as exc:
+                print("[안내] 켄 번스 시도 실패: {}".format(exc), flush=True)
+        if not ok:
+            print("[안내] 켄 번스 클립 생성 실패: {}".format(dest), flush=True)
     return clips
 
 
@@ -4241,17 +4306,18 @@ def ffmpeg_runway_pass(*args, **kwargs):
     return ffmpeg_spark_pass(*args, **kwargs)
 
 
-def fallback_script(style_prompt="", target_duration=15):
-    style = sanitize_narration(style_prompt) or "이 장면"
+def fallback_script(style_prompt="", target_duration=15, vision_tags=""):
+    style = sanitize_narration(style_prompt) or sanitize_narration(vision_tags) or "이 장면"
+    tags = sanitize_narration(vision_tags) or style
     target_duration = normalize_target_duration(target_duration)
     hook = "지금 이 장면. 그냥 넘기지 마세요."
     body15 = (
-        "{}의 빛과 공기가 마음을 붙잡아요. "
+        "{}이 눈에 들어와요. "
         "가까이 갈수록 디테일이 살아나고. "
         "짧은 숨이 길게 남아요. "
         "오늘은 이 순간을 기록해요. "
         "저장해 두고 다시 보세요."
-    ).format(style[:20])
+    ).format(tags[:28])
     body30 = (
         "{}의 빛과 공기가 한꺼번에 마음을 붙잡아요. "
         "가까이 다가갈수록 색과 결이 또렷해져요. "
@@ -4262,7 +4328,7 @@ def fallback_script(style_prompt="", target_duration=15):
         "한 컷 한 컷에 이름을 붙여 기억합니다. "
         "오늘은 이 순간을 기록해요. "
         "저장하고 공유해 주세요."
-    ).format(style[:20])
+    ).format(tags[:28])
     body60 = (
         "{}의 빛과 공기가 한꺼번에 마음을 붙잡아요. "
         "가까이 다가갈수록 색과 결이 또렷해져요. "
@@ -4276,7 +4342,7 @@ def fallback_script(style_prompt="", target_duration=15):
         "그래서 이 영상은 자랑이 아니라 기록입니다. "
         "마지막 컷이 닫혀도 여운은 남아요. "
         "저장하고 친구에게 공유해 주세요."
-    ).format(style[:20])
+    ).format(tags[:28])
     if target_duration >= 60:
         text = hook + " " + body60
     elif target_duration >= 30:
@@ -4667,8 +4733,8 @@ def run_pipeline(
                         settings, script, voice_file, voice_key, duration=float(target_duration)
                     )
                 try:
-                    i2v_wait = 70.0 if (vip or spark or viral_on) else 20.0
-                    generated = frame_fut.result(timeout=max(12.0, min(i2v_wait, max(12.0, _left() - 5))))
+                    i2v_wait = 14.0 if (vip or spark or viral_on) else 10.0
+                    generated = frame_fut.result(timeout=max(8.0, min(i2v_wait, max(8.0, _left() - 3))))
                 except Exception as exc:
                     print("[안내] 영상 생성 대기 중단: {}".format(exc), flush=True)
                     generated = salvage_motion_clips(work_dir)
