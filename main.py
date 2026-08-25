@@ -93,8 +93,10 @@ LIPSYNC_I2V_PROMPT = (
     "Talking portrait close-up: natural lip sync mouth shapes, subtle facial expression, blinking, "
     "micro head motion matching speech rhythm. Preserve exact face identity, photorealistic 9:16."
 )
-SPARK_MAX_CLIPS = 3
+SPARK_MAX_CLIPS = 1
 SPARK_CLIP_SEC = 5.0
+# True면 fal/멀티숏 비활성 · Pillow/FFmpeg 켄 번스만 (스파크 PRO 명시 ON 시에만 fal 1회)
+ZERO_COST_DEFAULT = True
 I2V_QUALITY_LAYER = "Photorealistic physics, 4k 60fps, 35mm anamorphic lens, preserve exact identity, no morphing, no extra limbs"
 MOTION_CLIP_EXTS = (".mp4", ".mov", ".webm", ".m4v")
 PIPELINE_HARD_LIMIT = 90.0
@@ -2450,8 +2452,10 @@ def generate_viral_motion_clips(
     before_after=False,
     ai_lipsync=False,
     parallax_3d=False,
+    allow_fal=False,
 ):
-    """인스타 바이럴 특수 연출: 립싱크 / 파라랙스 / 비포-애프터 훅."""
+    """인스타 바이럴 특수 연출. allow_fal=False(기본)면 fal 호출 없이 로컬만."""
+    del style_prompt, settings, user_action, target_duration
     width = int(width or TARGET_W)
     height = int(height or TARGET_H)
     motion_intensity = normalize_motion_intensity(motion_intensity)
@@ -2465,80 +2469,48 @@ def generate_viral_motion_clips(
     try:
         prepare_i2v_still(hero, frame, width, height)
     except Exception as exc:
-        print("[안내] 바이럴 I2V 캔버스 실패: {}".format(exc), flush=True)
+        print("[안내] 바이럴 캔버스 실패: {}".format(exc), flush=True)
         return []
 
     clips = []
-    if ai_lipsync and voice_path and Path(voice_path).is_file():
-        _notify(progress_cb, 34, "🎙️ AI 페이스 립싱크 생성 중", lock)
+    # 립싱크 fal은 스파크 PRO(allow_fal)일 때만 1회
+    if allow_fal and ai_lipsync and voice_path and Path(voice_path).is_file():
+        _notify(progress_cb, 34, "🎙️ AI 페이스 립싱크 1회", lock)
         lipsync_out = work_dir / "lipsync_01.mp4"
         try:
-            fal_lipsync_image_to_video(frame, voice_path, lipsync_out, timeout=min(50.0, FAL_WAIT_TIMEOUT + 25))
+            fal_lipsync_image_to_video(frame, voice_path, lipsync_out, timeout=min(40.0, FAL_WAIT_TIMEOUT + 20))
             if lipsync_out.is_file():
                 clips.append(lipsync_out)
         except Exception as exc:
-            print("[안내] 립싱크 API 실패, 토킹 I2V 폴백: {}".format(exc), flush=True)
-            try:
-                talking = work_dir / "lipsync_i2v.mp4"
-                fal_image_to_video(
-                    frame,
-                    LIPSYNC_I2V_PROMPT + " " + (style_prompt or "")[:60],
-                    talking,
-                    timeout=FAL_WAIT_TIMEOUT,
-                    motion_intensity=motion_intensity,
-                )
-                if Path(talking).is_file():
-                    clips.append(talking)
-            except Exception as inner:
-                print("[안내] 토킹 I2V도 실패: {}".format(inner), flush=True)
+            print("[안내] 립싱크 실패(제로코스트 유지): {}".format(exc), flush=True)
 
-    if parallax_3d and len(clips) < SPARK_MAX_CLIPS:
-        _notify(progress_cb, 38, "🌌 3D 공간 입체 무빙 합성", lock)
+    if parallax_3d and not clips:
+        _notify(progress_cb, 38, "🌌 3D 파라랙스 (로컬·비용0)", lock)
         try:
-            # fal I2V에 파라랙스 프롬프트 우선
-            para_ai = work_dir / "parallax_i2v.mp4"
-            fal_image_to_video(
+            local = work_dir / "parallax_local.mp4"
+            ffmpeg_parallax_clip(
                 frame,
-                PARALLAX_I2V_PROMPT + " " + (CAMERA_MOTIONS.get(normalize_camera_motion(camera_motion), "")),
-                para_ai,
-                timeout=FAL_WAIT_TIMEOUT,
-                motion_intensity=max(motion_intensity, 7),
+                local,
+                duration=SPARK_CLIP_SEC,
+                width=width,
+                height=height,
+                intensity=motion_intensity,
             )
-            if Path(para_ai).is_file():
-                clips.append(para_ai)
+            clips.append(local)
         except Exception as exc:
-            print("[안내] 파라랙스 I2V 실패, 로컬 합성: {}".format(exc), flush=True)
-        if len(clips) < 1 or (parallax_3d and not any("parallax" in Path(c).stem for c in clips)):
-            try:
-                local = work_dir / "parallax_local.mp4"
-                ffmpeg_parallax_clip(
-                    frame,
-                    local,
-                    duration=SPARK_CLIP_SEC,
-                    width=width,
-                    height=height,
-                    intensity=motion_intensity,
-                )
-                clips.append(local)
-            except Exception as exc:
-                print("[안내] 로컬 파라랙스 실패: {}".format(exc), flush=True)
+            print("[안내] 로컬 파라랙스 실패: {}".format(exc), flush=True)
 
     if not clips:
-        # 바이럴 토글이 있어도 기본 스파크 I2V로 채움
-        clips = generate_spark_cinema_clips(
+        clips = generate_zero_cost_motion_clips(
             media_files,
-            style_prompt,
-            camera_motion,
             work_dir,
             progress_cb=progress_cb,
             lock=lock,
             width=width,
             height=height,
-            settings=settings,
-            user_action=user_action,
             job_dir=job_dir,
-            target_duration=target_duration,
             motion_intensity=motion_intensity,
+            count=1,
         )
 
     if before_after and clips:
@@ -3342,8 +3314,10 @@ def compose_layered_i2v_prompt(layers, shot_prompt, user_action=""):
 
 
 def build_multishot_i2v_prompts(layers, target_duration, user_action=""):
-    shots = list(SHOT_SEQUENCE) if int(target_duration or 15) >= 15 else [SHOT_SEQUENCE[1]]
-    return [(key, compose_layered_i2v_prompt(layers, prompt, user_action)) for key, prompt in shots]
+    # 3숏 폐기: 액션 숏 1개만 사용 (크레딧 1/3)
+    del target_duration
+    shot_key, shot_prompt = SHOT_SEQUENCE[1]
+    return [(shot_key, compose_layered_i2v_prompt(layers, shot_prompt, user_action))]
 
 
 def vision_subject_motion_prompt(settings, image_path, user_action="", style_prompt="", camera_motion=""):
@@ -3792,39 +3766,33 @@ def generate_vip_action_clips(
     width=None,
     height=None,
 ):
-    sources = list(media_files)[:SPARK_MAX_CLIPS]
+    """VIP 액션도 fal 병렬 3회 폐기 · 단 1회만."""
+    sources = list(media_files)[:1]
+    if not sources:
+        return []
     width = int(width or TARGET_W)
     height = int(height or TARGET_H)
-    _notify(progress_cb, 32, "👑 VIP 액션 모션 · Kling/Minimax I2V 합성", lock)
-    clips = []
-
-    async def _one(index, src):
-        angle_key, angle_prompt = MULTI_ANGLES[index % len(MULTI_ANGLES)]
-        prompt = expand_action_i2v_prompt(settings, action_style, angle_prompt, style_prompt)
-        print("   VIP I2V [{}]: {}".format(angle_key, prompt[:160]))
-        frame = work_dir / ("vip_src_{:02d}.jpg".format(index + 1))
-        await asyncio.to_thread(still_from_media, src, frame, work_dir, width, height)
-        clip = work_dir / ("vip_{:02d}.mp4".format(index + 1))
-        await fal_image_to_video_timed(frame, prompt, clip, timeout=VIP_I2V_TIMEOUT)
-        return clip
-
-    async def _gather():
-        return await asyncio.wait_for(
-            asyncio.gather(*[_one(i, src) for i, src in enumerate(sources)], return_exceptions=True),
-            timeout=VIP_I2V_TIMEOUT + 20,
-        )
-
+    _notify(progress_cb, 32, "👑 VIP 액션 모션 · I2V 1회", lock)
+    src = sources[0]
+    angle_key, angle_prompt = MULTI_ANGLES[0]
+    prompt = expand_action_i2v_prompt(settings, action_style, angle_prompt, style_prompt)
+    print("   VIP I2V [{}]: {}".format(angle_key, prompt[:160]))
+    frame = work_dir / "vip_src_01.jpg"
+    still_from_media(src, frame, work_dir, width, height)
+    clip = work_dir / "vip_01.mp4"
     try:
-        results = asyncio.run(_gather())
+        fal_image_to_video(
+            frame,
+            prompt,
+            clip,
+            timeout=VIP_I2V_TIMEOUT,
+            models=(FAL_I2V_PRIMARY,),
+        )
+        if Path(clip).is_file() and Path(clip).stat().st_size > 1000:
+            return [Path(clip)]
     except Exception as exc:
-        print("[안내] VIP I2V 병렬 실패: {}".format(exc))
-        return []
-    for item in results:
-        if isinstance(item, Exception):
-            print("[안내] VIP 클립 실패: {}".format(item))
-        elif item and Path(item).is_file():
-            clips.append(item)
-    return clips
+        print("[안내] VIP I2V 1회 실패: {}".format(exc))
+    return []
 
 
 def mix_vip_sfx(video_path, out_file, duration, action_style, cue_starts, scene_starts, work_dir):
@@ -4036,6 +4004,49 @@ def pillow_ken_burns_sequence(src_jpg, work_dir, count=3, duration=5.0, width=No
     )
 
 
+def generate_zero_cost_motion_clips(
+    media_files,
+    work_dir,
+    progress_cb=None,
+    lock=None,
+    width=None,
+    height=None,
+    job_dir=None,
+    motion_intensity=None,
+    count=1,
+    duration=None,
+):
+    """비용 0원 · Pillow/FFmpeg 켄 번스 블러 엔진 (fal.ai 호출 없음)."""
+    width = int(width or TARGET_W)
+    height = int(height or TARGET_H)
+    motion_intensity = normalize_motion_intensity(motion_intensity)
+    job_dir = Path(job_dir) if job_dir else Path(work_dir).parent
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    hero = i2v_hero_source(media_files, job_dir)
+    if hero is None:
+        return []
+    _notify(progress_cb, 30, "💰 제로코스트 · 켄 번스 블러 엔진", lock)
+    frame = job_dir / "i2v_source.jpg"
+    try:
+        prepare_i2v_still(hero, frame, width, height)
+    except Exception as exc:
+        print("[안내] 제로코스트 캔버스 실패: {}".format(exc), flush=True)
+        return []
+    clips = pillow_ken_burns_sequence(
+        frame,
+        work_dir,
+        count=max(1, int(count or 1)),
+        duration=float(duration or SPARK_CLIP_SEC),
+        width=width,
+        height=height,
+        intensity=motion_intensity,
+    )
+    if clips:
+        _notify(progress_cb, 62, "켄 번스 모션 {}클립 준비 (fal 미사용)".format(len(clips)), lock)
+    return clips[: max(1, int(count or 1))]
+
+
 def generate_spark_cinema_clips(
     media_files,
     style_prompt,
@@ -4051,11 +4062,14 @@ def generate_spark_cinema_clips(
     target_duration=15,
     motion_intensity=None,
 ):
+    """✨ 스파크 시네마 PRO 전용 · fal.ai Image-to-Video 단 1회만 호출."""
     width = int(width or TARGET_W)
     height = int(height or TARGET_H)
     motion_intensity = normalize_motion_intensity(motion_intensity)
     reset_fal_billing_flag()
     job_dir = Path(job_dir) if job_dir else Path(work_dir).parent
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
     hero = i2v_hero_source(media_files, job_dir)
     if hero is None:
         print("[안내] I2V 원본 미디어가 없습니다")
@@ -4067,74 +4081,58 @@ def generate_spark_cinema_clips(
     except Exception as exc:
         print("[안내] I2V 9:16 캔버스 실패: {}".format(exc), flush=True)
         return []
-    _notify(progress_cb, 33, "Vision 4레이어 프롬프트 엔진", lock)
-    layers = vision_four_layer_analysis(
-        settings or load_settings(),
-        frame,
-        user_action=user_action,
-        style_prompt=style_prompt,
-        camera_motion=camera_motion,
-    )
-    shots = build_multishot_i2v_prompts(layers, target_duration, user_action)
-    for key, prompt in shots:
-        print("   I2V [{}]: {}".format(key, prompt[:200]), flush=True)
-    _notify(progress_cb, 36, "✨ 멀티숏 I2V 병렬 생성 ({}숏, {}초 제한)".format(len(shots), int(FAL_WAIT_TIMEOUT)), lock)
 
-    async def _one(index, shot_key, prompt, models):
-        clip = work_dir / ("i2v_{:02d}_{}.mp4".format(index + 1, shot_key))
-        await fal_image_to_video_timed(
+    # OpenAI Vision 생략 가능 시 로컬 프롬프트로 비용 절감 → 실패해도 fal 1회는 진행
+    prompt = NATURAL_I2V_PROMPT
+    try:
+        _notify(progress_cb, 33, "스파크 프롬프트 준비 (1숏)", lock)
+        layers = vision_four_layer_analysis(
+            settings or load_settings(),
+            frame,
+            user_action=user_action,
+            style_prompt=style_prompt,
+            camera_motion=camera_motion,
+        )
+        shots = build_multishot_i2v_prompts(layers, target_duration, user_action)
+        if shots:
+            prompt = shots[0][1]
+    except Exception as exc:
+        print("[안내] Vision 프롬프트 생략, 기본 I2V 프롬프트 사용: {}".format(exc), flush=True)
+        cam = CAMERA_MOTIONS.get(normalize_camera_motion(camera_motion), "")
+        prompt = "{} {} {}".format(NATURAL_I2V_PROMPT, cam, (style_prompt or "")[:80]).strip()
+
+    print("   I2V [single]: {}".format(prompt[:220]), flush=True)
+    _notify(progress_cb, 36, "✨ 스파크 I2V 단 1회 호출 (멀티숏 폐기)", lock)
+    clip = work_dir / "i2v_01_single.mp4"
+    try:
+        # 모델 폴백 체인 없이 PRIMARY 1회만 — 실패 시 즉시 제로코스트
+        fal_image_to_video(
             frame,
             prompt,
             clip,
             timeout=FAL_WAIT_TIMEOUT,
-            models=models,
+            models=(FAL_I2V_PRIMARY,),
             motion_intensity=motion_intensity,
         )
-        return clip
-
-    async def _wave(models):
-        tasks = [_one(i, key, prompt, models) for i, (key, prompt) in enumerate(shots)]
-        return await asyncio.wait_for(
-            asyncio.gather(*tasks, return_exceptions=True),
-            timeout=FAL_WAIT_TIMEOUT,
-        )
-
-    clips = []
-    try:
-        results = asyncio.run(_wave((FAL_I2V_PRIMARY, FAL_I2V_FALLBACK, FAL_I2V_FAST)))
+        if Path(clip).is_file() and Path(clip).stat().st_size > 1000:
+            _notify(progress_cb, 62, "✨ I2V 모션 1클립 준비 완료", lock)
+            return [Path(clip)]
     except Exception as exc:
-        print("[안내] I2V 병렬 25초 제한 초과/실패: {}".format(exc), flush=True)
-        results = []
-    for item in results:
-        if isinstance(item, Exception):
-            print("[안내] I2V 클립 실패: {}".format(item), flush=True)
-        elif item and Path(item).is_file() and Path(item).stat().st_size > 1000:
-            clips.append(item)
+        print("[안내] 스파크 I2V 1회 실패 → 제로코스트 폴백: {}".format(exc), flush=True)
 
-    unique = []
-    seen = set()
-    for clip in clips:
-        key = str(Path(clip).resolve())
-        if key not in seen:
-            seen.add(key)
-            unique.append(clip)
-    clips = unique
-    if clips:
-        _notify(progress_cb, 62, "✨ I2V 모션 클립 {}개 준비 완료".format(len(clips)), lock)
-        return clips[:SPARK_MAX_CLIPS]
-
-    _notify(progress_cb, 58, "3순위 Pillow 켄 번스 다이내믹 무빙", lock)
-    print("[안내] I2V 25초 초과/실패 → 켄 번스 모션 블러 폴백", flush=True)
-    kb = pillow_ken_burns_sequence(
-        frame,
+    _notify(progress_cb, 58, "💰 제로코스트 켄 번스 폴백", lock)
+    return generate_zero_cost_motion_clips(
+        media_files,
         work_dir,
-        count=len(shots),
-        duration=SPARK_CLIP_SEC,
+        progress_cb=progress_cb,
+        lock=lock,
         width=width,
         height=height,
-        intensity=motion_intensity,
+        job_dir=job_dir,
+        motion_intensity=motion_intensity,
+        count=1,
+        duration=SPARK_CLIP_SEC,
     )
-    return kb
 
 
 def generate_runway_clips(*args, **kwargs):
@@ -4525,12 +4523,13 @@ def run_pipeline(
     speed = normalize_speed(speed_multiplier)
     mood = normalize_bgm_mood(bgm_mood)
     vip = bool(is_vip_mode)
+    # fal.ai는 모바일에서 ✨ 스파크 시네마를 명시적으로 켰을 때만 (is_spark_cinema/is_runway_mode)
     spark = bool(is_spark_cinema) if is_spark_cinema is not None else bool(is_runway_mode)
     before_after_hook = bool(before_after_hook)
     ai_lipsync = bool(ai_lipsync)
     parallax_3d = bool(parallax_3d)
     viral_on = before_after_hook or ai_lipsync or parallax_3d
-    spark = spark or vip or viral_on
+    # vip/viral 만으로 spark(fal)를 켜지 않음 — 제로코스트 기본 유지
     motion = normalize_camera_motion(camera_motion)
     target_duration = normalize_target_duration(target_duration)
     caption_style = normalize_caption_style(caption_style)
@@ -4643,33 +4642,8 @@ def run_pipeline(
             return path
 
         def _frame_job(voice_for_lipsync=None):
-            if viral_on and _left() > 12:
-                try:
-                    clips = generate_viral_motion_clips(
-                        media_files,
-                        style_prompt,
-                        motion,
-                        work_dir,
-                        progress_cb=progress_cb,
-                        lock=progress_lock,
-                        width=width,
-                        height=height,
-                        settings=settings,
-                        user_action=action_style,
-                        job_dir=out_file.parent,
-                        target_duration=target_duration,
-                        motion_intensity=motion_intensity,
-                        voice_path=voice_for_lipsync,
-                        before_after=before_after_hook,
-                        ai_lipsync=ai_lipsync,
-                        parallax_3d=parallax_3d,
-                    )
-                    if clips:
-                        return clips
-                    print("[안내] 바이럴 연출 빈 결과 → 스파크/홀드 폴백")
-                except Exception as exc:
-                    print("[안내] 바이럴 연출 실패: {}".format(exc))
-            if spark and _left() > 12:
+            # 제로코스트 기본: fal 미사용. 스파크 PRO(spark)일 때만 fal 1회.
+            if spark and _left() > 10:
                 try:
                     clips = generate_spark_cinema_clips(
                         media_files,
@@ -4689,26 +4663,68 @@ def run_pipeline(
                     if clips:
                         if before_after_hook:
                             src = out_file.parent / "i2v_source.jpg"
-                            if src.is_file() and clips:
+                            if src.is_file():
                                 try:
                                     hooked = work_dir / "before_after_spark.mp4"
                                     apply_before_after_hook(
                                         src, clips[0], hooked, width=width, height=height, work_dir=work_dir
                                     )
-                                    clips = [hooked] + list(clips[1:])
+                                    clips = [hooked]
                                 except Exception as exc:
                                     print("[안내] 스파크 비포/애프터 훅 실패: {}".format(exc))
                         return clips
-                    print("[안내] 스파크 I2V/켄번스 빈 결과 → 홀드 렌더")
                 except Exception as exc:
-                    print("[안내] 스파크 I2V 실패: {}".format(exc))
+                    print("[안내] 스파크 I2V 실패 → 제로코스트: {}".format(exc))
+            if viral_on and _left() > 8:
+                try:
+                    clips = generate_viral_motion_clips(
+                        media_files,
+                        style_prompt,
+                        motion,
+                        work_dir,
+                        progress_cb=progress_cb,
+                        lock=progress_lock,
+                        width=width,
+                        height=height,
+                        settings=settings,
+                        user_action=action_style,
+                        job_dir=out_file.parent,
+                        target_duration=target_duration,
+                        motion_intensity=motion_intensity,
+                        voice_path=voice_for_lipsync,
+                        before_after=before_after_hook,
+                        ai_lipsync=ai_lipsync and spark,
+                        parallax_3d=parallax_3d,
+                        allow_fal=bool(spark),
+                    )
+                    if clips:
+                        return clips
+                except Exception as exc:
+                    print("[안내] 바이럴(로컬) 실패: {}".format(exc))
+            # 기본 경로: 비용 0원 켄 번스
+            try:
+                clips = generate_zero_cost_motion_clips(
+                    media_files,
+                    work_dir,
+                    progress_cb=progress_cb,
+                    lock=progress_lock,
+                    width=width,
+                    height=height,
+                    job_dir=out_file.parent,
+                    motion_intensity=motion_intensity,
+                    count=1,
+                )
+                if clips:
+                    return clips
+            except Exception as exc:
+                print("[안내] 제로코스트 모션 실패: {}".format(exc))
             _notify(progress_cb, 30, "사진 노출 균등 배분 및 리사이즈 중", progress_lock)
             frames = _hold_frames()
             _notify(progress_cb, 52, "장면 프레임 준비 완료", progress_lock)
             return frames
 
-        if ai_lipsync:
-            # 립싱크는 음성 파형이 필요하므로 음성 먼저 생성
+        if ai_lipsync and spark:
+            # 립싱크 fal은 스파크 PRO + 토글일 때만
             try:
                 voice_path = _voice_job()
             except Exception as exc:
@@ -4733,7 +4749,7 @@ def run_pipeline(
                         settings, script, voice_file, voice_key, duration=float(target_duration)
                     )
                 try:
-                    i2v_wait = 14.0 if (vip or spark or viral_on) else 10.0
+                    i2v_wait = 14.0 if spark else 10.0
                     generated = frame_fut.result(timeout=max(8.0, min(i2v_wait, max(8.0, _left() - 3))))
                 except Exception as exc:
                     print("[안내] 영상 생성 대기 중단: {}".format(exc), flush=True)

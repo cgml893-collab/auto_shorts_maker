@@ -713,10 +713,8 @@ async def create_video(
     ba_hook = parse_flag(before_after_hook)
     lipsync_on = parse_flag(ai_lipsync)
     parallax_on = parse_flag(parallax_3d)
-    viral_on = ba_hook or lipsync_on or parallax_on
-    if viral_on:
-        spark = True
-        vip = True
+    # 바이럴 토글만으로 fal/스파크를 강제하지 않음 — 명시적 스파크 PRO일 때만 유료 I2V
+    # lipsync fal은 스파크 ON일 때만 파이프라인에서 허용
     intensity = normalize_motion_intensity(motion_intensity)
     try:
         height = int(float(output_height or 720))
@@ -809,7 +807,7 @@ async def create_video(
         voice_key,
         speed,
         mood,
-        spark or vip,
+        spark,
         motion,
         height,
         features,
@@ -834,8 +832,8 @@ async def create_video(
         "speed_multiplier": speed,
         "bgm_type": mood,
         "bgm_mood": mood,
-        "is_spark_cinema": spark or vip,
-        "is_runway_mode": spark or vip,
+        "is_spark_cinema": spark,
+        "is_runway_mode": spark,
         "is_vip_mode": vip,
         "action_motion_enabled": action_on,
         "action_style": action_style,
@@ -851,6 +849,7 @@ async def create_video(
         "before_after_hook": ba_hook,
         "ai_lipsync": lipsync_on,
         "parallax_3d": parallax_on,
+        "zero_cost_mode": not spark,
         "plan": features.get("plan"),
         "error_code": err_code,
     }
