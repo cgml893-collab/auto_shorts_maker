@@ -116,6 +116,9 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
   bool _actionMotion = false;
   String _actionPreset = 'natural';
   String _motionIntensity = '7';
+  bool _beforeAfterHook = false;
+  bool _aiLipsync = false;
+  bool _parallax3d = false;
   final _actionCtrl = TextEditingController();
   File? _resultVideo;
   VideoPlayerController? _player;
@@ -291,6 +294,9 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
         if (_plan != 'pro') {
           _sparkCinema = false;
           _actionMotion = false;
+          _beforeAfterHook = false;
+          _aiLipsync = false;
+          _parallax3d = false;
         }
       });
     } catch (_) {}
@@ -632,8 +638,17 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
       await _showPaymentModal('👑 VIP 시네마 스튜디오는 프로 VIP 전용입니다.');
       return;
     }
-    setState(() => _sparkCinema = spark);
+    setState(() {
+      _sparkCinema = spark;
+      if (!spark) {
+        _beforeAfterHook = false;
+        _aiLipsync = false;
+        _parallax3d = false;
+      }
+    });
   }
+
+  bool get _viralAnyOn => _beforeAfterHook || _aiLipsync || _parallax3d;
 
   Future<void> _create() async {
     if (_media.isEmpty) {
@@ -684,13 +699,17 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
           req.fields['bgm_mood'] = _bgmMood;
           req.fields['is_spark_cinema'] = _sparkCinema ? 'true' : 'false';
           req.fields['is_runway_mode'] = _sparkCinema ? 'true' : 'false';
-          req.fields['is_vip_mode'] = (_sparkCinema && _actionMotion) ? 'true' : 'false';
+          req.fields['is_vip_mode'] =
+              (_sparkCinema && (_actionMotion || _viralAnyOn)) ? 'true' : 'false';
           req.fields['action_motion_enabled'] = (_sparkCinema && _actionMotion) ? 'true' : 'false';
           req.fields['action_preset'] = (_sparkCinema && _actionPreset != 'natural') ? _actionPreset : '';
           req.fields['action_style'] = _sparkCinema ? _actionCtrl.text.trim() : '';
           req.fields['subject_motion'] = _sparkCinema ? _actionCtrl.text.trim() : '';
           req.fields['camera_motion'] = _cameraMotion;
           req.fields['motion_intensity'] = _motionIntensity;
+          req.fields['before_after_hook'] = (_sparkCinema && _beforeAfterHook) ? 'true' : 'false';
+          req.fields['ai_lipsync'] = (_sparkCinema && _aiLipsync) ? 'true' : 'false';
+          req.fields['parallax_3d'] = (_sparkCinema && _parallax3d) ? 'true' : 'false';
           req.fields['output_height'] = _plan == 'pro' ? '1080' : '720';
           req.fields['target_duration'] = '$_targetDuration';
           req.fields['caption_style'] = _captionStyle;
@@ -1091,6 +1110,62 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
                             value: _actionMotion,
                             activeThumbColor: const Color(0xFFD4AF37),
                             onChanged: (v) => setState(() => _actionMotion = v),
+                          ),
+                          const SizedBox(height: 10),
+                          Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+                            decoration: BoxDecoration(
+                              color: const Color(0x22D4AF37),
+                              borderRadius: BorderRadius.circular(14),
+                              border: Border.all(color: const Color(0x66D4AF37)),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text(
+                                  '🌟 인스타 바이럴 특수 연출',
+                                  style: TextStyle(
+                                    color: Color(0xFFE8C872),
+                                    fontWeight: FontWeight.w800,
+                                    fontSize: 14,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  '비포/애프터 훅 · AI 립싱크 · 3D 파라랙스',
+                                  style: TextStyle(
+                                    color: Colors.white.withValues(alpha: 0.65),
+                                    fontSize: 12,
+                                    height: 1.3,
+                                  ),
+                                ),
+                                SwitchListTile.adaptive(
+                                  contentPadding: EdgeInsets.zero,
+                                  title: const Text('📸 비포/애프터 셔터 전환'),
+                                  subtitle: const Text('1.5초 Before + 셔터음 → AI 모션 스와이프'),
+                                  value: _beforeAfterHook,
+                                  activeThumbColor: const Color(0xFFD4AF37),
+                                  onChanged: (v) => setState(() => _beforeAfterHook = v),
+                                ),
+                                SwitchListTile.adaptive(
+                                  contentPadding: EdgeInsets.zero,
+                                  title: const Text('🗣️ AI 페이스 립싱크 모드'),
+                                  subtitle: const Text('음성 파형에 맞춘 입모양·표정 (인물/반려동물)'),
+                                  value: _aiLipsync,
+                                  activeThumbColor: const Color(0xFFD4AF37),
+                                  onChanged: (v) => setState(() => _aiLipsync = v),
+                                ),
+                                SwitchListTile.adaptive(
+                                  contentPadding: EdgeInsets.zero,
+                                  title: const Text('🌌 3D 공간 입체 무빙'),
+                                  subtitle: const Text('피사체·배경 분리 파라랙스 전진 카메라'),
+                                  value: _parallax3d,
+                                  activeThumbColor: const Color(0xFFD4AF37),
+                                  onChanged: (v) => setState(() => _parallax3d = v),
+                                ),
+                              ],
+                            ),
                           ),
                           const SizedBox(height: 6),
                           const _Label('액션 프리셋 (선택)'),

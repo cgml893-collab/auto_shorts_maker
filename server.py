@@ -199,6 +199,7 @@ def _purge_job_temps(job_dir, keep_file=None):
         "subs.srt",
         "i2v_source.jpg",
         "instagram_caption.json",
+        "voice.mp3",
     }
     if keep_file:
         try:
@@ -333,6 +334,9 @@ def _run_job(
     action_style="",
     action_preset="",
     motion_intensity=7,
+    before_after_hook=False,
+    ai_lipsync=False,
+    parallax_3d=False,
 ):
     started = time.time()
     target_duration = normalize_target_duration(target_duration)
@@ -341,6 +345,11 @@ def _run_job(
     finished = threading.Event()
     write_lock = threading.Lock()
     content_fields = _instagram_fields(style_prompt=prompt)
+    viral_flags = {
+        "before_after_hook": bool(before_after_hook),
+        "ai_lipsync": bool(ai_lipsync),
+        "parallax_3d": bool(parallax_3d),
+    }
 
     def _mark_completed(final_output_path=None, extra=None):
         final_output_path = Path(final_output_path or out_file)
@@ -434,6 +443,9 @@ def _run_job(
                 action_style=action_style,
                 action_preset=action_preset,
                 motion_intensity=motion_intensity,
+                before_after_hook=viral_flags["before_after_hook"],
+                ai_lipsync=viral_flags["ai_lipsync"],
+                parallax_3d=viral_flags["parallax_3d"],
             )
             try:
                 result = fut.result(timeout=max(90.0, budget))
@@ -508,6 +520,18 @@ def i2v_image(job_id: str):
     raise HTTPException(status_code=404, detail="I2V 소스 이미지를 찾지 못했습니다.")
 
 
+@app.get("/job-audio/{job_id}")
+def job_audio(job_id: str):
+    """립싱크용 공개 음성 URL (fal.ai가 fetch)."""
+    job_dir = JOBS_DIR / job_id
+    for name in ("voice.mp3", "voice.wav", "voice.m4a"):
+        path = job_dir / name
+        if path.is_file() and path.stat().st_size >= 64:
+            media = "audio/mpeg" if path.suffix.lower() == ".mp3" else "audio/wav"
+            return FileResponse(path=str(path), media_type=media)
+    raise HTTPException(status_code=404, detail="작업 음성을 찾지 못했습니다.")
+
+
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {
@@ -522,6 +546,7 @@ def root():
             "/job-status/{job_id}",
             "/download/{job_id}",
             "/i2v-image/{job_id}",
+            "/job-audio/{job_id}",
         ],
     }
 
@@ -636,6 +661,9 @@ async def create_video(
     action_preset: str = Form("", description="bike_stunt/dance/dynamic/sprint"),
     subject_motion: str = Form("", description="피사체 동작 지정"),
     motion_intensity: str = Form("7", description="모션 강도 6~8"),
+    before_after_hook: str = Form("false", description="📸 비포/애프터 셔터 전환"),
+    ai_lipsync: str = Form("false", description="🗣️ AI 페이스 립싱크"),
+    parallax_3d: str = Form("false", description="🌌 3D 공간 입체 무빙"),
 ):
     prompt = (style or style_prompt or "").strip()
     action_style = (action_style or subject_motion or "").strip()
@@ -654,6 +682,13 @@ async def create_video(
     ducking = parse_flag(audio_ducking) if str(audio_ducking or "").strip() else True
     vip = parse_flag(is_vip_mode)
     action_on = parse_flag(action_motion_enabled)
+    ba_hook = parse_flag(before_after_hook)
+    lipsync_on = parse_flag(ai_lipsync)
+    parallax_on = parse_flag(parallax_3d)
+    viral_on = ba_hook or lipsync_on or parallax_on
+    if viral_on:
+        spark = True
+        vip = True
     intensity = normalize_motion_intensity(motion_intensity)
     try:
         height = int(float(output_height or 720))
@@ -731,6 +766,9 @@ async def create_video(
             "error": None,
             "elapsed_sec": 0,
             "output": str(out_file),
+            "before_after_hook": ba_hook,
+            "ai_lipsync": lipsync_on,
+            "parallax_3d": parallax_on,
         }
     _persist_job(job_id)
 
@@ -757,6 +795,9 @@ async def create_video(
         action_style,
         action_preset,
         intensity,
+        ba_hook,
+        lipsync_on,
+        parallax_on,
     )
     return {
         "job_id": job_id,
@@ -779,6 +820,9 @@ async def create_video(
         "visual_fx": fx,
         "aspect_ratio": ratio,
         "audio_ducking": ducking,
+        "before_after_hook": ba_hook,
+        "ai_lipsync": lipsync_on,
+        "parallax_3d": parallax_on,
         "plan": features.get("plan"),
         "error_code": err_code,
     }

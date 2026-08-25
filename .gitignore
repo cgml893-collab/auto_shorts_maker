@@ -5,6 +5,9 @@ data/*.db
 data/*.db-journal
 data/*.db-wal
 data/*.db-shm
+sfx/*.wav
+sfx/*.mp3
+!sfx/.gitkeep
 __pycache__/
 *.pyc
 .venv/

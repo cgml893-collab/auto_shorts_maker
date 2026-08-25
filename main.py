@@ -72,7 +72,10 @@ BLUR_DIM = 0.38
 FAL_I2V_PRIMARY = os.getenv("FAL_I2V_MODEL", "fal-ai/kling-video/v1/standard/image-to-video")
 FAL_I2V_FALLBACK = "fal-ai/minimax/video-01/image-to-video"
 FAL_I2V_FAST = os.getenv("FAL_I2V_FAST_MODEL", "fal-ai/stable-video")
+FAL_LIPSYNC_MODEL = os.getenv("FAL_LIPSYNC_MODEL", "fal-ai/sync-lipsync/v3/image-to-video")
 FAL_WAIT_TIMEOUT = 25.0
+BEFORE_AFTER_SEC = 1.5
+BEFORE_SWIPE_SEC = 0.45
 MOTION_INTENSITY_DEFAULT = 7
 MOTION_BUCKET_ID = 180
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "https://auto-shorts-maker.onrender.com").rstrip("/")
@@ -80,6 +83,14 @@ NATURAL_I2V_PROMPT = (
     "Keep the exact subject from the input photo. Add physically accurate motion that matches "
     "the subject: wheels spin, hair or fur moves, limbs shift, breathing, a slight weight transfer. "
     "Photorealistic, preserve identity, no morphing, no extra limbs, no slideshow, cinematic 9:16."
+)
+PARALLAX_I2V_PROMPT = (
+    "Strong 3D parallax camera push-in: foreground subject and background planes move at different "
+    "speeds for volumetric depth. Keep exact identity, photorealistic, cinematic 9:16, no morphing."
+)
+LIPSYNC_I2V_PROMPT = (
+    "Talking portrait close-up: natural lip sync mouth shapes, subtle facial expression, blinking, "
+    "micro head motion matching speech rhythm. Preserve exact face identity, photorealistic 9:16."
 )
 SPARK_MAX_CLIPS = 3
 SPARK_CLIP_SEC = 5.0
@@ -2055,6 +2066,462 @@ def ensure_whoosh_sfx():
     return path
 
 
+def ensure_shutter_sfx():
+    found = find_named_sfx("shutter")
+    if found:
+        return found
+    path = SFX_DIR / "shutter.wav"
+    sr = 44100
+    n = int(sr * 0.18)
+    t = np.arange(n, dtype=np.float64) / sr
+    rng = np.random.default_rng(42)
+    click = rng.normal(0, 1, n) * np.exp(-t * 55)
+    mechan = np.sin(2 * np.pi * 2200 * t) * np.exp(-t * 48) * 0.55
+    thud = np.sin(2 * np.pi * 140 * t) * np.exp(-t * 28) * 0.35
+    _write_wav_mono(path, 0.9 * click + mechan + thud, sr)
+    print("   sfx/shutter 파일이 없어 셔터음을 생성했습니다: {}".format(path))
+    return path
+
+
+def _escape_drawtext(text):
+    return (
+        str(text or "")
+        .replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+        .replace("%", "\\%")
+    )
+
+
+def build_before_still_clip(still_jpg, dest_mp4, width, height, duration=BEFORE_AFTER_SEC):
+    width = int(width or TARGET_W)
+    height = int(height or TARGET_H)
+    width -= width % 2
+    height -= height % 2
+    duration = max(1.0, float(duration))
+    shutter = ensure_shutter_sfx()
+    font = find_korean_font()
+    font_opt = ""
+    if font and Path(font).is_file():
+        font_path = str(Path(font)).replace("\\", "/").replace(":", "\\:")
+        font_opt = "fontfile={}:".format(font_path)
+    label = _escape_drawtext("Before")
+    vf = (
+        "scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,"
+        "drawtext={font}text='{label}':fontsize={fs}:fontcolor=white:borderw=5:bordercolor=black@0.75:"
+        "x=(w-text_w)/2:y=h*0.10,"
+        "format=yuv420p,fps={fps}"
+    ).format(w=width, h=height, font=font_opt, label=label, fs=max(42, height // 18), fps=FPS)
+    dest = Path(dest_mp4)
+    run_ffmpeg(
+        [
+            "-loop",
+            "1",
+            "-t",
+            "{:.3f}".format(duration),
+            "-i",
+            str(still_jpg),
+            "-i",
+            str(shutter),
+            "-vf",
+            vf,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "22",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            str(dest),
+        ],
+        timeout=30,
+    )
+    if not dest.is_file() or dest.stat().st_size < 1000:
+        raise RuntimeError("Before 클립 생성 실패")
+    return dest
+
+
+def apply_before_after_hook(still_jpg, motion_mp4, dest_mp4, width=None, height=None, work_dir=None):
+    """첫 1.5초 Before + 셔터음 → 스와이프 → AI 모션 클립."""
+    width = int(width or TARGET_W)
+    height = int(height or TARGET_H)
+    work = Path(work_dir) if work_dir else Path(dest_mp4).parent
+    work.mkdir(parents=True, exist_ok=True)
+    before = work / "before_hook.mp4"
+    after_norm = work / "after_norm.mp4"
+    build_before_still_clip(still_jpg, before, width, height, BEFORE_AFTER_SEC)
+    run_ffmpeg(
+        [
+            "-i",
+            str(motion_mp4),
+            "-vf",
+            "scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,fps={fps},format=yuv420p".format(
+                w=width, h=height, fps=FPS
+            ),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "22",
+            "-movflags",
+            "+faststart",
+            str(after_norm),
+        ],
+        timeout=40,
+    )
+    if not after_norm.is_file():
+        shutil.copy2(str(motion_mp4), str(dest_mp4))
+        return Path(dest_mp4)
+    offset = max(0.4, BEFORE_AFTER_SEC - BEFORE_SWIPE_SEC)
+    dest = Path(dest_mp4)
+    try:
+        run_ffmpeg(
+            [
+                "-i",
+                str(before),
+                "-i",
+                str(after_norm),
+                "-filter_complex",
+                (
+                    "[0:v][1:v]xfade=transition=slideleft:duration={fade}:offset={off}[v];"
+                    "[0:a]aformat=sample_rates=44100:channel_layouts=stereo,apad=pad_dur=0.35[a0];"
+                    "[a0]anull[a]"
+                ).format(fade=BEFORE_SWIPE_SEC, off=offset),
+                "-map",
+                "[v]",
+                "-map",
+                "[a]",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "22",
+                "-c:a",
+                "aac",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+                str(dest),
+            ],
+            timeout=45,
+        )
+    except Exception as exc:
+        print("[안내] xfade 스와이프 실패, concat 폴백: {}".format(exc), flush=True)
+        list_path = work / "ba_concat.txt"
+        list_path.write_text(
+            "ffconcat version 1.0\nfile '{}'\nfile '{}'\n".format(
+                str(before).replace("'", "'\\''"),
+                str(after_norm).replace("'", "'\\''"),
+            ),
+            encoding="utf-8",
+        )
+        run_ffmpeg(
+            [
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(list_path),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "22",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                str(dest),
+            ],
+            timeout=40,
+        )
+    if dest.is_file() and dest.stat().st_size > 1000:
+        return dest
+    shutil.copy2(str(motion_mp4), str(dest))
+    return Path(dest)
+
+
+def ffmpeg_parallax_clip(src_jpg, dest_mp4, duration=5.0, width=None, height=None, intensity=7):
+    """피사체/배경 속도차를 흉내 낸 3D 전진 파라랙스 클립."""
+    width = int(width or TARGET_W)
+    height = int(height or TARGET_H)
+    width -= width % 2
+    height -= height % 2
+    duration = max(2.5, float(duration))
+    intensity = normalize_motion_intensity(intensity)
+    zoom_bg = 1.18 + 0.03 * (intensity - 6)
+    zoom_fg = 1.28 + 0.04 * (intensity - 6)
+    frames = max(36, int(round(duration * FPS)))
+    dest = Path(dest_mp4)
+    # 배경: 강한 블러 + 느린 푸시인 / 전경: 선명 크롭 + 더 빠른 전진
+    fc = (
+        "[0:v]scale={bw}:{bh}:flags=bicubic,boxblur=18:2,"
+        "zoompan=z='min(zoom+0.0012\\,{zbg})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={n}:s={w}x{h}:fps={fps}[bg];"
+        "[0:v]scale={fw}:{fh}:flags=bicubic,"
+        "zoompan=z='min(zoom+0.0022\\,{zfg})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)-on*0.35':d={n}:s={w}x{h}:fps={fps},"
+        "format=rgba,colorchannelmixer=aa=0.92[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2:format=auto,format=yuv420p,setsar=1[v]"
+    ).format(
+        bw=int(width * zoom_bg) + int(width * zoom_bg) % 2,
+        bh=int(height * zoom_bg) + int(height * zoom_bg) % 2,
+        fw=int(width * zoom_fg) + int(width * zoom_fg) % 2,
+        fh=int(height * zoom_fg) + int(height * zoom_fg) % 2,
+        zbg="{:.3f}".format(zoom_bg),
+        zfg="{:.3f}".format(zoom_fg),
+        n=frames,
+        w=width,
+        h=height,
+        fps=FPS,
+    )
+    try:
+        run_ffmpeg(
+            [
+                "-loop",
+                "1",
+                "-t",
+                "{:.3f}".format(duration),
+                "-i",
+                str(src_jpg),
+                "-filter_complex",
+                fc,
+                "-map",
+                "[v]",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "22",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                str(dest),
+            ],
+            timeout=35,
+        )
+    except Exception as exc:
+        print("[안내] 파라랙스 합성 실패, 켄 번스 폴백: {}".format(exc), flush=True)
+        clips = ffmpeg_ken_burns_sequence(
+            src_jpg, Path(dest).parent, count=1, duration=duration, width=width, height=height, intensity=intensity
+        )
+        if clips:
+            shutil.copy2(str(clips[0]), str(dest))
+    if dest.is_file() and dest.stat().st_size > 1000:
+        return dest
+    raise RuntimeError("3D 파라랙스 클립 생성 실패")
+
+
+def _public_job_audio_url(audio_path):
+    job_dir = _job_dir_for_media(audio_path)
+    dest = job_dir / "voice.mp3"
+    src = Path(audio_path)
+    if src.is_file() and src.resolve() != dest.resolve():
+        try:
+            shutil.copy2(str(src), str(dest))
+        except Exception:
+            pass
+    if not dest.is_file():
+        raise RuntimeError("공개할 음성 파일이 없습니다.")
+    return "{}/job-audio/{}".format(PUBLIC_BASE_URL, job_dir.name)
+
+
+def _fal_upload_or_url(path, kind="image"):
+    path = Path(path)
+    try:
+        import fal_client
+
+        url = fal_client.upload_file(str(path))
+        if url:
+            return url
+    except Exception as exc:
+        print("[안내] fal upload 실패({}): {}".format(kind, exc), flush=True)
+    if kind == "image":
+        try:
+            return _public_i2v_image_url(path)
+        except Exception:
+            return _fal_data_uri(path)
+    return _public_job_audio_url(path)
+
+
+def fal_lipsync_image_to_video(image_path, audio_path, dest_mp4, timeout=45.0):
+    """인물/반려동물 사진 + 나레이션 음성 → 립싱크 모션 (fal sync-lipsync / I2V 폴백)."""
+    if _fal_billing_dead():
+        raise RuntimeError("fal 잔액 부족 · 립싱크 폴백")
+    key = (os.getenv("FAL_KEY") or "").strip()
+    if not key:
+        raise RuntimeError("FAL_KEY가 없습니다.")
+    os.environ["FAL_KEY"] = key
+    image_url = _fal_upload_or_url(image_path, kind="image")
+    audio_url = _fal_upload_or_url(audio_path, kind="audio")
+    model = FAL_LIPSYNC_MODEL
+    payload = {"image_url": image_url, "audio_url": audio_url}
+    print("   fal 립싱크: {} ← img/audio".format(model), flush=True)
+    result = None
+    try:
+        import fal_client
+
+        result = fal_client.subscribe(model, arguments=payload, with_logs=False)
+    except Exception as exc:
+        print("[안내] fal lipsync subscribe 실패, queue 재시도: {}".format(exc), flush=True)
+        if _fal_is_billing_error(exc):
+            _mark_fal_billing_dead()
+            raise RuntimeError("fal 잔액 부족: {}".format(exc))
+        result = _fal_queue_subscribe(model, payload, timeout=timeout)
+    url = _fal_video_url(result)
+    if not url:
+        raise RuntimeError("립싱크 응답에 video url이 없습니다")
+    download_http_file(url, dest_mp4, timeout=min(30, max(10, int(timeout))))
+    if Path(dest_mp4).is_file() and Path(dest_mp4).stat().st_size > 1000:
+        return Path(dest_mp4)
+    raise RuntimeError("립싱크 다운로드 실패")
+
+
+def generate_viral_motion_clips(
+    media_files,
+    style_prompt,
+    camera_motion,
+    work_dir,
+    progress_cb=None,
+    lock=None,
+    width=None,
+    height=None,
+    settings=None,
+    user_action="",
+    job_dir=None,
+    target_duration=15,
+    motion_intensity=None,
+    voice_path=None,
+    before_after=False,
+    ai_lipsync=False,
+    parallax_3d=False,
+):
+    """인스타 바이럴 특수 연출: 립싱크 / 파라랙스 / 비포-애프터 훅."""
+    width = int(width or TARGET_W)
+    height = int(height or TARGET_H)
+    motion_intensity = normalize_motion_intensity(motion_intensity)
+    job_dir = Path(job_dir) if job_dir else Path(work_dir).parent
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    hero = i2v_hero_source(media_files, job_dir)
+    if hero is None:
+        return []
+    frame = job_dir / "i2v_source.jpg"
+    try:
+        prepare_i2v_still(hero, frame, width, height)
+    except Exception as exc:
+        print("[안내] 바이럴 I2V 캔버스 실패: {}".format(exc), flush=True)
+        return []
+
+    clips = []
+    if ai_lipsync and voice_path and Path(voice_path).is_file():
+        _notify(progress_cb, 34, "🎙️ AI 페이스 립싱크 생성 중", lock)
+        lipsync_out = work_dir / "lipsync_01.mp4"
+        try:
+            fal_lipsync_image_to_video(frame, voice_path, lipsync_out, timeout=min(50.0, FAL_WAIT_TIMEOUT + 25))
+            if lipsync_out.is_file():
+                clips.append(lipsync_out)
+        except Exception as exc:
+            print("[안내] 립싱크 API 실패, 토킹 I2V 폴백: {}".format(exc), flush=True)
+            try:
+                talking = work_dir / "lipsync_i2v.mp4"
+                fal_image_to_video(
+                    frame,
+                    LIPSYNC_I2V_PROMPT + " " + (style_prompt or "")[:60],
+                    talking,
+                    timeout=FAL_WAIT_TIMEOUT,
+                    motion_intensity=motion_intensity,
+                )
+                if Path(talking).is_file():
+                    clips.append(talking)
+            except Exception as inner:
+                print("[안내] 토킹 I2V도 실패: {}".format(inner), flush=True)
+
+    if parallax_3d and len(clips) < SPARK_MAX_CLIPS:
+        _notify(progress_cb, 38, "🌌 3D 공간 입체 무빙 합성", lock)
+        try:
+            # fal I2V에 파라랙스 프롬프트 우선
+            para_ai = work_dir / "parallax_i2v.mp4"
+            fal_image_to_video(
+                frame,
+                PARALLAX_I2V_PROMPT + " " + (CAMERA_MOTIONS.get(normalize_camera_motion(camera_motion), "")),
+                para_ai,
+                timeout=FAL_WAIT_TIMEOUT,
+                motion_intensity=max(motion_intensity, 7),
+            )
+            if Path(para_ai).is_file():
+                clips.append(para_ai)
+        except Exception as exc:
+            print("[안내] 파라랙스 I2V 실패, 로컬 합성: {}".format(exc), flush=True)
+        if len(clips) < 1 or (parallax_3d and not any("parallax" in Path(c).stem for c in clips)):
+            try:
+                local = work_dir / "parallax_local.mp4"
+                ffmpeg_parallax_clip(
+                    frame,
+                    local,
+                    duration=SPARK_CLIP_SEC,
+                    width=width,
+                    height=height,
+                    intensity=motion_intensity,
+                )
+                clips.append(local)
+            except Exception as exc:
+                print("[안내] 로컬 파라랙스 실패: {}".format(exc), flush=True)
+
+    if not clips:
+        # 바이럴 토글이 있어도 기본 스파크 I2V로 채움
+        clips = generate_spark_cinema_clips(
+            media_files,
+            style_prompt,
+            camera_motion,
+            work_dir,
+            progress_cb=progress_cb,
+            lock=lock,
+            width=width,
+            height=height,
+            settings=settings,
+            user_action=user_action,
+            job_dir=job_dir,
+            target_duration=target_duration,
+            motion_intensity=motion_intensity,
+        )
+
+    if before_after and clips:
+        _notify(progress_cb, 58, "📸 비포➔애프터 셔터 전환 적용", lock)
+        hooked = []
+        for index, clip in enumerate(clips[:1]):
+            dest = work_dir / ("before_after_{:02d}.mp4".format(index + 1))
+            try:
+                apply_before_after_hook(frame, clip, dest, width=width, height=height, work_dir=work_dir)
+                hooked.append(dest)
+            except Exception as exc:
+                print("[안내] 비포/애프터 훅 실패: {}".format(exc), flush=True)
+                hooked.append(clip)
+        hooked.extend(clips[1:])
+        clips = hooked
+
+    unique = []
+    seen = set()
+    for clip in clips:
+        key = str(Path(clip).resolve())
+        if key not in seen and Path(clip).is_file():
+            seen.add(key)
+            unique.append(Path(clip))
+    return unique[:SPARK_MAX_CLIPS]
+
+
 def scale_volume(clip, factor):
     if hasattr(clip, "with_volume_scaled"):
         return clip.with_volume_scaled(factor)
@@ -3973,6 +4440,9 @@ def run_pipeline(
     action_style="",
     action_preset="",
     motion_intensity=None,
+    before_after_hook=False,
+    ai_lipsync=False,
+    parallax_3d=False,
 ):
     if check_license:
         ok, message = verify_saved_license()
@@ -3990,11 +4460,18 @@ def run_pipeline(
     mood = normalize_bgm_mood(bgm_mood)
     vip = bool(is_vip_mode)
     spark = bool(is_spark_cinema) if is_spark_cinema is not None else bool(is_runway_mode)
-    spark = spark or vip
+    before_after_hook = bool(before_after_hook)
+    ai_lipsync = bool(ai_lipsync)
+    parallax_3d = bool(parallax_3d)
+    viral_on = before_after_hook or ai_lipsync or parallax_3d
+    spark = spark or vip or viral_on
     motion = normalize_camera_motion(camera_motion)
     target_duration = normalize_target_duration(target_duration)
     caption_style = normalize_caption_style(caption_style)
     visual_fx = normalize_visual_fx(visual_fx or motion)
+    if parallax_3d:
+        visual_fx = "cinematic"
+        motion = "push_in" if motion in ("zoom_in", "push_in") else motion
     aspect_ratio = normalize_aspect_ratio(aspect_ratio)
     width, height = canvas_size(aspect_ratio, output_height)
     motion_intensity = normalize_motion_intensity(motion_intensity)
@@ -4099,7 +4576,33 @@ def run_pipeline(
             _notify(progress_cb, 56, "음성 생성 완료", progress_lock)
             return path
 
-        def _frame_job():
+        def _frame_job(voice_for_lipsync=None):
+            if viral_on and _left() > 12:
+                try:
+                    clips = generate_viral_motion_clips(
+                        media_files,
+                        style_prompt,
+                        motion,
+                        work_dir,
+                        progress_cb=progress_cb,
+                        lock=progress_lock,
+                        width=width,
+                        height=height,
+                        settings=settings,
+                        user_action=action_style,
+                        job_dir=out_file.parent,
+                        target_duration=target_duration,
+                        motion_intensity=motion_intensity,
+                        voice_path=voice_for_lipsync,
+                        before_after=before_after_hook,
+                        ai_lipsync=ai_lipsync,
+                        parallax_3d=parallax_3d,
+                    )
+                    if clips:
+                        return clips
+                    print("[안내] 바이럴 연출 빈 결과 → 스파크/홀드 폴백")
+                except Exception as exc:
+                    print("[안내] 바이럴 연출 실패: {}".format(exc))
             if spark and _left() > 12:
                 try:
                     clips = generate_spark_cinema_clips(
@@ -4118,6 +4621,17 @@ def run_pipeline(
                         motion_intensity=motion_intensity,
                     )
                     if clips:
+                        if before_after_hook:
+                            src = out_file.parent / "i2v_source.jpg"
+                            if src.is_file() and clips:
+                                try:
+                                    hooked = work_dir / "before_after_spark.mp4"
+                                    apply_before_after_hook(
+                                        src, clips[0], hooked, width=width, height=height, work_dir=work_dir
+                                    )
+                                    clips = [hooked] + list(clips[1:])
+                                except Exception as exc:
+                                    print("[안내] 스파크 비포/애프터 훅 실패: {}".format(exc))
                         return clips
                     print("[안내] 스파크 I2V/켄번스 빈 결과 → 홀드 렌더")
                 except Exception as exc:
@@ -4127,22 +4641,37 @@ def run_pipeline(
             _notify(progress_cb, 52, "장면 프레임 준비 완료", progress_lock)
             return frames
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            voice_fut = pool.submit(_voice_job)
-            frame_fut = pool.submit(_frame_job)
+        if ai_lipsync:
+            # 립싱크는 음성 파형이 필요하므로 음성 먼저 생성
             try:
-                voice_path = voice_fut.result(timeout=max(8.0, min(40.0, _left() - 8)))
+                voice_path = _voice_job()
             except Exception as exc:
-                print("[안내] 음성 대기 중단: {}".format(exc))
+                print("[안내] 립싱크용 음성 생성 실패: {}".format(exc))
                 voice_path = ensure_voice_track(
                     settings, script, voice_file, voice_key, duration=float(target_duration)
                 )
             try:
-                i2v_wait = 70.0 if (vip or spark) else 20.0
-                generated = frame_fut.result(timeout=max(12.0, min(i2v_wait, max(12.0, _left() - 5))))
+                generated = _frame_job(voice_for_lipsync=voice_path)
             except Exception as exc:
-                print("[안내] 영상 생성 대기 중단: {}".format(exc), flush=True)
+                print("[안내] 립싱크 프레임 실패: {}".format(exc), flush=True)
                 generated = salvage_motion_clips(work_dir)
+        else:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                voice_fut = pool.submit(_voice_job)
+                frame_fut = pool.submit(_frame_job)
+                try:
+                    voice_path = voice_fut.result(timeout=max(8.0, min(40.0, _left() - 8)))
+                except Exception as exc:
+                    print("[안내] 음성 대기 중단: {}".format(exc))
+                    voice_path = ensure_voice_track(
+                        settings, script, voice_file, voice_key, duration=float(target_duration)
+                    )
+                try:
+                    i2v_wait = 70.0 if (vip or spark or viral_on) else 20.0
+                    generated = frame_fut.result(timeout=max(12.0, min(i2v_wait, max(12.0, _left() - 5))))
+                except Exception as exc:
+                    print("[안내] 영상 생성 대기 중단: {}".format(exc), flush=True)
+                    generated = salvage_motion_clips(work_dir)
 
         if spark:
             motion_ready = []
