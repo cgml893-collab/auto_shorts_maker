@@ -119,6 +119,9 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
   final _actionCtrl = TextEditingController();
   File? _resultVideo;
   VideoPlayerController? _player;
+  String _instagramCopy = '';
+  String _instagramCaption = '';
+  List<String> _instagramHashtags = [];
   String _plan = 'free';
   String _statusBar = '[무료 체험: 1회 가능]';
   int _freeRemaining = 1;
@@ -765,6 +768,9 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
   Future<void> _pollAndDownload(String url, String jobId) async {
     String status = 'processing';
     var polls = 0;
+    var instagramCopy = '';
+    var instagramCaption = '';
+    var instagramHashtags = <String>[];
     while (status == 'processing') {
       if (polls >= 300) {
         throw Exception('작업이 너무 오래 걸립니다. 잠시 후 다시 시도해 주세요.');
@@ -784,6 +790,18 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
       status = (js['status'] ?? 'processing').toString();
       final stage = (js['stage'] ?? '처리 중').toString();
       final percent = ((js['progress'] ?? js['percent'] ?? 0) as num).toDouble().clamp(0, 100);
+      final copy = (js['instagram_copy'] ?? '').toString().trim();
+      if (copy.isNotEmpty) {
+        instagramCopy = copy;
+      }
+      final caption = (js['instagram_caption'] ?? '').toString().trim();
+      if (caption.isNotEmpty) {
+        instagramCaption = caption;
+      }
+      final tags = js['instagram_hashtags'];
+      if (tags is List && tags.isNotEmpty) {
+        instagramHashtags = tags.map((e) => e.toString()).where((e) => e.isNotEmpty).toList();
+      }
       if (!mounted) {
         return;
       }
@@ -795,6 +813,10 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
       if (status == 'failed') {
         throw Exception((js['error'] ?? '영상 제작에 실패했습니다.').toString());
       }
+    }
+
+    if (instagramCopy.isEmpty && (instagramCaption.isNotEmpty || instagramHashtags.isNotEmpty)) {
+      instagramCopy = [instagramCaption, instagramHashtags.join(' ')].where((e) => e.isNotEmpty).join('\n\n');
     }
 
     setState(() {
@@ -820,6 +842,9 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
     setState(() {
       _resultVideo = localFile;
       _player = player;
+      _instagramCopy = instagramCopy;
+      _instagramCaption = instagramCaption;
+      _instagramHashtags = instagramHashtags;
       _busy = false;
       _progress = 1;
     });
@@ -834,13 +859,33 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
         return AlertDialog(
           backgroundColor: const Color(0xFF1A1028),
           title: const Text('🎉 릴스 영상이 완성되었습니다!'),
-          content: const Text('갤러리에 저장했고, 로컬 파일로 바로 재생합니다.'),
+          content: Text(
+            instagramCopy.isEmpty
+                ? '갤러리에 저장했고, 로컬 파일로 바로 재생합니다.'
+                : '갤러리에 저장했습니다. 아래 카드에서 인스타 캡션을 바로 복사하세요.',
+          ),
           actions: [
             FilledButton(onPressed: () => Navigator.pop(ctx), child: const Text('확인')),
           ],
         );
       },
     );
+  }
+
+  Future<void> _copyInstagramCaption() async {
+    final text = _instagramCopy.trim().isNotEmpty
+        ? _instagramCopy.trim()
+        : [
+            _instagramCaption.trim(),
+            _instagramHashtags.join(' '),
+          ].where((e) => e.isNotEmpty).join('\n\n');
+    if (text.isEmpty) {
+      _toast('복사할 캡션이 아직 없습니다.');
+      return;
+    }
+    await Clipboard.setData(ClipboardData(text: text));
+    HapticFeedback.selectionClick();
+    _toast('인스타그램 캡션을 복사했습니다. 업로드 화면에 붙여넣으세요.');
   }
 
   bool _isMp4Bytes(List<int> bytes) {
@@ -1290,6 +1335,17 @@ class _StudioScreenState extends State<StudioScreen> with WidgetsBindingObserver
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
                       ),
                     ),
+                    if (_instagramCopy.trim().isNotEmpty ||
+                        _instagramCaption.trim().isNotEmpty ||
+                        _instagramHashtags.isNotEmpty) ...[
+                      const SizedBox(height: 14),
+                      _InstagramCaptionCard(
+                        caption: _instagramCaption,
+                        hashtags: _instagramHashtags,
+                        copyText: _instagramCopy,
+                        onCopy: _copyInstagramCaption,
+                      ),
+                    ],
                   ],
                 ],
               ),
@@ -1520,6 +1576,71 @@ class _Label extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),
       child: Text(text, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+    );
+  }
+}
+
+class _InstagramCaptionCard extends StatelessWidget {
+  const _InstagramCaptionCard({
+    required this.caption,
+    required this.hashtags,
+    required this.copyText,
+    required this.onCopy,
+  });
+
+  final String caption;
+  final List<String> hashtags;
+  final String copyText;
+  final VoidCallback onCopy;
+
+  @override
+  Widget build(BuildContext context) {
+    final preview = copyText.trim().isNotEmpty
+        ? copyText.trim()
+        : [caption.trim(), hashtags.join(' ')].where((e) => e.isNotEmpty).join('\n\n');
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
+      decoration: BoxDecoration(
+        color: const Color(0x331A1028),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.14)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            '인스타그램 업로드 캡션',
+            style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            preview,
+            maxLines: 6,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: Colors.white.withValues(alpha: 0.78),
+              height: 1.45,
+              fontSize: 13.5,
+            ),
+          ),
+          const SizedBox(height: 14),
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              onPressed: onCopy,
+              icon: const Icon(Icons.content_copy_rounded),
+              label: const Text('📋 인스타그램 캡션 1초 복사'),
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFFFF4D8D),
+                foregroundColor: Colors.white,
+                minimumSize: const Size.fromHeight(50),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

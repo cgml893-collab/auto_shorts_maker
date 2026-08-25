@@ -965,9 +965,110 @@ def _peak_window_start(path, duration, window=25.0):
             pass
 
 
+VIRAL_REELS_SYSTEM_PROMPT = """\
+<role>당신은 인스타그램 릴스 100만 조회수를 만드는 전문 숏폼 디렉터입니다.</role>
+<structure>
+  - 0~3초: 첫 문장에서 시청자를 멈추게 하는 강력한 패턴 브레이크 후킹 (Hook)
+  - 3~15초: 불필요한 서론 없이 리듬감 넘치는 짧은 구어체 본론 (Body)
+  - 15~30초: 여운 있는 마무리 및 저장/공유를 유도하는 CTA (Outro)
+</structure>
+<rules>
+  - 나레이션 음성에는 해시태그나 이모지를 읽지 않는다.
+  - 문장은 10자 내외의 짧은 호흡으로 끊어 자막 가독성을 극대화한다.
+  - 장면 지시, 제목, 따옴표, 영어 해시태그를 script에 넣지 않는다.
+  - 화면에 보이는 소재를 구체적으로 언급한다.
+</rules>
+"""
+
+
+def normalize_instagram_payload(raw, style_prompt="", script=""):
+    # type: (object, str, str) -> dict
+    data = raw if isinstance(raw, dict) else {}
+    caption = sanitize_narration(str(data.get("caption") or data.get("body") or "")).strip()
+    tags_raw = data.get("hashtags") or data.get("tags") or []
+    tags = []
+    if isinstance(tags_raw, str):
+        tags_raw = re.findall(r"[#＃]?[0-9A-Za-z가-힣_]+", tags_raw)
+    if isinstance(tags_raw, list):
+        for item in tags_raw:
+            token = re.sub(r"^[#＃]+", "", str(item or "").strip())
+            token = re.sub(r"[^0-9A-Za-z가-힣_]", "", token)
+            if not token:
+                continue
+            tag = "#" + token
+            if tag not in tags:
+                tags.append(tag)
+            if len(tags) >= 5:
+                break
+    if not caption:
+        hook = sanitize_narration(script or "").split(".")[0].strip()
+        style = sanitize_narration(style_prompt) or "오늘의 순간"
+        caption = (
+            (hook + ".")
+            if hook
+            else "지금 이 장면, 그냥 넘기지 마세요."
+        )
+        caption = "{} {} 저장해 두고 나중에 다시 보세요.".format(caption, style[:24]).strip()
+    while len(tags) < 5:
+        defaults = ["#릴스", "#숏폼", "#인스타그램", "#일상", "#감성"]
+        for d in defaults:
+            if d not in tags:
+                tags.append(d)
+            if len(tags) >= 5:
+                break
+        break
+    tags = tags[:5]
+    copy_text = "{}\n\n{}".format(caption.strip(), " ".join(tags)).strip()
+    return {
+        "caption": caption.strip(),
+        "hashtags": tags,
+        "copy_text": copy_text,
+    }
+
+
+def parse_script_json_response(raw_text, media_count):
+    # type: (str, int) -> Tuple[str, List[int], dict]
+    text = (raw_text or "").strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```$", "", text)
+    data = None
+    try:
+        data = json.loads(text)
+    except Exception:
+        match = re.search(r"\{[\s\S]*\}", text)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+            except Exception:
+                data = None
+    if isinstance(data, dict):
+        script = sanitize_narration(str(data.get("script") or data.get("narration") or ""))
+        order_src = data.get("photo_order") or data.get("PHOTO_ORDER") or []
+        order_ids = []
+        if isinstance(order_src, str):
+            _, order_ids = parse_photo_order("PHOTO_ORDER: " + order_src, media_count)
+        elif isinstance(order_src, list):
+            for n in order_src:
+                try:
+                    idx = int(n) - 1
+                except Exception:
+                    continue
+                if 0 <= idx < media_count:
+                    order_ids.append(idx)
+        ig = normalize_instagram_payload(
+            data.get("instagram") or data.get("instagram_caption") or {},
+            script=script,
+        )
+        if script:
+            return script, order_ids, ig
+    script, order_ids = parse_photo_order(text, media_count)
+    script = sanitize_narration(script)
+    return script, order_ids, normalize_instagram_payload({}, script=script)
+
+
 def generate_script(settings, media_files, style_prompt="", direction=None, target_duration=15):
-    # type: (Settings, List[Path], str) -> Tuple[str, List[int]]
-    print("1) OpenAI(gpt-4o-mini)로 숏폼 나레이션 대본 작성 중...")
+    # type: (Settings, List[Path], str) -> Tuple[str, List[int], dict]
+    print("1) OpenAI(gpt-4o-mini) 클로드식 XML 릴스 대본 작성 중...")
     style = (style_prompt or "").strip() or "시선을 사로잡는 빠른 템포의 숏폼"
     target_duration = normalize_target_duration(target_duration)
     spec = DURATION_TARGETS[target_duration]
@@ -978,25 +1079,24 @@ def generate_script(settings, media_files, style_prompt="", direction=None, targ
     numbered = ", ".join(
         "{}번 {}".format(i + 1, path.name) for i, path in enumerate(media_files)
     )
-    prompt = (
-        "첨부된 사진/영상 프레임을 보고, 유튜브 쇼츠/인스타 릴스용 "
-        "한국어 나레이션 대본만 작성하세요.\n"
+    user_prompt = (
+        "첨부된 사진/영상 프레임을 보고 인스타그램 릴스/유튜브 쇼츠용 콘텐츠를 JSON으로만 작성하세요.\n"
         "영상 스타일/분위기: {}{}\n"
         "이미지 번호: {}\n"
-        "목표 길이: {}초 ({})\n"
-        "사진이 1~2장뿐이어도 선택한 길이에 맞는 완성형 3단 스토리텔링으로 작성하세요.\n"
-        "규칙:\n"
-        "- 말할 때 약 {}초 (공백 제외 {}~{}자. 짧으면 실패)\n"
-        "- 구성: (1) 첫 3초를 잡는 훅 (2) 장면·감정·디테일을 펼치는 본문 (3) 여운 있는 마무리\n"
-        "- 지정한 스타일에 맞게 톤과 템포를 맞출 것\n"
-        "- 구어체, 짧은 문장을 이어 붙여 호흡 있게\n"
-        "- 장면 지시, 이모지, 해시태그, #기호, 영어 태그, 따옴표, 제목 금지\n"
-        "- 화면에 보이는 소재를 구체적으로 언급\n"
-        "- 대본 본문만 먼저 쓰고, 마지막 줄에 사진 배치를 이렇게 적으세요:\n"
-        "PHOTO_ORDER: 1,3,2\n"
-        "- PHOTO_ORDER는 대본 흐름에 맞게 이미지 번호(1부터)를 의미 있는 순서로 나열. 반복 가능"
+        "목표 길이: {}초 ({}) · 나레이션은 말할 때 약 {}초 (공백 제외 {}~{}자. 짧으면 실패)\n"
+        "사진이 1~2장뿐이어도 선택한 길이에 맞는 완성형 Hook-Body-Outro로 작성하세요.\n"
+        "목표 길이가 15초면 Body를 압축하고, 30초 이상이면 Outro CTA를 분명히 넣으세요.\n"
+        "응답 JSON 스키마:\n"
+        '{{'
+        '"script":"나레이션 대본(해시태그·이모지 금지, 10자 내외 짧은 문장)",'
+        '"photo_order":[1,3,2],'
+        '"instagram":{{"caption":"업로드용 본문 글","hashtags":["#태그1","#태그2","#태그3","#태그4","#태그5"]}}'
+        '}}\n'
+        "- photo_order는 대본 흐름에 맞는 이미지 번호(1부터). 반복 가능\n"
+        "- instagram.caption은 저장/공유를 유도하는 업로드용 본문(이모지 소량 허용)\n"
+        "- hashtags는 핵심 한글/영문 해시태그 정확히 5개"
     ).format(style, guide, numbered, target_duration, spec["label"], target_duration, min_chars, max_chars)
-    content = [{"type": "text", "text": prompt}]
+    content = [{"type": "text", "text": user_prompt}]
 
     attached = 0
     for path in media_files:
@@ -1017,6 +1117,7 @@ def generate_script(settings, media_files, style_prompt="", direction=None, targ
         content[0]["text"] += "\n미디어 파일명 힌트: {}".format(numbered)
 
     client = OpenAI(api_key=settings.openai_api_key)
+    ig_payload = normalize_instagram_payload({}, style_prompt=style)
 
     def _ask(extra=""):
         body = list(content)
@@ -1025,37 +1126,41 @@ def generate_script(settings, media_files, style_prompt="", direction=None, targ
             body[0]["text"] = content[0]["text"] + extra
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": body}],
+            messages=[
+                {"role": "system", "content": VIRAL_REELS_SYSTEM_PROMPT},
+                {"role": "user", "content": body},
+            ],
             temperature=0.85,
-            max_tokens=900 if target_duration <= 15 else (1400 if target_duration <= 30 else 1800),
+            response_format={"type": "json_object"},
+            max_tokens=1100 if target_duration <= 15 else (1600 if target_duration <= 30 else 2000),
         )
         raw_text = (response.choices[0].message.content or "").strip()
-        raw_text = re.sub(r"^대본\s*[:：]\s*", "", raw_text)
-        raw_text, order_ids = parse_photo_order(raw_text, len(media_files))
-        return sanitize_narration(raw_text), order_ids
+        return parse_script_json_response(raw_text, len(media_files))
 
-    script, order = _ask()
+    script, order, ig_payload = _ask()
     compact = re.sub(r"\s+", "", script)
     if len(compact) < min_chars:
-        script, order = _ask(
-            "\n이전 대본이 너무 짧습니다. 공백 제외 {}~{}자로 훅-본문-마무리를 다시 쓰세요.".format(
+        script, order, ig_payload = _ask(
+            "\n이전 script가 너무 짧습니다. 공백 제외 {}~{}자로 Hook-Body-Outro를 다시 쓰세요. JSON만 반환.".format(
                 min_chars, max_chars
             )
         )
         compact = re.sub(r"\s+", "", script)
     if len(compact) < min_chars:
-        script, order = _ask(
-            "\n{}자 미만입니다. 3단 스토리로 공백 제외 {}자 전후의 완성형 대본을 다시 쓰세요.".format(
+        script, order, ig_payload = _ask(
+            "\n{}자 미만입니다. 3단 스토리로 공백 제외 {}자 전후의 완성형 script와 instagram을 JSON으로 다시 쓰세요.".format(
                 min_chars, (min_chars + max_chars) // 2
             )
         )
         compact = re.sub(r"\s+", "", script)
     if not script or len(compact) < 80:
         raise RuntimeError("대본 생성에 실패했습니다. OpenAI 응답이 비어 있거나 너무 짧습니다.")
+    ig_payload = normalize_instagram_payload(ig_payload, style_prompt=style, script=script)
     print("   대본 ({}자):\n   {}\n".format(len(compact), script))
+    print("   인스타 캡션: {}\n   태그: {}".format(ig_payload.get("caption"), " ".join(ig_payload.get("hashtags") or [])))
     if order:
         print("   사진 배치: {}".format([i + 1 for i in order]))
-    return script, order
+    return script, order, ig_payload
 
 
 def generate_voice(settings, script, output_path=None, voice_type=DEFAULT_VOICE_TYPE):
@@ -3672,33 +3777,55 @@ def ffmpeg_runway_pass(*args, **kwargs):
 def fallback_script(style_prompt="", target_duration=15):
     style = sanitize_narration(style_prompt) or "이 장면"
     target_duration = normalize_target_duration(target_duration)
-    hook = "지금 이 장면, 그냥 스치듯 넘기지 마세요. {}의 빛과 공기가 한꺼번에 마음을 붙잡습니다.".format(style[:20])
+    hook = "지금 이 장면. 그냥 넘기지 마세요."
     body15 = (
-        "가까이 다가갈수록 디테일이 살아나고 짧은 숨이 길게 남아요. "
-        "오늘은 이 순간을 기록하고 내일의 나에게 따뜻한 여운으로 건넵니다."
-    )
+        "{}의 빛과 공기가 마음을 붙잡아요. "
+        "가까이 갈수록 디테일이 살아나고. "
+        "짧은 숨이 길게 남아요. "
+        "오늘은 이 순간을 기록해요. "
+        "저장해 두고 다시 보세요."
+    ).format(style[:20])
     body30 = (
-        "가까이 다가갈수록 색과 결이 또렷해지고, 잠깐의 침묵이 이야기를 밀어 올립니다. "
-        "시선이 머무는 자리마다 작은 감정이 쌓이고, 그 감정이 다음 장면을 자연스럽게 엽니다. "
-        "우리는 이 하루를 서둘러 소비하지 않고, 한 컷 한 컷에 이름을 붙여 기억합니다. "
-        "오늘은 이 순간을 기록하고, 내일의 나에게 따뜻한 여운과 선명한 잔상으로 건넵니다."
-    )
+        "{}의 빛과 공기가 한꺼번에 마음을 붙잡아요. "
+        "가까이 다가갈수록 색과 결이 또렷해져요. "
+        "잠깐의 침묵이 이야기를 밀어 올립니다. "
+        "시선이 머무는 자리마다 감정이 쌓여요. "
+        "그 감정이 다음 장면을 자연스럽게 엽니다. "
+        "우리는 이 하루를 서둘러 소비하지 않아요. "
+        "한 컷 한 컷에 이름을 붙여 기억합니다. "
+        "오늘은 이 순간을 기록해요. "
+        "저장하고 공유해 주세요."
+    ).format(style[:20])
     body60 = (
-        "가까이 다가갈수록 색과 결이 또렷해지고, 작은 흔들림조차 이야기의 호흡이 됩니다. "
-        "시선이 머무는 자리마다 감정이 쌓이고, 그 감정이 다음 장면을 조용히 엽니다. "
-        "서둘러 넘겨 버리기엔 너무 선명한 하루라서, 우리는 한 컷 한 컷에 이름을 붙입니다. "
-        "빛은 잠깐 머물고, 그림자는 더 오래 남고, 그 사이 공간이 사람의 마음을 담습니다. "
-        "멀리서 보면 풍경이고 가까이서 보면 온기입니다. 그 온기가 오늘의 이유를 설명합니다. "
-        "그래서 이 영상은 자랑이 아니라 기록입니다. 지나간 시간을 붙잡는 짧은 편지입니다. "
-        "마지막 컷이 닫혀도 여운은 남습니다. 내일의 나에게, 오늘의 온기를 그대로 전합니다."
-    )
+        "{}의 빛과 공기가 한꺼번에 마음을 붙잡아요. "
+        "가까이 다가갈수록 색과 결이 또렷해져요. "
+        "작은 흔들림조차 이야기의 호흡이 됩니다. "
+        "시선이 머무는 자리마다 감정이 쌓여요. "
+        "그 감정이 다음 장면을 조용히 엽니다. "
+        "서둘러 넘겨 버리기엔 너무 선명한 하루예요. "
+        "한 컷 한 컷에 이름을 붙입니다. "
+        "빛은 잠깐 머물고 그림자는 더 오래 남아요. "
+        "멀리서 보면 풍경이고 가까이서 보면 온기입니다. "
+        "그래서 이 영상은 자랑이 아니라 기록입니다. "
+        "마지막 컷이 닫혀도 여운은 남아요. "
+        "저장하고 친구에게 공유해 주세요."
+    ).format(style[:20])
     if target_duration >= 60:
         text = hook + " " + body60
     elif target_duration >= 30:
         text = hook + " " + body30
     else:
         text = hook + " " + body15
-    return sanitize_narration(text), []
+    script = sanitize_narration(text)
+    ig = normalize_instagram_payload(
+        {
+            "caption": "지금 이 순간을 릴스로 담아봤어요. {}의 온기를 저장해 두고 다시 보세요.".format(style[:24]),
+            "hashtags": ["#릴스", "#숏폼", "#일상", "#감성", "#인스타추천"],
+        },
+        style_prompt=style,
+        script=script,
+    )
+    return script, [], ig
 
 
 def ensure_voice_track(settings, script, dest, voice_key, duration=18.0):
@@ -3899,6 +4026,7 @@ def run_pipeline(
 
     script = ""
     photo_order = []
+    instagram = normalize_instagram_payload({}, style_prompt=style_prompt)
     voice_path = None
     bgm_path = None
     direction = default_style_direction(style_prompt)
@@ -3941,7 +4069,7 @@ def run_pipeline(
         try:
             if _left() < 14:
                 raise RuntimeError("잔여시간 부족")
-            script, photo_order = generate_script(
+            script, photo_order, instagram = generate_script(
                 settings,
                 media_files,
                 style_prompt=style_prompt,
@@ -3950,9 +4078,10 @@ def run_pipeline(
             )
         except Exception as exc:
             print("[안내] 대본 API 실패, 로컬 스토리로 폴백: {}".format(exc))
-            script, photo_order = fallback_script(style_prompt, target_duration=target_duration)
+            script, photo_order, instagram = fallback_script(style_prompt, target_duration=target_duration)
             used_fallback = True
         script = sanitize_narration(script)
+        instagram = normalize_instagram_payload(instagram, style_prompt=style_prompt, script=script)
         pieces = split_script_pieces(script)
         _notify(progress_cb, 24, "대본 완료 · 음성 합성과 사진 보정을 동시에 시작", progress_lock)
 
@@ -4147,8 +4276,9 @@ def run_pipeline(
         print("[안내] 파이프라인 예외, 최종 블러 폴백(프로세스 유지): {}".format(exc))
         used_fallback = True
         if not script:
-            script, _order = fallback_script(style_prompt, target_duration=target_duration)
+            script, _order, instagram = fallback_script(style_prompt, target_duration=target_duration)
             script = sanitize_narration(script)
+            instagram = normalize_instagram_payload(instagram, style_prompt=style_prompt, script=script)
         try:
             fast_blur_slideshow(media_files, out_file, work_dir, voice_path=voice_path, duration=float(target_duration))
         except Exception as inner:
@@ -4163,7 +4293,7 @@ def run_pipeline(
 
     _notify(progress_cb, 100, "완료: {}".format(out_file), progress_lock)
     gc.collect()
-    return out_file, script
+    return out_file, script, normalize_instagram_payload(instagram, style_prompt=style_prompt, script=script)
 
 
 def main():

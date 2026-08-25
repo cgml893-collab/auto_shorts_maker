@@ -54,6 +54,7 @@ from main import (
     normalize_bgm_mood,
     normalize_camera_motion,
     normalize_caption_style,
+    normalize_instagram_payload,
     normalize_motion_intensity,
     normalize_speed,
     normalize_target_duration,
@@ -190,7 +191,15 @@ def _purge_job_temps(job_dir, keep_file=None):
     if not job_dir.exists():
         return
     keep = None
-    keep_names = {"status.json", "final_shorts.mp4", "voice.mp3", "bgm.wav", "subs.srt", "i2v_source.jpg"}
+    keep_names = {
+        "status.json",
+        "final_shorts.mp4",
+        "voice.mp3",
+        "bgm.wav",
+        "subs.srt",
+        "i2v_source.jpg",
+        "instagram_caption.json",
+    }
     if keep_file:
         try:
             keep = Path(keep_file).resolve()
@@ -269,6 +278,39 @@ def _vip_forbidden_response(message="👑 VIP 시네마 스튜디오는 프로 V
     )
 
 
+def _instagram_fields(payload=None, style_prompt="", script=""):
+    ig = normalize_instagram_payload(payload or {}, style_prompt=style_prompt, script=script)
+    return {
+        "script": str(script or "").strip(),
+        "instagram_caption": ig.get("caption") or "",
+        "instagram_hashtags": list(ig.get("hashtags") or []),
+        "instagram_copy": ig.get("copy_text") or "",
+    }
+
+
+def _write_instagram_artifact(job_dir, fields):
+    try:
+        job_dir = Path(job_dir)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "instagram_caption.json").write_text(
+            json.dumps(fields, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        print("[안내] 인스타 캡션 저장 실패: {}".format(exc))
+
+
+def _load_instagram_artifact(job_dir):
+    path = Path(job_dir) / "instagram_caption.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def _run_job(
     job_id,
     media_files,
@@ -298,21 +340,26 @@ def _run_job(
     deadline = started + budget
     finished = threading.Event()
     write_lock = threading.Lock()
+    content_fields = _instagram_fields(style_prompt=prompt)
 
-    def _mark_completed(final_output_path=None):
+    def _mark_completed(final_output_path=None, extra=None):
         final_output_path = Path(final_output_path or out_file)
         if not _output_valid(final_output_path):
             return False
-        _update_job(
-            job_id,
-            status="completed",
-            percent=100,
-            progress=100,
-            stage="completed",
-            output=str(final_output_path),
-            error=None,
-            elapsed_sec=round(time.time() - started, 1),
-        )
+        payload = {
+            "status": "completed",
+            "percent": 100,
+            "progress": 100,
+            "stage": "completed",
+            "output": str(final_output_path),
+            "error": None,
+            "elapsed_sec": round(time.time() - started, 1),
+        }
+        payload.update(content_fields)
+        if isinstance(extra, dict):
+            payload.update(extra)
+        _update_job(job_id, **payload)
+        _write_instagram_artifact(Path(final_output_path).parent, content_fields)
         return True
 
     def progress(percent, message):
@@ -321,14 +368,15 @@ def _run_job(
         if pct >= 96 or msg.startswith("완료") or msg == "completed":
             if _mark_completed(out_file):
                 return
-        _update_job(
-            job_id,
-            status="processing",
-            stage=message,
-            percent=pct,
-            progress=pct,
-            elapsed_sec=round(time.time() - started, 1),
-        )
+        fields = {
+            "status": "processing",
+            "stage": message,
+            "percent": pct,
+            "progress": pct,
+            "elapsed_sec": round(time.time() - started, 1),
+        }
+        fields.update(content_fields)
+        _update_job(job_id, **fields)
 
     def _force_complete():
         if _mark_completed(out_file):
@@ -355,7 +403,9 @@ def _run_job(
     watcher.start()
 
     try:
-        _update_job(job_id, stage="대본 작성 중", percent=8, progress=8, elapsed_sec=0)
+        boot = {"stage": "대본 작성 중", "percent": 8, "progress": 8, "elapsed_sec": 0}
+        boot.update(content_fields)
+        _update_job(job_id, **boot)
         runner = ThreadPoolExecutor(max_workers=1)
         try:
             fut = runner.submit(
@@ -386,7 +436,18 @@ def _run_job(
                 motion_intensity=motion_intensity,
             )
             try:
-                fut.result(timeout=max(90.0, budget))
+                result = fut.result(timeout=max(90.0, budget))
+                script_text = ""
+                ig_payload = {}
+                if isinstance(result, tuple):
+                    if len(result) >= 3:
+                        script_text = result[1] or ""
+                        ig_payload = result[2] if isinstance(result[2], dict) else {}
+                    elif len(result) >= 2:
+                        script_text = result[1] or ""
+                content_fields.update(
+                    _instagram_fields(ig_payload, style_prompt=prompt, script=script_text)
+                )
             except TimeoutError:
                 print("[안내] 파이프라인 대기 시간 초과, 완성 파일 확인", flush=True)
             except Exception as exc:
@@ -411,13 +472,14 @@ def _run_job(
         if _mark_completed(out_file):
             print("[안내] 예외 후에도 완성 MP4가 있어 completed 유지: {}".format(exc))
         else:
-            _update_job(
-                job_id,
-                status="failed",
-                stage="실패",
-                error=str(exc),
-                elapsed_sec=round(time.time() - started, 1),
-            )
+            fail = {
+                "status": "failed",
+                "stage": "실패",
+                "error": str(exc),
+                "elapsed_sec": round(time.time() - started, 1),
+            }
+            fail.update(content_fields)
+            _update_job(job_id, **fail)
     finally:
         finished.set()
         job_dir = Path(out_file).parent
@@ -749,6 +811,15 @@ def job_status(job_id: str):
         job = _job_snapshot(job_id) or job
         percent = 100
         stage = "completed"
+    artifact = _load_instagram_artifact(JOBS_DIR / job_id)
+    caption = str(job.get("instagram_caption") or artifact.get("instagram_caption") or "")
+    hashtags = job.get("instagram_hashtags") or artifact.get("instagram_hashtags") or []
+    if not isinstance(hashtags, list):
+        hashtags = []
+    copy_text = str(job.get("instagram_copy") or artifact.get("instagram_copy") or "")
+    if not copy_text and (caption or hashtags):
+        copy_text = "{}\n\n{}".format(caption, " ".join(str(t) for t in hashtags)).strip()
+    script = str(job.get("script") or artifact.get("script") or "")
     return {
         "job_id": job["job_id"],
         "status": job.get("status") or "processing",
@@ -757,6 +828,10 @@ def job_status(job_id: str):
         "progress": percent,
         "elapsed_sec": float(job.get("elapsed_sec") or 0),
         "error": job.get("error"),
+        "script": script,
+        "instagram_caption": caption,
+        "instagram_hashtags": hashtags,
+        "instagram_copy": copy_text,
     }
 
 

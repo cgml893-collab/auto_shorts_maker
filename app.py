@@ -263,6 +263,8 @@ def main():
         st.session_state.video_path = None
     if "script_text" not in st.session_state:
         st.session_state.script_text = ""
+    if "instagram_copy" not in st.session_state:
+        st.session_state.instagram_copy = ""
 
     st.markdown(
         """
@@ -342,7 +344,7 @@ def main():
                         progress.progress(min(100, max(0, int(percent))), text=message)
                         status.caption(message)
 
-                    out_path, script = run_pipeline(
+                    out_path, script, ig = run_pipeline(
                         media_files,
                         style_prompt=style_prompt.strip(),
                         progress_cb=on_progress,
@@ -350,6 +352,7 @@ def main():
                     )
                     st.session_state.video_path = str(out_path)
                     st.session_state.script_text = script
+                    st.session_state.instagram_copy = (ig or {}).get("copy_text") or ""
                     progress.progress(100, text="완료!")
                     status.empty()
                     st.success("영상이 완성되었습니다.")
@@ -364,6 +367,9 @@ def main():
         if st.session_state.script_text:
             with st.expander("생성된 나레이션 대본", expanded=False):
                 st.write(st.session_state.script_text)
+        if st.session_state.get("instagram_copy"):
+            with st.expander("인스타그램 업로드 캡션", expanded=True):
+                st.write(st.session_state.instagram_copy)
         st.video(video_path)
         with open(video_path, "rb") as handle:
             st.download_button(
